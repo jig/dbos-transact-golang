@@ -115,7 +115,7 @@ Workflows are particularly useful for
 A transactional step runs your SQL **and** the workflow's durable checkpoint in a single Postgres transaction.
 Your database writes and DBOS's internal state commit together, so the operation is atomic and exactly-once: if your program crashes and the workflow is retried, the writes are applied once and only once&mdash;no compensating logic, no two-phase commit.
 
-It works for tables that live in the same database as DBOS. Use `WithTxIsolation` to pick the isolation level (it defaults to read committed).
+By default the checkpoint is recorded in the DBOS system database, so your tables live there too. To keep your application tables in their own database, point transactions at it with `ApplicationDatabaseURL` (or `ApplicationDBPool`) in `dbos.Config`. Use `WithTxIsolation` to pick the isolation level (it defaults to read committed).
 
 First, an application table to operate on:
 

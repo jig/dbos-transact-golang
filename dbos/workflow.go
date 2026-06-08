@@ -1895,6 +1895,129 @@ func (c *dbosContext) runAsTxn(_ DBOSContext, fn txnFunc, opts ...StepOption) (a
 	}, withRetrierLogger(c.logger))
 }
 
+// runAsAppTxn is the public RunAsTransaction engine. Unlike runAsTxn — which is the
+// internal helper for DBOS's own atomic system-database operations and records into
+// operation_outputs — this runs the user's transaction against the application
+// database and records its checkpoint in transaction_outputs there. That table has
+// no foreign key to the system schema, so it may live in a database separate from
+// the DBOS system database.
+func runAsAppTxn[R any](ctx DBOSContext, fn txn[R], opts ...StepOption) (R, error) {
+	if ctx == nil {
+		return *new(R), newStepExecutionError("", "", fmt.Errorf("ctx cannot be nil"))
+	}
+	if fn == nil {
+		return *new(R), newStepExecutionError("", "", fmt.Errorf("step function cannot be nil"))
+	}
+
+	c, ok := ctx.(*dbosContext)
+	if !ok {
+		return *new(R), newStepExecutionError("", "", fmt.Errorf("runAsAppTxn requires *dbosContext. Mock the caller of this function if you are testing."))
+	}
+
+	stepName := runtime.FuncForPC(reflect.ValueOf(fn).Pointer()).Name()
+	opts = append(opts, WithStepName(stepName))
+
+	typeErasedFn := txnFunc(func(ctx context.Context, tx Tx) (any, error) { return fn(ctx, tx) })
+
+	result, err := c.runAsAppTxn(ctx, typeErasedFn, opts...)
+	if result == nil {
+		return *new(R), err
+	}
+	typedResult, convertErr := convertStepResult[R](ctx, result)
+	if convertErr != nil {
+		return *new(R), convertErr
+	}
+	return typedResult, err
+}
+
+func (c *dbosContext) runAsAppTxn(_ DBOSContext, fn txnFunc, opts ...StepOption) (any, error) {
+	prep, err := prepareStepExecution(c, opts)
+	if err != nil {
+		return nil, err
+	}
+	if fn == nil {
+		return nil, newStepExecutionError(prep.WorkflowID, prep.StepOpts.stepName, fmt.Errorf("step function cannot be nil"))
+	}
+	if prep.IsWithinStep {
+		return fn(c, nil)
+	}
+
+	uncancellableCtx := WithoutCancel(c)
+	stepState := prep.StepState
+	stepOpts := prep.StepOpts
+	// The user's transaction runs against the application database (which defaults
+	// to the system database). Its checkpoint lives in transaction_outputs there,
+	// committing atomically with the user's writes even when the application
+	// database is separate from the DBOS system database.
+	pool := c.appDB
+	schema := c.appDBSchema
+	stepCtx := WithValue(c, workflowStateKey, stepState)
+	stepStartTime := time.Now()
+
+	// The dedup checkpoint is in the application database, so we cannot read the
+	// workflow status inside the same transaction. Guard against running for a
+	// cancelled or non-existent workflow against the system database first.
+	if sdb, ok := c.systemDB.(*sysDB); ok {
+		if err := sdb.checkWorkflowCancellation(uncancellableCtx, stepState.workflowID); err != nil {
+			return nil, err
+		}
+	}
+
+	txOpts := TxOptions{IsoLevel: IsoLevelReadCommitted}
+	if stepOpts.txIsoLevel != nil {
+		txOpts.IsoLevel = *stepOpts.txIsoLevel
+	}
+	return retryWithResult(c, func() (any, error) {
+		tx, err := pool.BeginTx(uncancellableCtx, txOpts)
+		if err != nil {
+			return nil, newStepExecutionError(stepState.workflowID, stepOpts.stepName, fmt.Errorf("failed to begin transaction: %w", err))
+		}
+		defer tx.Rollback(uncancellableCtx)
+
+		recordedOutput, err := checkTransactionExecution(uncancellableCtx, tx, schema, stepState.workflowID, stepState.stepID, stepOpts.stepName)
+		if err != nil {
+			return nil, newStepExecutionError(stepState.workflowID, stepOpts.stepName, fmt.Errorf("checking transaction execution: %w", err))
+		}
+		if recordedOutput != nil {
+			return stepCheckpointedOutcome{value: recordedOutput.output, serialization: recordedOutput.serialization}, deserializeWorkflowError(recordedOutput.errStr, recordedOutput.serialization)
+		}
+
+		stepOutput, stepError := executeStepWithRetry(c, stepState.workflowID, stepOpts, func() (any, error) { return fn(stepCtx, tx) })
+
+		txnSer := resolveEncoder(c)
+		encodedStepOutput, serErr := txnSer.Encode(stepOutput)
+		if serErr != nil {
+			return nil, newStepExecutionError(stepState.workflowID, stepOpts.stepName, fmt.Errorf("failed to serialize step output: %w", serErr))
+		}
+
+		var serializedTxnErr *string
+		if stepError != nil {
+			s := serializeWorkflowError(stepError, txnSer.Name())
+			serializedTxnErr = &s
+		}
+		recErr := recordTransactionResult(uncancellableCtx, tx, schema, recordOperationResultDBInput{
+			workflowID:    stepState.workflowID,
+			stepName:      stepOpts.stepName,
+			stepID:        stepState.stepID,
+			errStr:        serializedTxnErr,
+			startedAt:     stepStartTime,
+			completedAt:   time.Now(),
+			output:        encodedStepOutput,
+			serialization: txnSer.Name(),
+		})
+		if recErr != nil {
+			if stepError != nil {
+				recErr = errors.Join(recErr, stepError)
+			}
+			return nil, newStepExecutionError(stepState.workflowID, stepOpts.stepName, recErr)
+		}
+		if err := tx.Commit(uncancellableCtx); err != nil {
+			return nil, newStepExecutionError(stepState.workflowID, stepOpts.stepName, fmt.Errorf("failed to commit transaction: %w", err))
+		}
+		return stepOutput, stepError
+	}, withRetrierLogger(c.logger))
+}
+
 // Go runs a step inside a Go routine and returns a channel to receive the result.
 // Go generates a deterministic step ID for the step before running the step in a routine, since goroutines are not deterministic.
 // Example:
