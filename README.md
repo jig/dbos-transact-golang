@@ -32,7 +32,7 @@ DBOS also provides powerful Postgres-backed primitives that makes it easier to w
 
 ## Features
 <details open><summary><strong>💾 Durable Workflows</strong></summary>
- 
+
 DBOS workflows make your program **durable** by checkpointing its state in Postgres.
 If your program ever fails, when it restarts all your workflows will automatically resume from the last completed step.
 
@@ -102,11 +102,113 @@ func main() {
 ```
 
 
-Workflows are particularly useful for 
+Workflows are particularly useful for
 
 - Orchestrating business processes so they seamlessly recover from any failure.
 - Building observable and fault-tolerant data pipelines.
 - Operating an AI agent, or any application that relies on unreliable or non-deterministic APIs.
+
+</details>
+
+<details><summary><strong>🔒 Transactional Steps</strong></summary>
+
+A transactional step runs your SQL **and** the workflow's durable checkpoint in a single Postgres transaction.
+Your database writes and DBOS's internal state commit together, so the operation is atomic and exactly-once: if your program crashes and the workflow is retried, the writes are applied once and only once&mdash;no compensating logic, no two-phase commit.
+
+It works for tables that live in the same database as DBOS. Use `WithTxIsolation` to pick the isolation level (it defaults to read committed).
+
+First, an application table to operate on:
+
+```sql
+CREATE TABLE accounts (name TEXT PRIMARY KEY, balance INT NOT NULL);
+INSERT INTO accounts VALUES ('alice', 100), ('bob', 0);
+```
+
+Then debit one account and credit another atomically from inside a workflow:
+
+```golang
+package main
+
+import (
+    "context"
+    "errors"
+    "fmt"
+    "os"
+    "time"
+
+    "github.com/dbos-inc/dbos-transact-golang/dbos"
+)
+
+type Transfer struct {
+    From   string
+    To     string
+    Amount int
+}
+
+// transferFunds debits one account and credits another. Both UPDATEs and the
+// DBOS step checkpoint commit in a single serializable transaction, so the
+// transfer is atomic — and exactly-once: retrying the workflow with the same ID
+// returns the recorded result without moving the money again.
+func transferFunds(dbosCtx dbos.DBOSContext, t Transfer) (string, error) {
+    return dbos.RunAsTransaction(dbosCtx, func(ctx context.Context, tx dbos.Tx) (string, error) {
+        var balance int
+        if err := tx.QueryRow(ctx,
+            `SELECT balance FROM accounts WHERE name = $1`, t.From).Scan(&balance); err != nil {
+            return "", err
+        }
+        if balance < t.Amount {
+            return "", errors.New("insufficient funds")
+        }
+        if _, err := tx.Exec(ctx,
+            `UPDATE accounts SET balance = balance - $1 WHERE name = $2`, t.Amount, t.From); err != nil {
+            return "", err
+        }
+        if _, err := tx.Exec(ctx,
+            `UPDATE accounts SET balance = balance + $1 WHERE name = $2`, t.Amount, t.To); err != nil {
+            return "", err
+        }
+        return fmt.Sprintf("transferred %d from %s to %s", t.Amount, t.From, t.To), nil
+    }, dbos.WithTxIsolation(dbos.IsoLevelSerializable))
+}
+
+func main() {
+    // Application tables must live in the same database as the DBOS system schema.
+    ctx, err := dbos.NewDBOSContext(context.Background(), dbos.Config{
+        DatabaseURL: os.Getenv("DBOS_SYSTEM_DATABASE_URL"),
+        AppName:     "bank",
+    })
+    if err != nil {
+        panic(err)
+    }
+
+    dbos.RegisterWorkflow(ctx, transferFunds)
+
+    if err := dbos.Launch(ctx); err != nil {
+        panic(err)
+    }
+    defer dbos.Shutdown(ctx, 2*time.Second)
+
+    // Run the transfer durably. If the process crashes and the workflow is
+    // retried with the same ID, the money still moves exactly once.
+    handle, err := dbos.RunWorkflow(ctx, transferFunds,
+        Transfer{From: "alice", To: "bob", Amount: 30},
+        dbos.WithWorkflowID("transfer-001"))
+    if err != nil {
+        panic(err)
+    }
+    res, err := handle.GetResult()
+    if err != nil {
+        panic(err)
+    }
+    fmt.Println(res) // transferred 30 from alice to bob
+}
+```
+
+Transactional steps are particularly useful for
+
+- Keeping your business data and workflow state consistent without a separate two-phase commit.
+- Idempotent money or ledger operations that must stay correct under retries and recovery.
+- Multi-row updates that must all land together, or not at all.
 
 </details>
 
