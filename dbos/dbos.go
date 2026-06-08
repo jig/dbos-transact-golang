@@ -35,6 +35,8 @@ type Config struct {
 	DatabaseURL               string          // DatabaseURL is the system-database connection string. Exactly one of DatabaseURL, SystemDBPool, or SqliteSystemDB must be set.
 	SystemDBPool              *pgxpool.Pool   // SystemDBPool is a custom pg/CRDB pool. Optional; takes precedence over DatabaseURL. Mutually exclusive with SqliteSystemDB.
 	SqliteSystemDB            *sql.DB         // SqliteSystemDB is a custom sqlite handle (e.g. from modernc.org/sqlite). Optional; takes precedence over DatabaseURL. Mutually exclusive with SystemDBPool.
+	ApplicationDatabaseURL    string          // ApplicationDatabaseURL is the database where RunAsTransaction runs user SQL and records its checkpoint. Postgres/CockroachDB only. Optional; when empty, transactions use the system database.
+	ApplicationDBPool         *pgxpool.Pool   // ApplicationDBPool is a custom pg/CRDB pool for transactional steps. Optional; takes precedence over ApplicationDatabaseURL.
 	DatabaseSchema            string          // Database schema name (defaults to "dbos")
 	Logger                    *slog.Logger    // Custom logger instance (defaults to a new slog logger)
 	AdminServer               bool            // Enable Transact admin HTTP server (disabled by default)
@@ -65,6 +67,15 @@ func processConfig(inputConfig *Config) (*Config, error) {
 			return nil, err
 		}
 	}
+	if inputConfig.ApplicationDatabaseURL != "" {
+		dialectName, err := detectDialect(inputConfig.ApplicationDatabaseURL)
+		if err != nil {
+			return nil, fmt.Errorf("invalid applicationDatabaseURL: %w", err)
+		}
+		if dialectName == DialectSQLite {
+			return nil, fmt.Errorf("applicationDatabaseURL must be a Postgres database: transactional steps are not supported on SQLite")
+		}
+	}
 	if inputConfig.AdminServerPort == 0 {
 		inputConfig.AdminServerPort = _DEFAULT_ADMIN_SERVER_PORT
 	}
@@ -83,6 +94,8 @@ func processConfig(inputConfig *Config) (*Config, error) {
 		ExecutorID:                inputConfig.ExecutorID,
 		SystemDBPool:              inputConfig.SystemDBPool,
 		SqliteSystemDB:            inputConfig.SqliteSystemDB,
+		ApplicationDatabaseURL:    inputConfig.ApplicationDatabaseURL,
+		ApplicationDBPool:         inputConfig.ApplicationDBPool,
 		EnablePatching:            inputConfig.EnablePatching,
 		Serializer:                inputConfig.Serializer,
 		SchedulerPollingInterval:  inputConfig.SchedulerPollingInterval,
@@ -222,6 +235,12 @@ type dbosContext struct {
 	adminServer *adminServer
 	config      *Config
 
+	// Application database for transactional steps (RunAsTransaction). Defaults to
+	// the system database pool when no separate application database is configured.
+	appDB       Pool
+	appDBSchema string
+	appDBOwned  bool // true when we created appDB and must Close it on shutdown
+
 	// Queue runner
 	queueRunner *queueRunner
 
@@ -328,6 +347,9 @@ func (c *dbosContext) From(_ DBOSContext, ctx context.Context) DBOSContext {
 		config:                  c.config,
 		logger:                  c.logger,
 		systemDB:                c.systemDB,
+		appDB:                   c.appDB,
+		appDBSchema:             c.appDBSchema,
+		appDBOwned:              c.appDBOwned,
 		workflowsWg:             c.workflowsWg,
 		workflowRegistry:        c.workflowRegistry,
 		workflowCustomNametoFQN: c.workflowCustomNametoFQN,
@@ -365,6 +387,9 @@ func (c *dbosContext) WithValue(key, val any) DBOSContext {
 		config:                  c.config,
 		logger:                  c.logger,
 		systemDB:                c.systemDB,
+		appDB:                   c.appDB,
+		appDBSchema:             c.appDBSchema,
+		appDBOwned:              c.appDBOwned,
 		workflowsWg:             c.workflowsWg,
 		workflowRegistry:        c.workflowRegistry,
 		workflowCustomNametoFQN: c.workflowCustomNametoFQN,
@@ -386,6 +411,9 @@ func (c *dbosContext) WithoutCancel(_ DBOSContext) DBOSContext {
 		config:                  c.config,
 		logger:                  c.logger,
 		systemDB:                c.systemDB,
+		appDB:                   c.appDB,
+		appDBSchema:             c.appDBSchema,
+		appDBOwned:              c.appDBOwned,
 		workflowsWg:             c.workflowsWg,
 		workflowRegistry:        c.workflowRegistry,
 		workflowCustomNametoFQN: c.workflowCustomNametoFQN,
@@ -416,6 +444,9 @@ func (c *dbosContext) WithCancel() (DBOSContext, context.CancelFunc) {
 		ctx:                     newCtx,
 		logger:                  c.logger,
 		systemDB:                c.systemDB,
+		appDB:                   c.appDB,
+		appDBSchema:             c.appDBSchema,
+		appDBOwned:              c.appDBOwned,
 		workflowsWg:             c.workflowsWg,
 		workflowRegistry:        c.workflowRegistry,
 		workflowCustomNametoFQN: c.workflowCustomNametoFQN,
@@ -447,6 +478,9 @@ func (c *dbosContext) WithCancelCause() (DBOSContext, context.CancelCauseFunc) {
 		ctx:                     newCtx,
 		logger:                  c.logger,
 		systemDB:                c.systemDB,
+		appDB:                   c.appDB,
+		appDBSchema:             c.appDBSchema,
+		appDBOwned:              c.appDBOwned,
 		workflowsWg:             c.workflowsWg,
 		workflowRegistry:        c.workflowRegistry,
 		workflowCustomNametoFQN: c.workflowCustomNametoFQN,
@@ -478,6 +512,9 @@ func (c *dbosContext) WithTimeout(_ DBOSContext, timeout time.Duration) (DBOSCon
 		config:                  c.config,
 		logger:                  c.logger,
 		systemDB:                c.systemDB,
+		appDB:                   c.appDB,
+		appDBSchema:             c.appDBSchema,
+		appDBOwned:              c.appDBOwned,
 		workflowsWg:             c.workflowsWg,
 		workflowRegistry:        c.workflowRegistry,
 		workflowCustomNametoFQN: c.workflowCustomNametoFQN,
@@ -622,6 +659,22 @@ func NewDBOSContext(ctx context.Context, inputConfig Config) (DBOSContext, error
 	}
 	initExecutor.systemDB = systemDB
 	initExecutor.logger.Debug("System database initialized")
+
+	// Set up the application database for transactional steps. Defaults to the
+	// system database pool when no separate application database is configured.
+	var systemPool Pool
+	if sdb, ok := systemDB.(*sysDB); ok {
+		systemPool = sdb.pool
+	}
+	appDB, err := setupApplicationDB(initExecutor, config, systemPool, config.DatabaseSchema, initExecutor.logger)
+	if err != nil {
+		initExecutor.logger.Error("failed to set up application database", "error", err)
+		return nil, newInitializationError(err.Error())
+	}
+	initExecutor.appDB = appDB.pool
+	initExecutor.appDBSchema = appDB.schema
+	initExecutor.appDBOwned = appDB.owned
+	initExecutor.logger.Debug("Application database initialized")
 
 	// Initialize the queue runner and register DBOS internal queue
 	initExecutor.queueRunner = newQueueRunner(initExecutor.logger)
@@ -818,6 +871,13 @@ func (c *dbosContext) Shutdown(timeout time.Duration) {
 	if c.systemDB != nil {
 		c.logger.Debug("Shutting down system database")
 		c.systemDB.shutdown(c, timeout)
+	}
+
+	// Close the application database pool if we own it (a separate pool we created).
+	// When it aliases the system database pool, the system database already closed it.
+	if c.appDBOwned && c.appDB != nil {
+		c.logger.Debug("Closing application database")
+		c.appDB.Close()
 	}
 
 	c.launched.Store(false)

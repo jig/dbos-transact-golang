@@ -2351,6 +2351,29 @@ func (s *sysDB) checkOperationExecution(ctx context.Context, input checkOperatio
 	return result, nil
 }
 
+// checkWorkflowCancellation reads a workflow's status from the system database and
+// returns an error if the workflow does not exist or has been cancelled.
+//
+// Transactional steps (RunAsTransaction) record their checkpoint in the
+// application database rather than operation_outputs, so they cannot rely on
+// checkOperationExecution for this guard and call this directly before running.
+func (s *sysDB) checkWorkflowCancellation(ctx context.Context, workflowID string) error {
+	query := s.renderSQL(`SELECT status FROM %sworkflow_status WHERE workflow_uuid = $1`, s.dialect.SchemaPrefix(s.schema))
+
+	var workflowStatus WorkflowStatusType
+	err := s.pool.QueryRow(ctx, query, workflowID).Scan(&workflowStatus)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return newNonExistentWorkflowError(workflowID)
+		}
+		return fmt.Errorf("failed to get workflow status: %w", err)
+	}
+	if workflowStatus == WorkflowStatusCancelled {
+		return newWorkflowCancelledError(workflowID)
+	}
+	return nil
+}
+
 // StepInfo contains information about a workflow step execution.
 type stepInfo struct {
 	StepID          int       // The sequential ID of the step within the workflow

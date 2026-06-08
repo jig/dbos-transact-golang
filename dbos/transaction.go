@@ -19,8 +19,10 @@ type Transaction[R any] func(ctx context.Context, tx Tx) (R, error)
 //   - The user MUST issue all SQL through the provided Tx, not through a
 //     separate pool or connection. Only writes made through that Tx are part of
 //     the atomic checkpoint commit.
-//   - It only works for tables in the same database as the DBOS system schema
-//     (the writes share the system DB connection pool).
+//   - The tables must live in the application database, i.e. the same database
+//     the checkpoint is recorded in. By default that is the DBOS system database;
+//     set Config.ApplicationDatabaseURL (or ApplicationDBPool) to run transactions
+//     against a separate Postgres database instead.
 //   - It must be called directly from a workflow. If called nested within
 //     another step, steps are flattened and the engine passes a nil Tx — do not
 //     do that.
@@ -32,7 +34,7 @@ type Transaction[R any] func(ctx context.Context, tx Tx) (R, error)
 // Use WithTxIsolation to control the transaction isolation level (defaults to
 // read committed).
 func RunAsTransaction[R any](ctx DBOSContext, fn Transaction[R], opts ...StepOption) (R, error) {
-	return runAsTxn(ctx, txn[R](fn), opts...)
+	return runAsAppTxn(ctx, txn[R](fn), opts...)
 }
 
 // WithTxIsolation sets the isolation level of the transaction opened by
