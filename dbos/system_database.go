@@ -138,6 +138,21 @@ type sysDB struct {
 	schema                        string
 	launched                      bool
 	isCockroachDB                 bool
+
+	// Application database used by RunAsTransaction (defaults to the system pool;
+	// may point at a separate Postgres database). Set after construction via
+	// setApplicationDB. Workflow deletion and garbage collection use it to clean up
+	// transaction_outputs, which has no FK to workflow_status.
+	appPool   Pool
+	appSchema string
+}
+
+// setApplicationDB hands the system database a reference to the application
+// database so deleteWorkflows and garbageCollectWorkflows can clean up the
+// transactional-step checkpoints of the workflows they remove.
+func (s *sysDB) setApplicationDB(pool Pool, schema string) {
+	s.appPool = pool
+	s.appSchema = schema
 }
 
 /*******************************/
@@ -1664,6 +1679,13 @@ func (s *sysDB) deleteWorkflows(ctx context.Context, input deleteWorkflowsDBInpu
 		}
 	}
 
+	// Delete the transactional-step checkpoints first: if the system delete below
+	// fails or never commits, a retry simply repeats this no-op, so the cleanup
+	// converges and transaction_outputs cannot accumulate orphans.
+	if err := deleteTransactionOutputs(ctx, s.appPool, s.appSchema, workflowIDs); err != nil {
+		return err
+	}
+
 	// Delete all matching workflows regardless of their state
 	anyClause := dialectAnyClause(s.dialect, "workflow_uuid", 1)
 	deleteQuery := s.renderSQL(
@@ -1790,6 +1812,45 @@ func (s *sysDB) garbageCollectWorkflows(ctx context.Context, input garbageCollec
 	// If no cutoff is determined, no garbage collection is needed
 	if cutoffTimestamp == nil {
 		return nil
+	}
+
+	// Clean up the transactional-step checkpoints of the doomed workflows before
+	// deleting their system rows: a crash between the two phases leaves the system
+	// rows in place, so the next GC run selects the same IDs again and the cleanup
+	// converges (no permanent orphans in transaction_outputs).
+	if PgxPool(s.appPool) != nil {
+		selectQuery := s.renderSQL(`SELECT workflow_uuid FROM %sworkflow_status
+				  WHERE created_at < $1
+				    AND status NOT IN ($2, $3, $4)`, s.dialect.SchemaPrefix(s.schema))
+		rows, err := s.pool.Query(ctx, selectQuery,
+			*cutoffTimestamp,
+			WorkflowStatusPending,
+			WorkflowStatusEnqueued,
+			WorkflowStatusDelayed)
+		if err != nil {
+			return fmt.Errorf("failed to list workflows for garbage collection: %w", err)
+		}
+		var doomedIDs []string
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return fmt.Errorf("failed to scan workflow id for garbage collection: %w", err)
+			}
+			doomedIDs = append(doomedIDs, id)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("failed to read workflow ids for garbage collection: %w", err)
+		}
+
+		const gcChunkSize = 1000
+		for start := 0; start < len(doomedIDs); start += gcChunkSize {
+			end := min(start+gcChunkSize, len(doomedIDs))
+			if err := deleteTransactionOutputs(ctx, s.appPool, s.appSchema, doomedIDs[start:end]); err != nil {
+				return err
+			}
+		}
 	}
 
 	// Delete all workflows older than cutoff that are NOT PENDING, ENQUEUED, or DELAYED

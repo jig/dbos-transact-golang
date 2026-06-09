@@ -676,6 +676,10 @@ func NewDBOSContext(ctx context.Context, inputConfig Config) (DBOSContext, error
 	initExecutor.appDB = appDB.pool
 	initExecutor.appDBSchema = appDB.schema
 	initExecutor.appDBOwned = appDB.owned
+	if sdb, ok := systemDB.(*sysDB); ok {
+		// Let workflow deletion and GC clean up transaction_outputs in the application database.
+		sdb.setApplicationDB(appDB.pool, appDB.schema)
+	}
 	initExecutor.logger.Debug("Application database initialized")
 
 	// Initialize the queue runner and register DBOS internal queue

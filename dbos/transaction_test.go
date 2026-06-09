@@ -162,6 +162,66 @@ func TestForkWorkflowWithTransactions(t *testing.T) {
 	require.Equal(t, 1, copied)
 }
 
+// TestTransactionOutputsCleanup proves that deleting and garbage-collecting
+// workflows also removes their transactional-step checkpoints from
+// transaction_outputs (which has no FK to workflow_status, so no cascade).
+func TestTransactionOutputsCleanup(t *testing.T) {
+	skipIfSqlite(t, "transactional steps are Postgres-only")
+
+	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
+
+	verifyPool, err := pgxpool.New(context.Background(), getDatabaseURL())
+	require.NoError(t, err)
+	defer verifyPool.Close()
+
+	_, err = verifyPool.Exec(context.Background(),
+		`CREATE TABLE IF NOT EXISTS cleanup_txn_data (id text PRIMARY KEY)`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = verifyPool.Exec(context.Background(), `DROP TABLE IF EXISTS cleanup_txn_data`)
+	})
+
+	txnWorkflow := func(ctx DBOSContext, id string) (string, error) {
+		return RunAsTransaction(ctx, func(txCtx context.Context, tx Tx) (string, error) {
+			if _, err := tx.Exec(txCtx,
+				`INSERT INTO cleanup_txn_data (id) VALUES ($1)`, id); err != nil {
+				return "", err
+			}
+			return id, nil
+		})
+	}
+
+	RegisterWorkflow(dbosCtx, txnWorkflow)
+	require.NoError(t, Launch(dbosCtx))
+
+	countCheckpoints := func(wfID string) int {
+		var n int
+		require.NoError(t, verifyPool.QueryRow(context.Background(),
+			`SELECT count(*) FROM dbos.transaction_outputs WHERE workflow_uuid = $1`, wfID).Scan(&n))
+		return n
+	}
+
+	wf1, wf2 := uuid.NewString(), uuid.NewString()
+	for i, wfID := range []string{wf1, wf2} {
+		handle, err := RunWorkflow(dbosCtx, txnWorkflow, fmt.Sprintf("row-%d", i), WithWorkflowID(wfID))
+		require.NoError(t, err)
+		_, err = handle.GetResult()
+		require.NoError(t, err)
+		require.Equal(t, 1, countCheckpoints(wfID))
+	}
+
+	// DeleteWorkflows removes the checkpoints of the deleted workflow only.
+	require.NoError(t, DeleteWorkflows(dbosCtx, []string{wf1}))
+	require.Equal(t, 0, countCheckpoints(wf1))
+	require.Equal(t, 1, countCheckpoints(wf2))
+
+	// Garbage collection removes the checkpoints of collected workflows.
+	cutoff := time.Now().Add(time.Second).UnixMilli()
+	require.NoError(t, dbosCtx.(*dbosContext).systemDB.garbageCollectWorkflows(dbosCtx,
+		garbageCollectWorkflowsInput{cutoffEpochTimestampMs: &cutoff}))
+	require.Equal(t, 0, countCheckpoints(wf2))
+}
+
 // TestRunAsTransactionSeparateAppDB exercises a transactional step whose user
 // tables live in a separate application database, configured via
 // Config.ApplicationDatabaseURL. It proves the user's writes and the step
