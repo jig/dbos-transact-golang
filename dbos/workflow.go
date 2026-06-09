@@ -270,18 +270,42 @@ func (h *workflowHandle[R]) GetResult(opts ...GetResultOption) (R, error) {
 		timeoutChan = time.After(options.timeout)
 	}
 
-	select {
-	case outcome, ok := <-h.outcomeChan:
-		if !ok {
-			// Return error if channel closed (happens when GetResult() called twice)
-			return *new(R), errors.New("workflow result channel is already closed. Did you call GetResult() twice on the same workflow handle?")
+	// Durable wait: when suspension is enabled and the caller is a workflow without an
+	// explicit timeout, block in-process only up to the threshold, then suspend until
+	// the awaited workflow completes.
+	var suspendChan <-chan time.Time
+	c, wfState, suspendable := suspendableWaiter(h.dbosContext, options.timeout)
+	if suspendable {
+		suspendChan = time.After(c.config.DurableSleepThreshold)
+	}
+
+	for {
+		select {
+		case outcome, ok := <-h.outcomeChan:
+			if !ok {
+				// Return error if channel closed (happens when GetResult() called twice)
+				return *new(R), errors.New("workflow result channel is already closed. Did you call GetResult() twice on the same workflow handle?")
+			}
+			if errors.Is(outcome.err, errWorkflowSuspended) {
+				// The awaited workflow suspended itself to the database: its goroutine is
+				// gone. Cascade the suspension when possible, otherwise poll for the
+				// eventual result.
+				if suspendable {
+					c.suspendForResult(wfState, h.workflowID) // does not return on success
+				}
+				pollingHandle := newWorkflowPollingHandle[R](h.dbosContext, h.workflowID)
+				return pollingHandle.GetResult(opts...)
+			}
+			completedTime := time.Now()
+			return h.processOutcome(outcome, startTime, completedTime)
+		case <-suspendChan:
+			c.suspendForResult(wfState, h.workflowID) // does not return on success
+			suspendChan = nil                         // suspension failed: keep waiting in-process
+		case <-h.dbosContext.Done():
+			return *new(R), context.Cause(h.dbosContext)
+		case <-timeoutChan:
+			return *new(R), fmt.Errorf("workflow result timeout after %v: %w", options.timeout, context.DeadlineExceeded)
 		}
-		completedTime := time.Now()
-		return h.processOutcome(outcome, startTime, completedTime)
-	case <-h.dbosContext.Done():
-		return *new(R), context.Cause(h.dbosContext)
-	case <-timeoutChan:
-		return *new(R), fmt.Errorf("workflow result timeout after %v: %w", options.timeout, context.DeadlineExceeded)
 	}
 }
 
@@ -347,6 +371,20 @@ func (h *workflowPollingHandle[R]) GetResult(opts ...GetResultOption) (R, error)
 	}
 
 	startTime := time.Now()
+
+	// Durable wait: when suspension is enabled and the caller is a workflow without an
+	// explicit timeout, poll in-process only up to the threshold, then suspend until
+	// the awaited workflow completes.
+	if c, wfState, suspendable := suspendableWaiter(h.dbosContext, options.timeout); suspendable {
+		graceCtx, graceCancel := WithTimeout(h.dbosContext, c.config.DurableSleepThreshold)
+		_, graceErr := c.systemDB.awaitWorkflowResult(graceCtx, h.workflowID, options.pollInterval)
+		graceCancel()
+		if graceErr != nil && errors.Is(graceErr, context.DeadlineExceeded) {
+			c.suspendForResult(wfState, h.workflowID) // does not return on success
+		}
+		// Otherwise the awaited workflow is terminal (or suspension failed): the await
+		// below returns (almost) immediately and handles the outcome as usual.
+	}
 
 	// Use timeout if specified, otherwise use DBOS context directly
 	ctx := h.dbosContext
@@ -1342,7 +1380,34 @@ func (c *dbosContext) RunWorkflow(_ DBOSContext, fn WorkflowFunc, input any, opt
 		var result any
 		var err error
 
-		result, err = fn(workflowCtx, input)
+		var suspension *workflowSuspension
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					if s, ok := r.(*workflowSuspension); ok {
+						suspension = s
+						return
+					}
+					panic(r) // not a suspension: preserve the original panic behavior
+				}
+			}()
+			result, err = fn(workflowCtx, input)
+		}()
+
+		if suspension != nil {
+			// The workflow parked itself in the database (status DELAYED), either for a
+			// durable sleep or awaiting another workflow's result. Release the goroutine
+			// without recording an outcome: the queue runner will re-enqueue and
+			// re-execute the workflow when its delay expires or it is woken earlier.
+			if stopFunc != nil && !stopFunc() {
+				// The cancel function won the race: the workflow is being cancelled in the DB.
+				<-cancelFuncCompleted
+			}
+			c.logger.Debug("Workflow suspended", "workflow_id", workflowID, "delay_until", suspension.delayUntil, "awaited_workflow_id", suspension.awaitedWorkflowID)
+			outcomeChan <- workflowOutcome[any]{result: nil, err: errWorkflowSuspended}
+			close(outcomeChan)
+			return
+		}
 
 		// Handle DBOS ID conflict errors by waiting workflow result
 		if errors.Is(err, &DBOSError{Code: ConflictingIDError}) {
@@ -2983,6 +3048,90 @@ func CloseStream(ctx DBOSContext, key string) error {
 	return ctx.CloseStream(ctx, key)
 }
 
+// workflowSuspension is the panic value used by Sleep and GetResult to unwind the
+// workflow goroutine after the workflow has been durably parked in the database
+// (status DELAYED). The workflow runner goroutine recovers it and releases the
+// goroutine without recording a workflow outcome; the queue runner resumes the
+// workflow when its delay expires or it is woken earlier. Any other panic value is
+// re-raised unchanged.
+type workflowSuspension struct {
+	workflowID        string
+	delayUntil        time.Time
+	awaitedWorkflowID string // set when suspended waiting for another workflow's result
+}
+
+// errWorkflowSuspended is delivered on the in-memory outcome channel when a workflow
+// suspends durably. workflowHandle.GetResult intercepts it and either cascades the
+// suspension (when the caller is itself a suspendable workflow) or falls back to
+// polling the database for the workflow's eventual result.
+var errWorkflowSuspended = errors.New("workflow suspended durably")
+
+// _waiterWakeFallbackInterval is the delay_until horizon used when a workflow suspends
+// waiting for another workflow's result. The real wake-up is event-driven (completion
+// of the awaited workflow wakes its waiters); this fallback only bounds the latency if
+// a wake-up is lost (e.g. a crash between the completion and the wake), at the cost of
+// one spurious replay per interval, after which the waiter re-suspends.
+var _waiterWakeFallbackInterval = 1 * time.Hour
+
+// isTerminalStatus reports whether a workflow status is terminal from the point of view
+// of a workflow awaiting its result.
+func isTerminalStatus(status WorkflowStatusType) bool {
+	switch status {
+	case WorkflowStatusSuccess, WorkflowStatusError, WorkflowStatusCancelled, WorkflowStatusMaxRecoveryAttemptsExceeded:
+		return true
+	}
+	return false
+}
+
+// suspendableWaiter reports whether the calling context is a workflow that may durably
+// suspend while waiting for another workflow's result: durable suspension must be
+// enabled, the caller must be inside a workflow (not inside a step), and no explicit
+// GetResult timeout may be set (suspension cannot honor it).
+func suspendableWaiter(ctx DBOSContext, userTimeout time.Duration) (*dbosContext, *workflowState, bool) {
+	c, ok := ctx.(*dbosContext)
+	if !ok {
+		return nil, nil, false
+	}
+	if c.config == nil || c.config.DurableSleepThreshold <= 0 || userTimeout > 0 {
+		return nil, nil, false
+	}
+	wfState, ok := c.Value(workflowStateKey).(*workflowState)
+	if !ok || wfState == nil || wfState.isWithinStep {
+		return nil, nil, false
+	}
+	return c, wfState, true
+}
+
+// suspendForResult durably parks the calling workflow (status DELAYED) until the awaited
+// workflow reaches a terminal state, then unwinds the goroutine via workflowSuspension —
+// it does not return when the suspension succeeds. On wake-up the workflow re-executes
+// with completed steps memoized, reaches its GetResult again, and either finds the
+// awaited workflow finished or re-suspends.
+// If the workflow cannot be suspended (e.g. it was cancelled concurrently), it logs and
+// returns, and the caller keeps waiting in-process.
+func (c *dbosContext) suspendForResult(wfState *workflowState, awaitedWorkflowID string) {
+	delayUntil := time.Now().Add(_waiterWakeFallbackInterval)
+	suspended, err := retryWithResult(c, func() (bool, error) {
+		return c.systemDB.suspendWorkflowForResult(c, wfState.workflowID, awaitedWorkflowID, delayUntil)
+	}, withRetrierLogger(c.logger))
+	if err != nil || !suspended {
+		c.logger.Warn("could not suspend workflow awaiting a result; waiting in-process", "workflow_id", wfState.workflowID, "awaited_workflow_id", awaitedWorkflowID, "error", err)
+		return
+	}
+
+	// Close the race where the awaited workflow completed before the waiter row was
+	// committed (its completion found no waiter to wake): wake ourselves immediately.
+	statuses, err := c.systemDB.listWorkflows(c, listWorkflowsDBInput{workflowIDs: []string{awaitedWorkflowID}})
+	if err == nil && len(statuses) == 1 && isTerminalStatus(statuses[0].Status) {
+		if wakeErr := c.systemDB.wakeWorkflowWaiters(c, nil, awaitedWorkflowID); wakeErr != nil {
+			// Not fatal: the fallback delay still bounds the wait.
+			c.logger.Warn("failed to self-wake after awaited workflow completed", "workflow_id", wfState.workflowID, "awaited_workflow_id", awaitedWorkflowID, "error", wakeErr)
+		}
+	}
+
+	panic(&workflowSuspension{workflowID: wfState.workflowID, delayUntil: delayUntil, awaitedWorkflowID: awaitedWorkflowID})
+}
+
 func (c *dbosContext) Sleep(_ DBOSContext, duration time.Duration) (time.Duration, error) {
 	wfState, ok := c.Value(workflowStateKey).(*workflowState)
 	if !ok || wfState == nil {
@@ -2991,15 +3140,53 @@ func (c *dbosContext) Sleep(_ DBOSContext, duration time.Duration) (time.Duratio
 	if wfState.isWithinStep {
 		return 0, newStepExecutionError(wfState.workflowID, "DBOS.sleep", fmt.Errorf("cannot call Sleep within a step"))
 	}
-	return retryWithResult(c, func() (time.Duration, error) {
-		return c.systemDB.sleep(c, sleepInput{duration: duration, skipSleep: false})
+
+	// Record (or read back) the durable wake-up time and compute the remaining duration.
+	remaining, err := retryWithResult(c, func() (time.Duration, error) {
+		return c.systemDB.sleep(c, sleepInput{duration: duration, skipSleep: true})
 	}, withRetrierLogger(c.logger))
+	if err != nil {
+		return 0, err
+	}
+
+	if threshold := c.config.DurableSleepThreshold; threshold > 0 && remaining > threshold {
+		delayUntil := time.Now().Add(remaining)
+		suspended, err := retryWithResult(c, func() (bool, error) {
+			return c.systemDB.suspendWorkflowForSleep(c, wfState.workflowID, delayUntil)
+		}, withRetrierLogger(c.logger))
+		if err != nil {
+			return 0, newStepExecutionError(wfState.workflowID, "DBOS.sleep", fmt.Errorf("suspending workflow for durable sleep: %w", err))
+		}
+		if suspended {
+			panic(&workflowSuspension{workflowID: wfState.workflowID, delayUntil: delayUntil})
+		}
+		// The workflow is no longer PENDING (e.g. cancelled concurrently): fall back to
+		// the in-process sleep, preserving the pre-suspension behavior.
+		c.logger.Warn("could not suspend workflow for durable sleep; sleeping in-process", "workflow_id", wfState.workflowID, "delay_until", delayUntil)
+	}
+
+	if remaining > 0 {
+		time.Sleep(remaining)
+	}
+	return remaining, nil
 }
 
 // Sleep pauses workflow execution for the specified duration.
 // This is a durable sleep - if the workflow is recovered during the sleep period,
 // it will continue sleeping for the remaining time.
 // Returns the actual duration slept.
+//
+// By default the wait happens in-process (a goroutine is held for the whole duration).
+// If Config.DurableSleepThreshold is set and the remaining sleep exceeds it, the
+// workflow is instead suspended to the database (status DELAYED) and its goroutine is
+// released; when the sleep expires, the workflow function is re-executed from the top
+// with completed steps memoized. This imposes two requirements on suspending workflows:
+//
+//   - All non-deterministic or side-effecting code before the Sleep must be wrapped in
+//     steps (RunAsStep), because it re-runs on every wake-up.
+//   - The suspension unwinds the workflow goroutine with an internal panic: deferred
+//     functions in the workflow run on suspension, and recover() in workflow code must
+//     re-panic values it does not recognize.
 //
 // Example:
 //

@@ -1,7 +1,9 @@
 # Design note: a Temporal-style durable `Sleep`
 
-Status: exploration / not implemented. Captures the findings and a plan so it
-can be picked up on another machine.
+Status: **implemented** (opt-in via `Config.DurableSleepThreshold`). See
+"Implementation" at the end. The original exploration is kept below, with one
+correction: the "GC of parked goroutines" mechanism described in "The hard
+part" was wrong and is not what was built.
 
 ## Background
 
@@ -94,13 +96,15 @@ You cannot kill a goroutine. Options to stop executing the function:
 - (c) **Cooperative yield** (thread a sentinel error up the whole stack) — not
   transparent; the workflow code must cooperate.
 
-Temporal's trick (usable here): park the goroutine on a channel and make it
-**unreachable**. A goroutine blocked on a channel with no live references is
-**garbage-collected by Go, and its `defer`s do NOT run** (defers only run on
-`return`/`panic`). That gives "evict without running defers", like Temporal.
-Implementation must, before parking: decrement `workflowsWg`, remove from
-`activeWorkflowIDs`, write `DELAYED`, and drop all references so GC can reclaim
-the goroutine.
+**Correction (this section was wrong):** Go does **not** garbage-collect
+blocked goroutines — the runtime keeps a reference to every goroutine
+(`allgs`), which is exactly why goroutine leaks exist. There is no
+"evict without running defers" in Go. The Temporal Go SDK itself unwinds
+evicted workflow coroutines with `runtime.Goexit()`, which **does run
+deferred functions**. So any suspension mechanism in Go (panic sentinel,
+`runtime.Goexit`) runs user defers on suspension; this must be documented,
+not avoided. The implementation below uses a panic sentinel recovered by the
+workflow runner goroutine.
 
 ## Costs (this is a change of contract, not just an optimisation)
 
@@ -109,9 +113,12 @@ the goroutine.
    imposes the **same determinism discipline as Temporal** (`time.Now()`,
    `rand`, map iteration, I/O must be steps) and will surface latent bugs. This
    is DBOS's main selling point, so it must be opt-in.
-2. **`defer`/resource semantics across `Sleep`.** Suspend does not run defers
-   (like Temporal), so non-durable resources (files, locks, conns) cannot be
-   held across a `Sleep`. Must be documented.
+2. **`defer`/resource semantics across `Sleep`.** Suspension unwinds the
+   goroutine via panic, so user defers **do run on every suspension** (and the
+   resources they release are simply re-acquired on replay if acquired in
+   steps... which they must not be — non-durable resources cannot be held
+   across a suspending `Sleep` either way). A `recover()` in workflow code
+   that swallows unknown panic values breaks suspension. Must be documented.
 3. **Replay is DB-heavy.** Each wake does one `checkOperationExecution` per prior
    step -> O(steps) round-trips per wake, O(steps^2) for loops with repeated
    sleeps. Needs a `ContinueAsNew`-like escape hatch.
@@ -151,7 +158,8 @@ the goroutine.
 - Prototype plan:
   1. Add a `suspendWorkflow` sentinel/path in the run-workflow goroutine that
      writes `DELAYED` + `delay_until`, decrements `workflowsWg`, clears
-     `activeWorkflowIDs`, and parks-then-drops the goroutine (GC, no defers).
+     `activeWorkflowIDs`, and unwinds the goroutine (panic sentinel; defers
+     run — see correction above).
   2. Make `sleep` choose in-process vs suspend based on a threshold.
   3. Confirm the queue runner re-dequeues `DELAYED` -> replay -> continue.
   4. Tests: long sleep across a worker restart; cancellation; determinism of
@@ -159,10 +167,89 @@ the goroutine.
 
 ## Key references in this repo
 
-- `dbos/workflow.go:2863` — `dbosContext.Sleep`
-- `dbos/system_database.go:2623` — `sysDB.sleep`
-- `dbos/system_database.go:2673/2655/2705/2709` — record endTime / replay / remaining / `time.Sleep`
+(Function names, not line numbers — lines drift.)
+
+- `dbosContext.Sleep` in `dbos/workflow.go`
+- `sysDB.sleep` in `dbos/system_database.go` (records/reads the durable
+  `endTime` step output; `skipSleep` returns the remaining duration)
 - Delayed-queue primitives: `WorkflowStatusDelayed`, `DelayUntil`, `WithDelay`,
-  `SetWorkflowDelay` (see `dbos/workflow.go`, `dbos/queue.go`)
+  `SetWorkflowDelay`, `transitionDelayedWorkflows`
 - Recovery / replay: `dbos/recovery.go`, `checkOperationExecution` in
   `dbos/system_database.go`
+
+## Implementation (June 2026)
+
+Opt-in threshold hybrid, as recommended above:
+
+- `Config.DurableSleepThreshold time.Duration` — 0 (default) disables
+  suspension entirely (upstream behavior). When > 0, any `dbos.Sleep` whose
+  *remaining* duration exceeds the threshold suspends the workflow.
+- Suspension path (`dbosContext.Sleep` in `dbos/workflow.go`):
+  1. `sysDB.sleep(skipSleep: true)` records (or reads back) the durable
+     wake-up time and returns the remaining duration.
+  2. `sysDB.suspendWorkflowForSleep` atomically transitions
+     `PENDING -> DELAYED` with `delay_until = endTime`, assigns
+     `queue_name = COALESCE(queue_name, '_dbos_internal_queue')` (direct-run
+     workflows get parked on the internal queue; enqueued workflows keep their
+     queue), clears `started_at`, and resets `recovery_attempts` to 0 (a
+     suspension is voluntary, so every wake-up gets a fresh retry budget —
+     otherwise a workflow sleeping in a loop would hit
+     MAX_RECOVERY_ATTEMPTS_EXCEEDED). Guarded on `status = PENDING`: if the
+     workflow was cancelled concurrently, the update affects 0 rows and Sleep
+     falls back to the in-process wait.
+  3. `panic(&workflowSuspension{...})` unwinds the user code (defers run);
+     the runner goroutine in `dbosContext.RunWorkflow` recovers *only* this
+     sentinel (anything else is re-panicked), skips outcome recording, and
+     sends `errWorkflowSuspended` on the in-memory outcome channel.
+- Wake-up: the queue runner's `transitionDelayedWorkflows` promotes
+  `DELAYED -> ENQUEUED` when `delay_until` expires; dequeue re-executes the
+  workflow function from the top with completed steps memoized; the `Sleep`
+  step finds its recorded `endTime`, remaining ≈ 0, and continues.
+- In-memory handles: `workflowHandle.GetResult` intercepts
+  `errWorkflowSuspended` and falls back to polling the DB
+  (`workflowPollingHandle`), so callers still get the final result.
+- Scale: the partial index `idx_workflow_status_delayed`
+  (`delay_until_epoch_ms WHERE status = 'DELAYED'`, migration 16) makes the
+  wake-up scan cheap with millions of sleeping workflows; a suspended
+  workflow costs zero goroutines/RAM.
+- Caveats (documented on `dbos.Sleep`): code before a suspending `Sleep`
+  re-runs on every wake-up (must be in steps if non-deterministic or
+  side-effecting); user `recover()` must re-panic unknown values; a parent
+  blocked on a child's `GetResult` still holds its own goroutine; dequeue
+  filters by `application_version`, so workflows sleep across restarts of the
+  *same* app version (standard DBOS recovery semantics).
+- Tests: `dbos/durable_sleep_test.go`.
+
+### Phase 2: suspend on `GetResult` (await another workflow's result)
+
+Without this, a parent blocked on a child's `GetResult` held its goroutine even
+while the child was suspended. Now (same `DurableSleepThreshold` opt-in):
+
+- **Waiter registry**: `workflow_waiters (waiter, awaited)` table (migration 38),
+  inserted atomically with the waiter's `PENDING -> DELAYED` transition
+  (`sysDB.suspendWorkflowForResult`).
+- **Event-driven wake**: every place a workflow becomes terminal —
+  `updateWorkflowOutcome` (SUCCESS/ERROR/CANCELLED, now transactional),
+  `cancelWorkflows`, and the MAX_RECOVERY_ATTEMPTS_EXCEEDED path in
+  `insertWorkflowStatus` — calls `wakeWorkflowWaiters`, which sets the waiters'
+  `delay_until = now` and deletes the rows; the queue runner promotes and
+  re-executes them as usual.
+- **Lost-wake fallback**: the waiter's `delay_until` is set to
+  `now + _waiterWakeFallbackInterval` (1h). If a wake is lost (crash between the
+  completion and the wake), the waiter replays at the fallback and re-suspends
+  if the awaited workflow is still running. The completed-before-registered race
+  is closed by re-checking the awaited status right after committing the waiter
+  row and self-waking.
+- **Where it hooks in**:
+  - `workflowPollingHandle.GetResult` (queued children, replayed handles): polls
+    in-process up to the threshold (grace), then suspends.
+  - `workflowHandle.GetResult` (direct children): blocks on the channel up to
+    the threshold, then suspends. If the child's suspension marker arrives, the
+    suspension **cascades immediately** up the parent chain (tested three levels
+    deep), so a whole tree waiting on one sleeping leaf costs zero goroutines.
+  - A `GetResult` with an explicit timeout never suspends (timeout honored
+    in-process). Calls from outside a workflow are unaffected.
+
+Phase 3 (not done): suspend on `Recv`/`GetEvent` — wake = notification insert
+or timeout expiry; same waiter pattern, but hooked into the notifications
+machinery.

@@ -212,6 +212,49 @@ Transactional steps are particularly useful for
 
 </details>
 
+<details><summary><strong>💤 Durable Sleep (zero-RAM long waits)</strong></summary>
+
+`dbos.Sleep` is always durable: the wake-up time is checkpointed, so a workflow that sleeps for two years wakes at the right instant even across crashes and restarts. By default, though, the wait happens in-process&mdash;each sleeping workflow holds a goroutine for the whole duration.
+
+Setting `DurableSleepThreshold` in `dbos.Config` changes that for long sleeps: any `Sleep` with more than the threshold remaining **suspends the workflow to the database** (status `DELAYED`) and releases its goroutine. When the sleep expires, the queue runner re-enqueues the workflow and re-executes it from the top with all completed steps memoized, so it continues exactly after the `Sleep`. Sleeping workflows consume **no goroutines, no RAM, and no CPU**&mdash;you can have millions of workflows sleeping for months or years, the same way Temporal timers work.
+
+```golang
+ctx, err := dbos.NewDBOSContext(context.Background(), dbos.Config{
+    DatabaseURL:           os.Getenv("DBOS_SYSTEM_DATABASE_URL"),
+    AppName:               "myapp",
+    DurableSleepThreshold: 10 * time.Second, // suspend any sleep longer than this
+})
+```
+
+```golang
+func subscriptionWorkflow(ctx dbos.DBOSContext, customer string) (string, error) {
+    for {
+        _, err := dbos.RunAsStep(ctx, func(c context.Context) (string, error) {
+            return chargeCustomer(c, customer)
+        })
+        if err != nil {
+            return "", err
+        }
+        // Suspends to the database; costs nothing until next month
+        if _, err := dbos.Sleep(ctx, 30*24*time.Hour); err != nil {
+            return "", err
+        }
+    }
+}
+```
+
+Workflows that suspend must follow the same discipline as recovery (it is the same mechanism, exercised on every wake-up instead of only after crashes):
+
+- All non-deterministic or side-effecting code before a suspending `Sleep` must be wrapped in steps, because the workflow function re-runs on every wake-up.
+- Suspension unwinds the workflow goroutine with an internal panic, so deferred functions in the workflow run on suspension, and any `recover()` in workflow code must re-panic values it does not recognize.
+- Sleeps with less than the threshold remaining (including re-executions close to the wake-up time) still wait in-process, so short sleeps keep their run-once semantics.
+
+Workflows started directly (not enqueued) are parked on the internal DBOS queue while suspended; enqueued workflows wake up on their own queue. In-memory workflow handles keep working: `GetResult()` transparently falls back to polling the database when the workflow suspends.
+
+**Waiting on child workflows suspends too.** When suspension is enabled, a workflow blocked on a child's `handle.GetResult()` waits in-process only up to the threshold and then suspends to the database as well; the child's completion wakes it (event-driven, with a periodic fallback in case a wake-up is lost). If the child itself suspends, the suspension cascades immediately up the whole parent chain, so an entire workflow tree waiting on one long sleep costs zero goroutines. A `GetResult` with an explicit timeout option never suspends (the timeout is honored in-process).
+
+</details>
+
 <details><summary><strong>📒 Durable Queues</strong></summary>
 
 ####

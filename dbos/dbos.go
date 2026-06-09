@@ -49,6 +49,7 @@ type Config struct {
 	EnablePatching            bool            // Enable the patching system for Patch and DeprecatePatch (default: false)
 	Serializer                Serializer[any] // Custom serializer for encoding/decoding workflow inputs, outputs, and events (defaults to JSON serializer)
 	SchedulerPollingInterval  time.Duration   // controls how often dynamic schedules are reconciled with the database (defaults to 30 seconds)
+	DurableSleepThreshold     time.Duration   // When > 0, a Sleep with more than this duration remaining suspends the workflow to the database (status DELAYED) instead of holding a goroutine; the workflow is re-executed (with completed steps memoized) when the sleep expires. See the Sleep documentation for the determinism requirements this imposes. 0 (default) disables suspension.
 }
 
 func processConfig(inputConfig *Config) (*Config, error) {
@@ -99,6 +100,7 @@ func processConfig(inputConfig *Config) (*Config, error) {
 		EnablePatching:            inputConfig.EnablePatching,
 		Serializer:                inputConfig.Serializer,
 		SchedulerPollingInterval:  inputConfig.SchedulerPollingInterval,
+		DurableSleepThreshold:     inputConfig.DurableSleepThreshold,
 	}
 
 	if dbosConfig.ConductorExecutorMetadata != nil {

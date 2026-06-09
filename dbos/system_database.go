@@ -83,6 +83,9 @@ type systemDatabase interface {
 	// Queues
 	setWorkflowDelay(ctx context.Context, input setWorkflowDelayDBInput) error
 	transitionDelayedWorkflows(ctx context.Context) error
+	suspendWorkflowForSleep(ctx context.Context, workflowID string, delayUntil time.Time) (bool, error)
+	suspendWorkflowForResult(ctx context.Context, waiterID string, awaitedID string, delayUntil time.Time) (bool, error)
+	wakeWorkflowWaiters(ctx context.Context, runner Querier, workflowID string) error
 	dequeueWorkflows(ctx context.Context, input dequeueWorkflowsInput) ([]dequeuedWorkflow, error)
 	clearQueueAssignment(ctx context.Context, workflowID string) (bool, error)
 	getQueuePartitions(ctx context.Context, queueName string) ([]string, error)
@@ -301,6 +304,9 @@ var migration36SQL string
 //go:embed migrations/37_create_started_at_index.sql
 var migration37SQL string
 
+//go:embed migrations/38_create_workflow_waiters.sql
+var migration38SQL string
+
 type migrationFile struct {
 	version int64
 	sql     string
@@ -404,6 +410,7 @@ func buildMigrations(schema string, isCockroach bool) []migrationFile {
 		{version: 35, sql: fmt.Sprintf(migration35SQL, c, sanitizedSchema), online: !isCockroach},
 		{version: 36, sql: fmt.Sprintf(migration36SQL, sanitizedSchema, sanitizedSchema)},
 		{version: 37, sql: fmt.Sprintf(migration37SQL, c, sanitizedSchema), online: !isCockroach},
+		{version: 38, sql: fmt.Sprintf(migration38SQL, sanitizedSchema, sanitizedSchema)},
 	}
 }
 
@@ -1100,6 +1107,11 @@ func (s *sysDB) insertWorkflowStatus(ctx context.Context, input insertWorkflowSt
 			return nil, fmt.Errorf("failed to update workflow to %s: %w", WorkflowStatusMaxRecoveryAttemptsExceeded, err)
 		}
 
+		// MAX_RECOVERY_ATTEMPTS_EXCEEDED is terminal for awaiting workflows: wake them.
+		if err := s.wakeWorkflowWaiters(ctx, input.tx, input.status.ID); err != nil {
+			return nil, err
+		}
+
 		// Commit the transaction before throwing the error
 		if err := input.tx.Commit(ctx); err != nil {
 			return nil, fmt.Errorf("failed to commit transaction after marking workflow as %s: %w", WorkflowStatusMaxRecoveryAttemptsExceeded, err)
@@ -1437,16 +1449,34 @@ func (s *sysDB) updateWorkflowOutcome(ctx context.Context, input updateWorkflowO
 			  SET status = $1, output = $2, error = $3, updated_at = $4, completed_at = $4, deduplication_id = NULL
 			  WHERE workflow_uuid = $5 AND NOT (status = $6 AND CAST($1 AS TEXT) IN ($7, $8))`, s.dialect.SchemaPrefix(s.schema))
 
-	// input.output is already a *string from the database layer
-	var err error
-	if input.tx != nil {
-		_, err = input.tx.Exec(ctx, query, input.status, input.output, input.errStr, time.Now().UnixMilli(), input.workflowID, WorkflowStatusCancelled, WorkflowStatusSuccess, WorkflowStatusError)
-	} else {
-		_, err = s.pool.Exec(ctx, query, input.status, input.output, input.errStr, time.Now().UnixMilli(), input.workflowID, WorkflowStatusCancelled, WorkflowStatusSuccess, WorkflowStatusError)
+	// Run the outcome update and the waiter wake-up in a single transaction so a
+	// workflow suspended on this workflow's result cannot miss the completion.
+	runner := Querier(input.tx)
+	var localTx Tx
+	if input.tx == nil {
+		tx, err := s.pool.BeginTx(ctx, TxOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to begin transaction to update workflow outcome: %w", err)
+		}
+		defer tx.Rollback(ctx)
+		localTx = tx
+		runner = tx
 	}
 
-	if err != nil {
+	// input.output is already a *string from the database layer
+	if _, err := runner.Exec(ctx, query, input.status, input.output, input.errStr, time.Now().UnixMilli(), input.workflowID, WorkflowStatusCancelled, WorkflowStatusSuccess, WorkflowStatusError); err != nil {
 		return fmt.Errorf("failed to update workflow status: %w", err)
+	}
+
+	// The workflow reached a terminal state: wake any workflows suspended on its result.
+	if err := s.wakeWorkflowWaiters(ctx, runner, input.workflowID); err != nil {
+		return err
+	}
+
+	if localTx != nil {
+		if err := localTx.Commit(ctx); err != nil {
+			return fmt.Errorf("failed to commit workflow outcome update: %w", err)
+		}
 	}
 	return nil
 }
@@ -1507,6 +1537,12 @@ func (s *sysDB) cancelWorkflows(ctx context.Context, input cancelWorkflowsDBInpu
 
 		if _, err := runner.Exec(ctx, updateQuery, args...); err != nil {
 			return nil, fmt.Errorf("failed to cancel workflows: %w", err)
+		}
+		// CANCELLED is terminal for awaiting workflows: wake their waiters.
+		for _, id := range input.workflowIDs {
+			if err := s.wakeWorkflowWaiters(ctx, runner, id); err != nil {
+				return nil, err
+			}
 		}
 		rows, err := runner.Query(ctx, selectQuery, args[2])
 		if err != nil {
@@ -1580,6 +1616,14 @@ func (s *sysDB) cancelWorkflows(ctx context.Context, input cancelWorkflowsDBInpu
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("failed to read cancelled workflow ids: %w", err)
 	}
+
+	// CANCELLED is terminal for awaiting workflows: wake their waiters.
+	for _, id := range input.workflowIDs {
+		if err := s.wakeWorkflowWaiters(ctx, input.tx, id); err != nil {
+			return nil, err
+		}
+	}
+
 	return found, nil
 }
 
@@ -3761,6 +3805,116 @@ func (s *sysDB) setWorkflowDelay(ctx context.Context, input setWorkflowDelayDBIn
 		if err != nil {
 			return fmt.Errorf("failed to set workflow delay: %w", err)
 		}
+	}
+	return nil
+}
+
+// suspendWorkflowToDelayed transitions a PENDING workflow to DELAYED so that, once
+// delayUntil expires (or the workflow is woken earlier), the queue runner re-enqueues
+// and re-executes it (with completed steps memoized).
+// Workflows that were not started on a queue are assigned to the internal queue.
+// recovery_attempts is reset because a suspension is voluntary, not a failed execution:
+// every wake-up gets a fresh retry budget.
+// Returns false if the workflow is no longer PENDING (e.g. it was cancelled concurrently),
+// in which case the caller must not suspend.
+func (s *sysDB) suspendWorkflowToDelayed(ctx context.Context, runner Querier, workflowID string, delayUntil time.Time) (bool, error) {
+	query := s.renderSQL(`UPDATE %sworkflow_status
+		SET status = $1,
+		    delay_until_epoch_ms = $2,
+		    updated_at = $3,
+		    queue_name = COALESCE(NULLIF(queue_name, ''), $4),
+		    started_at_epoch_ms = NULL,
+		    recovery_attempts = 0
+		WHERE workflow_uuid = $5
+		  AND status = $6`, s.dialect.SchemaPrefix(s.schema))
+
+	commandTag, err := runner.Exec(ctx, query,
+		WorkflowStatusDelayed,
+		delayUntil.UnixMilli(),
+		time.Now().UnixMilli(),
+		_DBOS_INTERNAL_QUEUE_NAME,
+		workflowID,
+		WorkflowStatusPending)
+	if err != nil {
+		return false, fmt.Errorf("failed to suspend workflow %s: %w", workflowID, err)
+	}
+	n, err := commandTag.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("failed to read rows affected after suspending workflow %s: %w", workflowID, err)
+	}
+	return n > 0, nil
+}
+
+// suspendWorkflowForSleep parks a PENDING workflow in the database for the remainder of a
+// durable sleep. See suspendWorkflowToDelayed for the semantics.
+func (s *sysDB) suspendWorkflowForSleep(ctx context.Context, workflowID string, delayUntil time.Time) (bool, error) {
+	return s.suspendWorkflowToDelayed(ctx, s.pool, workflowID, delayUntil)
+}
+
+// suspendWorkflowForResult parks a PENDING workflow (the waiter) while it waits for
+// another workflow to reach a terminal state. The waiter registration and the DELAYED
+// transition commit atomically; the awaited workflow's completion wakes the waiter via
+// wakeWorkflowWaiters. delayUntil acts as a periodic fallback wake-up in case a
+// completion wake-up is lost: the woken waiter simply re-suspends if the awaited
+// workflow is still running.
+func (s *sysDB) suspendWorkflowForResult(ctx context.Context, waiterID string, awaitedID string, delayUntil time.Time) (bool, error) {
+	tx, err := s.pool.BeginTx(ctx, TxOptions{})
+	if err != nil {
+		return false, fmt.Errorf("failed to begin transaction to suspend workflow %s: %w", waiterID, err)
+	}
+	defer tx.Rollback(ctx)
+
+	suspended, err := s.suspendWorkflowToDelayed(ctx, tx, waiterID, delayUntil)
+	if err != nil {
+		return false, err
+	}
+	if !suspended {
+		return false, nil
+	}
+
+	insertQuery := s.renderSQL(`INSERT INTO %sworkflow_waiters (waiter_workflow_uuid, awaited_workflow_uuid)
+		VALUES ($1, $2) ON CONFLICT DO NOTHING`, s.dialect.SchemaPrefix(s.schema))
+	if _, err := tx.Exec(ctx, insertQuery, waiterID, awaitedID); err != nil {
+		return false, fmt.Errorf("failed to register workflow waiter %s -> %s: %w", waiterID, awaitedID, err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("failed to commit suspension of workflow %s: %w", waiterID, err)
+	}
+	return true, nil
+}
+
+// wakeWorkflowWaiters wakes the workflows suspended on workflowID's result: their
+// delay_until is moved to now (the queue runner then promotes them to ENQUEUED) and the
+// waiter rows are removed. Called whenever a workflow reaches a terminal state.
+// Pass the caller's transaction to make the wake atomic with the status change; with a
+// nil runner the two statements run in their own transaction.
+func (s *sysDB) wakeWorkflowWaiters(ctx context.Context, runner Querier, workflowID string) error {
+	if runner == nil {
+		tx, err := s.pool.BeginTx(ctx, TxOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to begin transaction to wake waiters of workflow %s: %w", workflowID, err)
+		}
+		defer tx.Rollback(ctx)
+		if err := s.wakeWorkflowWaiters(ctx, tx, workflowID); err != nil {
+			return err
+		}
+		return tx.Commit(ctx)
+	}
+
+	schemaPrefix := s.dialect.SchemaPrefix(s.schema)
+	updateQuery := s.renderSQL(`UPDATE %sworkflow_status
+		SET delay_until_epoch_ms = $1, updated_at = $1
+		WHERE status = $2
+		  AND workflow_uuid IN (SELECT waiter_workflow_uuid FROM %sworkflow_waiters WHERE awaited_workflow_uuid = $3)`,
+		schemaPrefix, schemaPrefix)
+	if _, err := runner.Exec(ctx, updateQuery, time.Now().UnixMilli(), WorkflowStatusDelayed, workflowID); err != nil {
+		return fmt.Errorf("failed to wake waiters of workflow %s: %w", workflowID, err)
+	}
+
+	deleteQuery := s.renderSQL(`DELETE FROM %sworkflow_waiters WHERE awaited_workflow_uuid = $1`, schemaPrefix)
+	if _, err := runner.Exec(ctx, deleteQuery, workflowID); err != nil {
+		return fmt.Errorf("failed to delete waiters of workflow %s: %w", workflowID, err)
 	}
 	return nil
 }
