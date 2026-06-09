@@ -84,6 +84,84 @@ func TestRunAsTransaction(t *testing.T) {
 	require.Equal(t, 1, count)
 }
 
+// TestForkWorkflowWithTransactions proves that forking a workflow past a
+// transactional step does not re-execute the step's SQL: the fork copies the
+// transaction_outputs checkpoints for steps before StartStep, so the forked run
+// replays the recorded result instead of re-applying the write.
+func TestForkWorkflowWithTransactions(t *testing.T) {
+	skipIfSqlite(t, "transactional steps are Postgres-only")
+
+	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
+
+	verifyPool, err := pgxpool.New(context.Background(), getDatabaseURL())
+	require.NoError(t, err)
+	defer verifyPool.Close()
+
+	_, err = verifyPool.Exec(context.Background(),
+		`CREATE TABLE IF NOT EXISTS fork_txn_data (id text PRIMARY KEY, note text)`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = verifyPool.Exec(context.Background(), `DROP TABLE IF EXISTS fork_txn_data`)
+	})
+
+	const rowID = "fork-row"
+
+	// Step 0: transactional INSERT (re-execution would violate the primary key).
+	// Step 1: a regular step.
+	forkableWorkflow := func(ctx DBOSContext, note string) (string, error) {
+		id, err := RunAsTransaction(ctx, func(txCtx context.Context, tx Tx) (string, error) {
+			if _, err := tx.Exec(txCtx,
+				`INSERT INTO fork_txn_data (id, note) VALUES ($1, $2)`, rowID, note); err != nil {
+				return "", err
+			}
+			return rowID, nil
+		})
+		if err != nil {
+			return "", err
+		}
+		stepRes, err := RunAsStep(ctx, func(ctx context.Context) (string, error) {
+			return "step", nil
+		})
+		if err != nil {
+			return "", err
+		}
+		return id + "-" + stepRes, nil
+	}
+
+	RegisterWorkflow(dbosCtx, forkableWorkflow)
+	require.NoError(t, Launch(dbosCtx))
+
+	wfID := uuid.NewString()
+	handle, err := RunWorkflow(dbosCtx, forkableWorkflow, "original", WithWorkflowID(wfID))
+	require.NoError(t, err)
+	result, err := handle.GetResult()
+	require.NoError(t, err)
+	require.Equal(t, "fork-row-step", result)
+
+	// Fork past both steps: the transactional INSERT must NOT run again.
+	forkedHandle, err := ForkWorkflow[string](dbosCtx, ForkWorkflowInput{
+		OriginalWorkflowID: wfID,
+		StartStep:          2,
+	})
+	require.NoError(t, err)
+	forkedResult, err := forkedHandle.GetResult(WithHandleTimeout(60*time.Second), WithHandlePollingInterval(100*time.Millisecond))
+	require.NoError(t, err, "forked workflow must not re-execute the transactional step (PK violation would fail it)")
+	require.Equal(t, "fork-row-step", forkedResult)
+
+	// Exactly one row: the forked run replayed the recorded checkpoint.
+	var count int
+	require.NoError(t, verifyPool.QueryRow(context.Background(),
+		`SELECT count(*) FROM fork_txn_data WHERE id = $1`, rowID).Scan(&count))
+	require.Equal(t, 1, count)
+
+	// The checkpoint was copied onto the forked workflow ID.
+	var copied int
+	require.NoError(t, verifyPool.QueryRow(context.Background(),
+		`SELECT count(*) FROM dbos.transaction_outputs WHERE workflow_uuid = $1`,
+		forkedHandle.GetWorkflowID()).Scan(&copied))
+	require.Equal(t, 1, copied)
+}
+
 // TestRunAsTransactionSeparateAppDB exercises a transactional step whose user
 // tables live in a separate application database, configured via
 // Config.ApplicationDatabaseURL. It proves the user's writes and the step

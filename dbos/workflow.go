@@ -3847,7 +3847,10 @@ func (c *dbosContext) ForkWorkflow(_ DBOSContext, input ForkWorkflowInput) (Work
 		queuePartitionKey:  input.QueuePartitionKey,
 	}
 
-	// Call system database method
+	// Call system database method. Transactional-step checkpoints (transaction_outputs,
+	// possibly in a separate application database) are copied inside the system
+	// transaction, before the forked workflow becomes visible (ENQUEUED): otherwise the
+	// queue runner could dequeue it and re-execute transactional steps it must skip.
 	workflowState, ok := c.Value(workflowStateKey).(*workflowState)
 	isWithinWorkflow := ok && workflowState != nil
 	var forkedWorkflowID string
@@ -3855,11 +3858,43 @@ func (c *dbosContext) ForkWorkflow(_ DBOSContext, input ForkWorkflowInput) (Work
 	if isWithinWorkflow {
 		forkedWorkflowID, err = runAsTxn(c, func(ctx context.Context, tx Tx) (string, error) {
 			dbInput.tx = tx
-			return c.systemDB.forkWorkflow(ctx, dbInput)
+			id, err := c.systemDB.forkWorkflow(ctx, dbInput)
+			if err != nil {
+				return "", err
+			}
+			if err := copyTransactionOutputsForFork(ctx, c.appDB, c.appDBSchema, input.OriginalWorkflowID, id, dbInput.startStep); err != nil {
+				return "", err
+			}
+			return id, nil
 		}, WithStepName("DBOS.forkWorkflow"))
 	} else {
 		forkedWorkflowID, err = retryWithResult(c, func() (string, error) {
-			return c.systemDB.forkWorkflow(c, dbInput)
+			sdb, ok := c.systemDB.(*sysDB)
+			if !ok { // Mocked system database: no transactional checkpoints to copy
+				return c.systemDB.forkWorkflow(c, dbInput)
+			}
+			tx, err := sdb.pool.BeginTx(c, TxOptions{})
+			if err != nil {
+				return "", fmt.Errorf("failed to begin fork transaction: %w", err)
+			}
+			defer tx.Rollback(c)
+			forkInput := dbInput
+			forkInput.tx = tx
+			id, err := c.systemDB.forkWorkflow(c, forkInput)
+			if err != nil {
+				return "", err
+			}
+			if err := copyTransactionOutputsForFork(c, c.appDB, c.appDBSchema, input.OriginalWorkflowID, id, dbInput.startStep); err != nil {
+				return "", err
+			}
+			if err := tx.Commit(c); err != nil {
+				// The forked workflow was never created; drop the copied checkpoints (best effort).
+				if cleanupErr := deleteTransactionOutputs(c, c.appDB, c.appDBSchema, []string{id}); cleanupErr != nil {
+					c.logger.Warn("failed to clean up copied transaction outputs after fork failure", "forked_workflow_id", id, "error", cleanupErr)
+				}
+				return "", fmt.Errorf("failed to commit fork transaction: %w", err)
+			}
+			return id, nil
 		}, withRetrierLogger(c.logger))
 	}
 	if err != nil {

@@ -192,6 +192,46 @@ func checkTransactionExecution(ctx context.Context, tx Tx, schema, workflowID st
 	}, nil
 }
 
+// copyTransactionOutputsForFork copies the transactional-step checkpoints of
+// originalID with function_id < startStep onto forkedID, so a forked workflow does
+// not re-execute (and thus re-apply) transactional steps it is supposed to skip.
+// It must run before the forked workflow becomes visible (ENQUEUED) in the system
+// database. ON CONFLICT DO NOTHING makes it idempotent across retries.
+// No-op for non-pgx pools (SQLite system database), where transactional steps are
+// unsupported anyway.
+func copyTransactionOutputsForFork(ctx context.Context, pool Pool, schema, originalID, forkedID string, startStep int) error {
+	if startStep <= 0 || PgxPool(pool) == nil {
+		return nil
+	}
+	prefix := appDialect.SchemaPrefix(schema)
+	query := appDialect.RewriteQuery(fmt.Sprintf(
+		`INSERT INTO %stransaction_outputs (workflow_uuid, function_id, function_name, output, error, started_at_epoch_ms, completed_at_epoch_ms, serialization)
+		 SELECT $1, function_id, function_name, output, error, started_at_epoch_ms, completed_at_epoch_ms, serialization
+		 FROM %stransaction_outputs
+		 WHERE workflow_uuid = $2 AND function_id < $3
+		 ON CONFLICT DO NOTHING`, prefix, prefix))
+	if _, err := pool.Exec(ctx, query, forkedID, originalID, startStep); err != nil {
+		return fmt.Errorf("failed to copy transaction outputs from %s to %s: %w", originalID, forkedID, err)
+	}
+	return nil
+}
+
+// deleteTransactionOutputs removes all transactional-step checkpoints of the given
+// workflows from the application database. Used to clean up after a failed fork and
+// by workflow deletion/garbage collection. No-op for non-pgx pools.
+func deleteTransactionOutputs(ctx context.Context, pool Pool, schema string, workflowIDs []string) error {
+	if len(workflowIDs) == 0 || PgxPool(pool) == nil {
+		return nil
+	}
+	query := appDialect.RewriteQuery(fmt.Sprintf(
+		`DELETE FROM %stransaction_outputs WHERE workflow_uuid = ANY($1)`,
+		appDialect.SchemaPrefix(schema)))
+	if _, err := pool.Exec(ctx, query, workflowIDs); err != nil {
+		return fmt.Errorf("failed to delete transaction outputs: %w", err)
+	}
+	return nil
+}
+
 // recordTransactionResult inserts the transactional step's checkpoint into
 // transaction_outputs using the supplied application-database transaction, so the
 // checkpoint commits atomically with the user's writes.

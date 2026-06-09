@@ -15,12 +15,13 @@ import (
 )
 
 type ClientConfig struct {
-	DatabaseURL    string          // DatabaseURL is the system-database connection string. Exactly one of DatabaseURL, SystemDBPool, or SqliteSystemDB must be set.
-	SystemDBPool   *pgxpool.Pool   // SystemDBPool is a custom pg/CRDB pool. Optional; takes precedence over DatabaseURL. Mutually exclusive with SqliteSystemDB.
-	SqliteSystemDB *sql.DB         // SqliteSystemDB is a custom sqlite handle (e.g. from modernc.org/sqlite). Optional; takes precedence over DatabaseURL. Mutually exclusive with SystemDBPool.
-	DatabaseSchema string          // Database schema name (defaults to "dbos")
-	Logger         *slog.Logger    // Optional custom logger
-	Serializer     Serializer[any] // Optional custom serializer (defaults to JSON)
+	DatabaseURL            string          // DatabaseURL is the system-database connection string. Exactly one of DatabaseURL, SystemDBPool, or SqliteSystemDB must be set.
+	SystemDBPool           *pgxpool.Pool   // SystemDBPool is a custom pg/CRDB pool. Optional; takes precedence over DatabaseURL. Mutually exclusive with SqliteSystemDB.
+	SqliteSystemDB         *sql.DB         // SqliteSystemDB is a custom sqlite handle (e.g. from modernc.org/sqlite). Optional; takes precedence over DatabaseURL. Mutually exclusive with SystemDBPool.
+	DatabaseSchema         string          // Database schema name (defaults to "dbos")
+	ApplicationDatabaseURL string          // Application database used by RunAsTransaction, when separate from the system database. Needed so ForkWorkflow can copy transactional-step checkpoints.
+	Logger                 *slog.Logger    // Optional custom logger
+	Serializer             Serializer[any] // Optional custom serializer (defaults to JSON)
 }
 
 // Client provides a programmatic way to interact with your DBOS application from external code.
@@ -80,13 +81,14 @@ type client struct {
 //	}
 func NewClient(ctx context.Context, config ClientConfig) (Client, error) {
 	dbosCtx, err := NewDBOSContext(ctx, Config{
-		DatabaseURL:    config.DatabaseURL,
-		DatabaseSchema: config.DatabaseSchema,
-		AppName:        "dbos-client",
-		Logger:         config.Logger,
-		SystemDBPool:   config.SystemDBPool,
-		SqliteSystemDB: config.SqliteSystemDB,
-		Serializer:     config.Serializer,
+		DatabaseURL:            config.DatabaseURL,
+		DatabaseSchema:         config.DatabaseSchema,
+		AppName:                "dbos-client",
+		Logger:                 config.Logger,
+		SystemDBPool:           config.SystemDBPool,
+		SqliteSystemDB:         config.SqliteSystemDB,
+		ApplicationDatabaseURL: config.ApplicationDatabaseURL,
+		Serializer:             config.Serializer,
 	})
 	if err != nil {
 		return nil, err
