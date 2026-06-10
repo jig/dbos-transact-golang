@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -5140,15 +5141,37 @@ func maskPasswordInKeyValueFormat(connStr string) string {
 /******* RETRIER ********/
 /*******************************/
 
-// isRetryableTransaction returns true for PG error 40001 (SerializationFailure).
-// Useful for CockroachDB transaction retries
+// isRetryableTransaction returns true if any PG error in err's tree is 40001
+// (SerializationFailure) or 40P01 (DeadlockDetected): transient transaction aborts
+// that are safe to retry on a fresh transaction. Used for CockroachDB transaction
+// retries and for the transactional-step engines (runAsTxn / runAsAppTxn).
+//
+// The whole error tree is searched (not errors.As) because the step engines join
+// the user function's error with the checkpoint-recording error: after an abort,
+// the recording fails with 25P02 and errors.As would stop at that first PgError,
+// never reaching the 40001 in the other branch of the join.
 func isRetryableTransaction(err error, _ *slog.Logger) bool {
+	return anyPgErrorCode(err, pgerrcode.SerializationFailure, pgerrcode.DeadlockDetected)
+}
+
+// anyPgErrorCode reports whether any error in err's tree (following both single
+// and multi (errors.Join) unwrapping) is a *pgconn.PgError with one of the codes.
+func anyPgErrorCode(err error, codes ...string) bool {
 	if err == nil {
 		return false
 	}
-	var pgerr *pgconn.PgError
-	if errors.As(err, &pgerr) && pgerr.Code == pgerrcode.SerializationFailure {
-		return true
+	if pgerr, ok := err.(*pgconn.PgError); ok {
+		return slices.Contains(codes, pgerr.Code)
+	}
+	switch x := err.(type) {
+	case interface{ Unwrap() error }:
+		return anyPgErrorCode(x.Unwrap(), codes...)
+	case interface{ Unwrap() []error }:
+		for _, e := range x.Unwrap() {
+			if anyPgErrorCode(e, codes...) {
+				return true
+			}
+		}
 	}
 	return false
 }

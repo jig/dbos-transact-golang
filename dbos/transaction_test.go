@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -160,6 +161,74 @@ func TestForkWorkflowWithTransactions(t *testing.T) {
 		`SELECT count(*) FROM dbos.transaction_outputs WHERE workflow_uuid = $1`,
 		forkedHandle.GetWorkflowID()).Scan(&copied))
 	require.Equal(t, 1, copied)
+}
+
+// TestRunAsTransactionSerializationRetry proves that a transactional step hit by
+// a serialization failure (PG 40001, expected under SERIALIZABLE contention) is
+// retried on a fresh transaction instead of failing the workflow.
+func TestRunAsTransactionSerializationRetry(t *testing.T) {
+	skipIfSqlite(t, "transactional steps are Postgres-only")
+
+	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
+
+	verifyPool, err := pgxpool.New(context.Background(), getDatabaseURL())
+	require.NoError(t, err)
+	defer verifyPool.Close()
+
+	_, err = verifyPool.Exec(context.Background(),
+		`CREATE TABLE IF NOT EXISTS srlz_txn_data (id text PRIMARY KEY, val int NOT NULL)`)
+	require.NoError(t, err)
+	_, err = verifyPool.Exec(context.Background(),
+		`INSERT INTO srlz_txn_data (id, val) VALUES ('k', 0) ON CONFLICT (id) DO UPDATE SET val = 0`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = verifyPool.Exec(context.Background(), `DROP TABLE IF EXISTS srlz_txn_data`)
+	})
+
+	// Rendezvous: both transactions must read before either writes, forcing a
+	// read-write conflict under SERIALIZABLE. After the barrier opens (or on
+	// retried attempts) it is non-blocking.
+	var readyCount atomic.Int64
+	bothReady := make(chan struct{})
+	var fnExecutions atomic.Int64
+
+	contendingWorkflow := func(ctx DBOSContext, _ string) (int, error) {
+		return RunAsTransaction(ctx, func(txCtx context.Context, tx Tx) (int, error) {
+			fnExecutions.Add(1)
+			var val int
+			if err := tx.QueryRow(txCtx, `SELECT val FROM srlz_txn_data WHERE id = 'k'`).Scan(&val); err != nil {
+				return 0, err
+			}
+			if readyCount.Add(1) == 2 {
+				close(bothReady)
+			}
+			<-bothReady
+			if _, err := tx.Exec(txCtx, `UPDATE srlz_txn_data SET val = $1 WHERE id = 'k'`, val+1); err != nil {
+				return 0, err
+			}
+			return val + 1, nil
+		}, WithTxIsolation(IsoLevelSerializable))
+	}
+
+	RegisterWorkflow(dbosCtx, contendingWorkflow)
+	require.NoError(t, Launch(dbosCtx))
+
+	h1, err := RunWorkflow(dbosCtx, contendingWorkflow, "a")
+	require.NoError(t, err)
+	h2, err := RunWorkflow(dbosCtx, contendingWorkflow, "b")
+	require.NoError(t, err)
+
+	_, err = h1.GetResult()
+	require.NoError(t, err, "workflow must survive a serialization failure via retry")
+	_, err = h2.GetResult()
+	require.NoError(t, err, "workflow must survive a serialization failure via retry")
+
+	// Both increments landed: the loser of the serialization conflict retried.
+	var val int
+	require.NoError(t, verifyPool.QueryRow(context.Background(),
+		`SELECT val FROM srlz_txn_data WHERE id = 'k'`).Scan(&val))
+	require.Equal(t, 2, val)
+	require.GreaterOrEqual(t, fnExecutions.Load(), int64(3), "the conflict loser must have re-executed fn")
 }
 
 // TestTransactionOutputsCleanup proves that deleting and garbage-collecting

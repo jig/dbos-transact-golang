@@ -1957,7 +1957,7 @@ func (c *dbosContext) runAsTxn(_ DBOSContext, fn txnFunc, opts ...StepOption) (a
 			return nil, newStepExecutionError(stepState.workflowID, stepOpts.stepName, fmt.Errorf("failed to commit transaction: %w", err))
 		}
 		return stepOutput, stepError
-	}, withRetrierLogger(c.logger))
+	}, withRetrierLogger(c.logger), withRetryCondition(isRetryableTransaction))
 }
 
 // runAsAppTxn is the public RunAsTransaction engine. Unlike runAsTxn — which is the
@@ -2080,7 +2080,7 @@ func (c *dbosContext) runAsAppTxn(_ DBOSContext, fn txnFunc, opts ...StepOption)
 			return nil, newStepExecutionError(stepState.workflowID, stepOpts.stepName, fmt.Errorf("failed to commit transaction: %w", err))
 		}
 		return stepOutput, stepError
-	}, withRetrierLogger(c.logger))
+	}, withRetrierLogger(c.logger), withRetryCondition(isRetryableTransaction))
 }
 
 // Go runs a step inside a Go routine and returns a channel to receive the result.

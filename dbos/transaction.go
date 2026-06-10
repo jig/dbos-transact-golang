@@ -12,8 +12,10 @@ type Transaction[R any] func(ctx context.Context, tx Tx) (R, error)
 
 // RunAsTransaction runs fn as a single DBOS step whose database writes and step
 // checkpoint commit atomically in one transaction. On serialization failures
-// the whole step is retried; on replay the recorded result is returned without
-// re-running fn (exactly-once).
+// (PG 40001) and deadlocks (PG 40P01) the whole step is retried on a fresh
+// transaction; on replay the recorded result is returned without re-running fn
+// (exactly-once). For the retry to work, fn must return errors from Tx
+// operations as-is (or wrapped), not swallow them.
 //
 // Usage requirements:
 //   - The user MUST issue all SQL through the provided Tx, not through a
