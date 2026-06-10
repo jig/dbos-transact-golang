@@ -5164,6 +5164,160 @@ func TestWorkflowIdentity(t *testing.T) {
 	})
 }
 
+// authSnapshot holds identity fields read from a workflow's DB row.
+type authSnapshot struct {
+	User  string
+	Role  string
+	Roles []string
+}
+
+// captureAuthFromDB reads the calling workflow's own identity from workflow_status.
+func captureAuthFromDB(ctx DBOSContext) (authSnapshot, error) {
+	wfID, err := GetWorkflowID(ctx)
+	if err != nil {
+		return authSnapshot{}, err
+	}
+	rows, err := ctx.(*dbosContext).systemDB.listWorkflows(ctx, listWorkflowsDBInput{
+		workflowIDs: []string{wfID},
+	})
+	if err != nil || len(rows) == 0 {
+		return authSnapshot{}, err
+	}
+	return authSnapshot{
+		User:  rows[0].AuthenticatedUser,
+		Role:  rows[0].AssumedRole,
+		Roles: rows[0].AuthenticatedRoles,
+	}, nil
+}
+
+// authChildWorkflow returns its own auth snapshot as output.
+func authChildWorkflow(ctx DBOSContext, _ string) (authSnapshot, error) {
+	return captureAuthFromDB(ctx)
+}
+
+// authParentWorkflow spawns authChildWorkflow without passing any auth opts.
+// Propagation from workflowState should carry the parent's identity.
+func authParentWorkflow(ctx DBOSContext, _ string) (authSnapshot, error) {
+	handle, err := RunWorkflow(ctx, authChildWorkflow, "")
+	if err != nil {
+		return authSnapshot{}, err
+	}
+	return handle.GetResult()
+}
+
+// authGrandparentWorkflow tests three-level propagation.
+func authGrandparentWorkflow(ctx DBOSContext, _ string) (authSnapshot, error) {
+	handle, err := RunWorkflow(ctx, authParentWorkflow, "")
+	if err != nil {
+		return authSnapshot{}, err
+	}
+	return handle.GetResult()
+}
+
+// authParentWithOverrideWorkflow spawns a child that explicitly sets different auth.
+func authParentWithOverrideWorkflow(ctx DBOSContext, _ string) (authSnapshot, error) {
+	handle, err := RunWorkflow(ctx, authChildWorkflow, "",
+		WithAuthenticatedUser("service-account"),
+		WithAssumedRole("service"),
+		WithAuthenticatedRoles([]string{"internal"}),
+	)
+	if err != nil {
+		return authSnapshot{}, err
+	}
+	return handle.GetResult()
+}
+
+func TestAuthPropagation(t *testing.T) {
+	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
+	RegisterWorkflow(dbosCtx, authChildWorkflow)
+	RegisterWorkflow(dbosCtx, authParentWorkflow)
+	RegisterWorkflow(dbosCtx, authGrandparentWorkflow)
+	RegisterWorkflow(dbosCtx, authParentWithOverrideWorkflow)
+
+	t.Run("PropagatesFromParentToChild", func(t *testing.T) {
+		handle, err := RunWorkflow(dbosCtx, authParentWorkflow, "",
+			WithAuthenticatedUser("alice@example.com"),
+			WithAssumedRole("customer"),
+			WithAuthenticatedRoles([]string{"read", "write"}),
+		)
+		require.NoError(t, err)
+		childAuth, err := handle.GetResult()
+		require.NoError(t, err)
+		assert.Equal(t, "alice@example.com", childAuth.User)
+		assert.Equal(t, "customer", childAuth.Role)
+		assert.Equal(t, []string{"read", "write"}, childAuth.Roles)
+	})
+
+	t.Run("ChildExplicitOverridesParent", func(t *testing.T) {
+		handle, err := RunWorkflow(dbosCtx, authParentWithOverrideWorkflow, "",
+			WithAuthenticatedUser("alice@example.com"),
+			WithAssumedRole("customer"),
+			WithAuthenticatedRoles([]string{"read", "write"}),
+		)
+		require.NoError(t, err)
+		childAuth, err := handle.GetResult()
+		require.NoError(t, err)
+		assert.Equal(t, "service-account", childAuth.User)
+		assert.Equal(t, "service", childAuth.Role)
+		assert.Equal(t, []string{"internal"}, childAuth.Roles)
+	})
+
+	t.Run("EmptyParentDoesNotPropagateNoise", func(t *testing.T) {
+		handle, err := RunWorkflow(dbosCtx, authParentWorkflow, "")
+		require.NoError(t, err)
+		childAuth, err := handle.GetResult()
+		require.NoError(t, err)
+		assert.Empty(t, childAuth.User)
+		assert.Empty(t, childAuth.Role)
+		assert.Empty(t, childAuth.Roles)
+	})
+
+	t.Run("PropagatesMultipleLevels", func(t *testing.T) {
+		handle, err := RunWorkflow(dbosCtx, authGrandparentWorkflow, "",
+			WithAuthenticatedUser("alice@example.com"),
+			WithAssumedRole("customer"),
+			WithAuthenticatedRoles([]string{"read", "write"}),
+		)
+		require.NoError(t, err)
+		grandchildAuth, err := handle.GetResult()
+		require.NoError(t, err)
+		assert.Equal(t, "alice@example.com", grandchildAuth.User)
+		assert.Equal(t, "customer", grandchildAuth.Role)
+		assert.Equal(t, []string{"read", "write"}, grandchildAuth.Roles)
+	})
+
+	t.Run("PropagatesAfterRecovery", func(t *testing.T) {
+		const wfID = "auth-recovery-test-wf"
+
+		handle, err := RunWorkflow(dbosCtx, authParentWorkflow, "",
+			WithWorkflowID(wfID),
+			WithAuthenticatedUser("alice@example.com"),
+			WithAssumedRole("customer"),
+			WithAuthenticatedRoles([]string{"read", "write"}),
+		)
+		require.NoError(t, err)
+		_, err = handle.GetResult()
+		require.NoError(t, err)
+
+		// Simulate crash: reset parent to PENDING so recovery re-runs it.
+		setWorkflowStatusPending(t, dbosCtx, wfID)
+
+		recoveredHandles, err := recoverPendingWorkflows(dbosCtx.(*dbosContext), []string{"local"})
+		require.NoError(t, err)
+		require.Len(t, recoveredHandles, 1)
+
+		// Use a typed handle so the JSON output decodes into authSnapshot.
+		typedHandle, err := RetrieveWorkflow[authSnapshot](dbosCtx, wfID)
+		require.NoError(t, err)
+		childAuth, err := typedHandle.GetResult()
+		require.NoError(t, err)
+
+		assert.Equal(t, "alice@example.com", childAuth.User)
+		assert.Equal(t, "customer", childAuth.Role)
+		assert.Equal(t, []string{"read", "write"}, childAuth.Roles)
+	})
+}
+
 func TestWorkflowHandles(t *testing.T) {
 	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
 	RegisterWorkflow(dbosCtx, slowWorkflow)
@@ -6578,5 +6732,122 @@ func TestGetWorkflowAggregates(t *testing.T) {
 			total += r.Count
 		}
 		assert.Equal(t, int64(2), total)
+	})
+}
+
+func stepAggOK(_ context.Context) (string, error) { return "ok", nil }
+
+func stepAggBad(_ context.Context) (string, error) { return "", errors.New("boom") }
+
+// stepAggregatesWorkflow runs two successful steps (aggStepOK) and one failing step
+// (aggStepBad, whose error is caught) so the operation_outputs table holds a known mix
+// of SUCCESS and ERROR steps.
+func stepAggregatesWorkflow(ctx DBOSContext, _ string) (string, error) {
+	if _, err := RunAsStep(ctx, stepAggOK, WithStepName("aggStepOK")); err != nil {
+		return "", err
+	}
+	if _, err := RunAsStep(ctx, stepAggOK, WithStepName("aggStepOK")); err != nil {
+		return "", err
+	}
+	_, _ = RunAsStep(ctx, stepAggBad, WithStepName("aggStepBad"))
+	return "done", nil
+}
+
+func TestGetStepAggregates(t *testing.T) {
+	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
+
+	RegisterWorkflow(dbosCtx, stepAggregatesWorkflow)
+	require.NoError(t, Launch(dbosCtx), "failed to launch DBOS instance")
+
+	// Run 3 workflows: 6 aggStepOK (SUCCESS), 3 aggStepBad (ERROR).
+	for i := 0; i < 3; i++ {
+		handle, err := RunWorkflow(dbosCtx, stepAggregatesWorkflow, fmt.Sprintf("in-%d", i))
+		require.NoError(t, err)
+		_, err = handle.GetResult()
+		require.NoError(t, err)
+	}
+
+	t.Run("GroupByFunctionName", func(t *testing.T) {
+		rows, err := GetStepAggregates(dbosCtx, GetStepAggregatesInput{
+			GroupByFunctionName: true,
+			SelectCount:         true,
+		})
+		require.NoError(t, err)
+		counts := map[string]int64{}
+		for _, r := range rows {
+			require.NotNil(t, r.Group["function_name"])
+			require.NotNil(t, r.Count)
+			counts[*r.Group["function_name"]] = *r.Count
+		}
+		assert.Equal(t, int64(6), counts["aggStepOK"])
+		assert.Equal(t, int64(3), counts["aggStepBad"])
+	})
+
+	t.Run("GroupByStatus", func(t *testing.T) {
+		rows, err := GetStepAggregates(dbosCtx, GetStepAggregatesInput{
+			GroupByStatus: true,
+			SelectCount:   true,
+		})
+		require.NoError(t, err)
+		counts := map[string]int64{}
+		for _, r := range rows {
+			require.NotNil(t, r.Group["status"])
+			require.NotNil(t, r.Count)
+			counts[*r.Group["status"]] = *r.Count
+		}
+		assert.Equal(t, int64(6), counts["SUCCESS"])
+		assert.Equal(t, int64(3), counts["ERROR"])
+	})
+
+	t.Run("FilterByFunctionName", func(t *testing.T) {
+		rows, err := GetStepAggregates(dbosCtx, GetStepAggregatesInput{
+			GroupByStatus: true,
+			SelectCount:   true,
+			FunctionName:  []string{"aggStepBad"},
+		})
+		require.NoError(t, err)
+		require.Len(t, rows, 1)
+		require.NotNil(t, rows[0].Group["status"])
+		assert.Equal(t, "ERROR", *rows[0].Group["status"])
+		require.NotNil(t, rows[0].Count)
+		assert.Equal(t, int64(3), *rows[0].Count)
+	})
+
+	t.Run("FilterByStatus", func(t *testing.T) {
+		rows, err := GetStepAggregates(dbosCtx, GetStepAggregatesInput{
+			GroupByFunctionName: true,
+			SelectCount:         true,
+			Status:              []string{"SUCCESS"},
+		})
+		require.NoError(t, err)
+		require.Len(t, rows, 1)
+		require.NotNil(t, rows[0].Group["function_name"])
+		assert.Equal(t, "aggStepOK", *rows[0].Group["function_name"])
+		require.NotNil(t, rows[0].Count)
+		assert.Equal(t, int64(6), *rows[0].Count)
+	})
+
+	t.Run("SelectMaxDuration", func(t *testing.T) {
+		rows, err := GetStepAggregates(dbosCtx, GetStepAggregatesInput{
+			GroupByFunctionName: true,
+			SelectMaxDurationMs: true,
+		})
+		require.NoError(t, err)
+		require.NotEmpty(t, rows)
+		for _, r := range rows {
+			assert.Nil(t, r.Count, "count should not be selected")
+			require.NotNil(t, r.MaxDurationMs, "max_duration_ms should be selected")
+			assert.GreaterOrEqual(t, *r.MaxDurationMs, int64(0))
+		}
+	})
+
+	t.Run("NoGroupByReturnsError", func(t *testing.T) {
+		_, err := GetStepAggregates(dbosCtx, GetStepAggregatesInput{SelectCount: true})
+		require.Error(t, err)
+	})
+
+	t.Run("NoSelectReturnsError", func(t *testing.T) {
+		_, err := GetStepAggregates(dbosCtx, GetStepAggregatesInput{GroupByFunctionName: true})
+		require.Error(t, err)
 	})
 }

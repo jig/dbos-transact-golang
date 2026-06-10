@@ -399,6 +399,8 @@ func (c *conductor) handleMessage(data []byte) error {
 		return c.handleGetWorkflowStreamsRequest(data, base.RequestID)
 	case getWorkflowAggregatesMessage:
 		return c.handleGetWorkflowAggregatesRequest(data, base.RequestID)
+	case getStepAggregatesMessage:
+		return c.handleGetStepAggregatesRequest(data, base.RequestID)
 	case listAppVersionsMessage:
 		return c.handleListApplicationVersionsRequest(data, base.RequestID)
 	case setLatestAppVersionMessage:
@@ -927,7 +929,7 @@ func (c *conductor) handleListStepsRequest(data []byte, requestID string) error 
 	c.logger.Debug("Handling list steps request", "request", req)
 
 	// Get workflow steps using the public GetWorkflowSteps method
-	steps, err := GetWorkflowSteps(c.dbosCtx, req.WorkflowID)
+	steps, err := GetWorkflowSteps(c.dbosCtx, req.WorkflowID, WithStepsLoadOutput(req.LoadOutput))
 	if err != nil {
 		c.logger.Error("Failed to list workflow steps", "workflow_id", req.WorkflowID, "error", err)
 		errorMsg := fmt.Sprintf("failed to list workflow steps: %v", err)
@@ -975,7 +977,10 @@ func (c *conductor) handleGetWorkflowRequest(data []byte, requestID string) erro
 	}
 	c.logger.Debug("Handling get workflow request", "workflow_id", req.WorkflowID)
 
-	workflows, err := c.dbosCtx.ListWorkflows(c.dbosCtx, WithWorkflowIDs([]string{req.WorkflowID}))
+	workflows, err := c.dbosCtx.ListWorkflows(c.dbosCtx,
+		WithWorkflowIDs([]string{req.WorkflowID}),
+		WithLoadInput(req.LoadInput),
+		WithLoadOutput(req.LoadOutput))
 	if err != nil {
 		c.logger.Error("Failed to get workflow", "workflow_id", req.WorkflowID, "error", err)
 		errorMsg := fmt.Sprintf("failed to get workflow: %v", err)
@@ -1531,6 +1536,52 @@ func (c *conductor) handleGetWorkflowAggregatesRequest(data []byte, requestID st
 
 	resp.Output = rows
 	return c.sendResponse(resp, string(getWorkflowAggregatesMessage))
+}
+
+func (c *conductor) handleGetStepAggregatesRequest(data []byte, requestID string) error {
+	var req getStepAggregatesConductorRequest
+	if err := json.Unmarshal(data, &req); err != nil {
+		c.logger.Error("Failed to parse get step aggregates request", "error", err)
+		return fmt.Errorf("failed to parse get step aggregates request: %w", err)
+	}
+	c.logger.Debug("Handling get step aggregates request", "request_id", requestID)
+
+	input := GetStepAggregatesInput{
+		GroupByFunctionName: req.Body.GroupByFunctionName,
+		GroupByStatus:       req.Body.GroupByStatus,
+		SelectCount:         req.Body.SelectCount,
+		SelectMaxDurationMs: req.Body.SelectMaxDurationMs,
+		Status:              req.Body.Status.toSlice(),
+		FunctionName:        req.Body.FunctionName.toSlice(),
+		WorkflowIDPrefix:    req.Body.WorkflowIDPrefix.toSlice(),
+	}
+	if req.Body.TimeBucketSizeMs != nil {
+		input.TimeBucketSize = time.Duration(*req.Body.TimeBucketSizeMs) * time.Millisecond
+	}
+	if req.Body.CompletedAfter != nil {
+		input.CompletedAfter = *req.Body.CompletedAfter
+	}
+	if req.Body.CompletedBefore != nil {
+		input.CompletedBefore = *req.Body.CompletedBefore
+	}
+
+	resp := getStepAggregatesConductorResponse{
+		baseResponse: baseResponse{
+			baseMessage: baseMessage{Type: getStepAggregatesMessage, RequestID: requestID},
+		},
+		Output: []StepAggregateRow{},
+	}
+
+	rows, err := c.dbosCtx.GetStepAggregates(c.dbosCtx, input)
+	if err != nil {
+		c.logger.Error("Failed to get step aggregates", "error", err)
+		errStr := fmt.Sprintf("Exception encountered when getting step aggregates: %v", err)
+		resp.ErrorMessage = &errStr
+		return c.sendResponse(resp, string(getStepAggregatesMessage))
+	}
+
+	resp.Output = rows
+	return c.sendResponse(resp, string(getStepAggregatesMessage))
 }
 
 func (c *conductor) sendResponse(response any, responseType string) error {
