@@ -3025,7 +3025,7 @@ func (s *sysDB) sleep(ctx context.Context, input sleepInput) (time.Duration, err
 		}
 
 		if recordedResult.errStr != nil { // This should never happen
-			return 0, errors.New(*recordedResult.errStr)
+			return 0, errorFromRecorded(*recordedResult.errStr)
 		}
 	} else {
 		// First execution: calculate and record the end time
@@ -3462,7 +3462,7 @@ func (s *sysDB) recv(ctx context.Context, input recvInput) (*recvResult, error) 
 	if recordedResult != nil {
 		var recvErr error
 		if recordedResult.errStr != nil {
-			recvErr = errors.New(*recordedResult.errStr)
+			recvErr = errorFromRecorded(*recordedResult.errStr)
 		}
 		return &recvResult{message: recordedResult.output, serialization: recordedResult.serialization}, recvErr
 	}
@@ -3746,7 +3746,7 @@ func (s *sysDB) getEvent(ctx context.Context, input getEventInput) (*getEventRes
 		if recordedResult != nil {
 			var evtErr error
 			if recordedResult.errStr != nil {
-				evtErr = errors.New(*recordedResult.errStr)
+				evtErr = errorFromRecorded(*recordedResult.errStr)
 			}
 			return &getEventResult{value: recordedResult.output, serialization: recordedResult.serialization}, evtErr
 		}

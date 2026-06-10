@@ -1,6 +1,11 @@
 package dbos
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+)
 
 // DBOSErrorCode represents the different types of errors that can occur in DBOS operations.
 type DBOSErrorCode int
@@ -56,6 +61,24 @@ func (e *DBOSError) Error() string {
 // This enables Go's error unwrapping functionality with errors.Is and errors.As.
 func (e *DBOSError) Unwrap() error {
 	return e.wrappedErr
+}
+
+// errorFromRecorded reconstructs an error that was previously recorded as a step
+// result. DBOS stores step errors as their Error() text; a *DBOSError renders as
+// "DBOS Error <code>: <message>" (see DBOSError.Error). When the recorded text
+// has that shape we rebuild a *DBOSError preserving the code, so that after a
+// recovery or a durable-suspension replay callers can still use errors.As (or
+// inspect Code) on the returned error — exactly as on the first execution. Any
+// other text is returned as a plain error.
+func errorFromRecorded(s string) error {
+	if rest, ok := strings.CutPrefix(s, "DBOS Error "); ok {
+		if i := strings.Index(rest, ": "); i > 0 {
+			if code, err := strconv.Atoi(rest[:i]); err == nil {
+				return &DBOSError{Code: DBOSErrorCode(code), Message: rest[i+2:]}
+			}
+		}
+	}
+	return errors.New(s)
 }
 
 // Implements https://pkg.go.dev/errors#Is
