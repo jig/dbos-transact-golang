@@ -4504,6 +4504,11 @@ func TestGarbageCollect(t *testing.T) {
 			require.NoError(t, err, "failed to get result from test workflow %d", i)
 			require.Equal(t, i, result, "expected result %d, got %d", i, result)
 			completedHandles = append(completedHandles, handle)
+			// created_at has millisecond resolution and the rows-threshold cutoff
+			// uses a strict created_at < cutoff comparison: two workflows created in
+			// the same millisecond around the threshold make the GC keep one extra
+			// row. Space the creations out so every workflow gets a distinct timestamp.
+			time.Sleep(2 * time.Millisecond)
 		}
 
 		// Verify exactly 11 workflows exist before GC (1 blocked + 10 completed)
@@ -4741,6 +4746,11 @@ func TestGarbageCollect(t *testing.T) {
 			result, err := handle.GetResult()
 			require.NoError(t, err, "failed to get result from test workflow %d", i)
 			require.Equal(t, i, result, "expected result %d, got %d", i, result)
+			// created_at has millisecond resolution and the rows-threshold cutoff
+			// uses a strict created_at < cutoff comparison: two workflows created in
+			// the same millisecond around the threshold make the GC keep one extra
+			// row. Space the creations out so every workflow gets a distinct timestamp.
+			time.Sleep(2 * time.Millisecond)
 		}
 
 		// Verify exactly 6 workflows exist (1 blocked + 5 completed)
