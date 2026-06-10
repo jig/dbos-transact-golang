@@ -2494,15 +2494,24 @@ func Send[P any](ctx DBOSContext, destinationID string, message P, topic string,
 }
 
 type recvInput struct {
-	Topic         string        // Topic to listen for (empty string receives from default topic)
-	Timeout       time.Duration // Maximum time to wait for a message
-	serialization string        // fallback serialization format (receiver's) for recording when no message is found
+	Topic            string        // Topic to listen for (empty string receives from default topic)
+	Timeout          time.Duration // Maximum time to wait for a message
+	serialization    string        // fallback serialization format (receiver's) for recording when no message is found
+	suspendThreshold time.Duration // when > 0 and no message arrives within it, return a suspension sentinel instead of waiting in-process
+	stepID           *int          // pre-assigned step IDs, for re-entry after a failed suspension
+	sleepStepID      *int
 }
 
 // recvResult carries the received message along with its serialization format from the notifications table.
+// When suspend is set, no message arrived within the suspension threshold and nothing was
+// recorded: the caller should durably suspend the workflow and let it replay.
 type recvResult struct {
 	message       *string
 	serialization string
+	suspend       bool
+	delayUntil    time.Time // durable timeout deadline (set when suspend is)
+	stepID        int       // step IDs used, so a re-entry can reuse them
+	sleepStepID   int
 }
 
 func (c *dbosContext) Recv(_ DBOSContext, topic string, timeout time.Duration) (any, error) {
@@ -2518,13 +2527,66 @@ func (c *dbosContext) Recv(_ DBOSContext, topic string, timeout time.Duration) (
 		Timeout:       timeout,
 		serialization: resolveEncoder(c).Name(),
 	}
+	if c.config.DurableSleepThreshold > 0 {
+		input.suspendThreshold = c.config.DurableSleepThreshold
+	}
 	recvRetryOpts := []retryOption{withRetrierLogger(c.logger)}
 	if sysDB, ok := c.systemDB.(*sysDB); ok && sysDB.isCockroachDB {
 		recvRetryOpts = append(recvRetryOpts, withRetryCondition(isRetryableTransaction))
 	}
+	result, err := retryWithResult(c, func() (*recvResult, error) {
+		return c.systemDB.recv(c, input)
+	}, recvRetryOpts...)
+	if err != nil || result == nil || !result.suspend {
+		return result, err
+	}
+
+	// No message within the threshold: durably suspend until a Send wakes us or the
+	// timeout deadline passes. Does not return when the suspension succeeds.
+	c.suspendForRecv(wfState, topic, result.delayUntil)
+
+	// Suspension failed (e.g. concurrent cancellation): wait in-process for the rest
+	// of the timeout, re-entering with the same step IDs.
+	input.suspendThreshold = 0
+	input.stepID = &result.stepID
+	input.sleepStepID = &result.sleepStepID
 	return retryWithResult(c, func() (*recvResult, error) {
 		return c.systemDB.recv(c, input)
 	}, recvRetryOpts...)
+}
+
+// suspendForRecv durably parks the calling workflow (status DELAYED) until a message
+// arrives (send wakes the destination) or the recv timeout deadline passes, then
+// unwinds the goroutine via workflowSuspension — it does not return on success.
+// delay_until is capped by the waiter fallback interval so a lost wake-up costs at
+// most one spurious replay per interval (the replayed recv re-suspends if there is
+// still no message and time remains).
+func (c *dbosContext) suspendForRecv(wfState *workflowState, topic string, deadline time.Time) {
+	delayUntil := deadline
+	if fallback := time.Now().Add(_waiterWakeFallbackInterval); fallback.Before(delayUntil) {
+		delayUntil = fallback
+	}
+	// Register the workflow as a waiter on itself: this marks it as "suspended waiting
+	// for a message", which is what send's wake-up targets.
+	suspended, err := retryWithResult(c, func() (bool, error) {
+		return c.systemDB.suspendWorkflowForResult(c, wfState.workflowID, wfState.workflowID, delayUntil)
+	}, withRetrierLogger(c.logger))
+	if err != nil || !suspended {
+		c.logger.Warn("could not suspend workflow awaiting a message; waiting in-process", "workflow_id", wfState.workflowID, "topic", topic, "error", err)
+		return
+	}
+
+	// Close the race where a message landed after recv's check but before the waiter
+	// row was committed (its send found no suspended waiter to wake).
+	exists, err := c.systemDB.hasUnconsumedNotification(c, wfState.workflowID, topic)
+	if err == nil && exists {
+		if wakeErr := c.systemDB.wakeSuspendedWorkflow(c, wfState.workflowID); wakeErr != nil {
+			// Not fatal: the fallback delay still bounds the wait.
+			c.logger.Warn("failed to self-wake after a message arrived", "workflow_id", wfState.workflowID, "topic", topic, "error", wakeErr)
+		}
+	}
+
+	panic(&workflowSuspension{workflowID: wfState.workflowID, delayUntil: delayUntil})
 }
 
 // Recv receives a message sent to this workflow with type safety.
@@ -2532,6 +2594,12 @@ func (c *dbosContext) Recv(_ DBOSContext, topic string, timeout time.Duration) (
 // Messages are consumed in FIFO order and each message is delivered exactly once.
 //
 // Recv can only be called from within a workflow and becomes part of the workflow's durable state.
+//
+// If Config.DurableSleepThreshold is set and no message arrives within it, the
+// workflow is suspended to the database (status DELAYED, goroutine released) until a
+// Send to it arrives or the timeout deadline passes, then re-executed with completed
+// steps memoized. The same determinism requirements as for a suspending Sleep apply;
+// see the Sleep documentation.
 //
 // Example:
 //

@@ -251,6 +251,8 @@ Workflows that suspend must follow the same discipline as recovery (it is the sa
 
 Workflows started directly (not enqueued) are parked on the internal DBOS queue while suspended; enqueued workflows wake up on their own queue. In-memory workflow handles keep working: `GetResult()` transparently falls back to polling the database when the workflow suspends.
 
+**Waiting on a message (`Recv`) suspends too.** With suspension enabled, a workflow blocked in `Recv` waits in-process only up to the threshold and then suspends; a `Send` to it wakes it immediately (event-driven, inside the sender's transaction), and the recv timeout keeps its exact semantics — it is the suspended workflow's wake-up deadline. A workflow can wait days for a signal at zero cost, like a Temporal signal channel.
+
 **Waiting on child workflows suspends too.** When suspension is enabled, a workflow blocked on a child's `handle.GetResult()` waits in-process only up to the threshold and then suspends to the database as well; the child's completion wakes it (event-driven, with a periodic fallback in case a wake-up is lost). If the child itself suspends, the suspension cascades immediately up the whole parent chain, so an entire workflow tree waiting on one long sleep costs zero goroutines. A `GetResult` with an explicit timeout option never suspends (the timeout is honored in-process).
 
 </details>

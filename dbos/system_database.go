@@ -90,6 +90,8 @@ type systemDatabase interface {
 	suspendWorkflowForSleep(ctx context.Context, workflowID string, delayUntil time.Time) (bool, error)
 	suspendWorkflowForResult(ctx context.Context, waiterID string, awaitedID string, delayUntil time.Time) (bool, error)
 	wakeWorkflowWaiters(ctx context.Context, runner Querier, workflowID string) error
+	wakeSuspendedWorkflow(ctx context.Context, workflowID string) error
+	hasUnconsumedNotification(ctx context.Context, destinationID string, topic string) (bool, error)
 	dequeueWorkflows(ctx context.Context, input dequeueWorkflowsInput) ([]dequeuedWorkflow, error)
 	clearQueueAssignment(ctx context.Context, workflowID string) (bool, error)
 	getQueuePartitions(ctx context.Context, queueName string) ([]string, error)
@@ -1701,6 +1703,16 @@ func (s *sysDB) deleteWorkflows(ctx context.Context, input deleteWorkflowsDBInpu
 	}
 	if _, err := tx.Exec(ctx, deleteQuery, encodedIDs); err != nil {
 		return fmt.Errorf("failed to delete workflow(s): %w", err)
+	}
+
+	// Drop any waiter registrations involving the deleted workflows (no FK cascade).
+	waiterAnyClause := dialectAnyClause(s.dialect, "waiter_workflow_uuid", 1)
+	awaitedAnyClause := dialectAnyClause(s.dialect, "awaited_workflow_uuid", 1)
+	deleteWaitersQuery := s.renderSQL(
+		`DELETE FROM %sworkflow_waiters WHERE %s OR %s`,
+		s.dialect.SchemaPrefix(s.schema), waiterAnyClause, awaitedAnyClause)
+	if _, err := tx.Exec(ctx, deleteWaitersQuery, encodedIDs); err != nil {
+		return fmt.Errorf("failed to delete workflow waiters: %w", err)
 	}
 
 	// If we created the transaction internally, commit it
@@ -3359,22 +3371,51 @@ func (s *sysDB) send(ctx context.Context, input WorkflowSendInput) error {
 		topic = input.Topic
 	}
 
+	// Insert the notification and wake the destination (if it is durably suspended
+	// waiting for a message) in one transaction, so a suspended receiver cannot miss
+	// the message.
+	runner := Querier(input.tx)
+	var localTx Tx
+	if input.tx == nil {
+		tx, err := s.pool.BeginTx(ctx, TxOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to begin transaction to send notification: %w", err)
+		}
+		defer tx.Rollback(ctx)
+		localTx = tx
+		runner = tx
+	}
+
 	insertQuery := s.renderSQL(`INSERT INTO %snotifications (destination_uuid, topic, message, serialization, message_uuid, created_at_epoch_ms) VALUES ($1, $2, $3, $4, $5, $6)`, s.dialect.SchemaPrefix(s.schema))
 	messageUUID := uuid.NewString()
 	createdAtMs := time.Now().UnixMilli()
-	var err error
-	if input.tx != nil {
-		_, err = input.tx.Exec(ctx, insertQuery, input.DestinationID, topic, input.Message, input.serialization, messageUUID, createdAtMs)
-	} else {
-		_, err = s.pool.Exec(ctx, insertQuery, input.DestinationID, topic, input.Message, input.serialization, messageUUID, createdAtMs)
-	}
-	if err != nil {
+	if _, err := runner.Exec(ctx, insertQuery, input.DestinationID, topic, input.Message, input.serialization, messageUUID, createdAtMs); err != nil {
 		s.logger.Error("failed to insert notification", "error", err, "query", insertQuery, "destination_id", input.DestinationID, "topic", topic, "message", input.Message)
 		// Check for foreign key violation (destination workflow doesn't exist)
 		if s.dialect.IsForeignKeyViolation(err) {
 			return newNonExistentWorkflowError(input.DestinationID)
 		}
 		return fmt.Errorf("failed to insert notification: %w", err)
+	}
+
+	// A destination suspended for a Recv registers itself as a waiter on its own ID
+	// (see suspendForRecv); the waiter-row guard keeps this from waking workflows
+	// that are DELAYED for other reasons (initial enqueue delay, durable sleep).
+	schemaPrefix := s.dialect.SchemaPrefix(s.schema)
+	wakeQuery := s.renderSQL(`UPDATE %sworkflow_status
+		SET delay_until_epoch_ms = $1, updated_at = $1
+		WHERE workflow_uuid = $2
+		  AND status = $3
+		  AND EXISTS (SELECT 1 FROM %sworkflow_waiters WHERE waiter_workflow_uuid = $2 AND awaited_workflow_uuid = $2)`,
+		schemaPrefix, schemaPrefix)
+	if _, err := runner.Exec(ctx, wakeQuery, time.Now().UnixMilli(), input.DestinationID, WorkflowStatusDelayed); err != nil {
+		return fmt.Errorf("failed to wake suspended receiver %s: %w", input.DestinationID, err)
+	}
+
+	if localTx != nil {
+		if err := localTx.Commit(ctx); err != nil {
+			return fmt.Errorf("failed to commit notification send: %w", err)
+		}
 	}
 	return nil
 }
@@ -3389,8 +3430,16 @@ func (s *sysDB) recv(ctx context.Context, input recvInput) (*recvResult, error) 
 		return nil, newStepExecutionError("", functionName, fmt.Errorf("workflow state not found in context: are you running this step within a workflow?"))
 	}
 
-	stepID := wfState.nextStepID()
-	sleepStepID := wfState.nextStepID() // We will use a sleep step to implement the timeout
+	// Allocate step IDs, unless the caller re-enters with pre-assigned ones
+	// (after a failed suspension attempt).
+	var stepID, sleepStepID int
+	if input.stepID != nil && input.sleepStepID != nil {
+		stepID = *input.stepID
+		sleepStepID = *input.sleepStepID
+	} else {
+		stepID = wfState.nextStepID()
+		sleepStepID = wfState.nextStepID() // We will use a sleep step to implement the timeout
+	}
 	destinationID := wfState.workflowID
 
 	// Set default topic if not provided
@@ -3461,6 +3510,12 @@ func (s *sysDB) recv(ctx context.Context, input recvInput) (*recvResult, error) 
 		cond.L.Unlock()
 	}
 
+	// When suspension is enabled and the remaining (durable) timeout exceeds the
+	// threshold, wait in-process only up to the threshold, then hand a suspension
+	// sentinel back to the caller. The channel is armed once: repoll iterations must
+	// not extend the in-process wait.
+	var suspendChan <-chan time.Time
+
 loop:
 	for !exists {
 		timeout, err := s.sleep(ctx, sleepInput{
@@ -3471,6 +3526,10 @@ loop:
 		if err != nil {
 			return nil, fmt.Errorf("failed to sleep before recv timeout: %w", err)
 		}
+		deadline := time.Now().Add(timeout)
+		if suspendChan == nil && input.suspendThreshold > 0 && timeout > input.suspendThreshold {
+			suspendChan = time.After(input.suspendThreshold)
+		}
 
 		select {
 		case <-done:
@@ -3479,6 +3538,9 @@ loop:
 			timeoutOccurred = true
 			s.logger.Warn("Recv() timeout reached", "payload", payload, "timeout", input.Timeout)
 			break loop
+		case <-suspendChan:
+			// Nothing recorded: the replayed recv reuses the memoized timeout deadline.
+			return &recvResult{suspend: true, delayUntil: deadline, stepID: stepID, sleepStepID: sleepStepID}, nil
 		case <-repollChannel:
 			s.logger.Warn("Receive polling after repoll channel signal", "payload", payload)
 			// We were instructed to poll again because the connection was disconnected
@@ -4196,6 +4258,35 @@ func (s *sysDB) wakeWorkflowWaiters(ctx context.Context, runner Querier, workflo
 		return fmt.Errorf("failed to delete waiters of workflow %s: %w", workflowID, err)
 	}
 	return nil
+}
+
+// wakeSuspendedWorkflow moves a DELAYED workflow's delay_until to now, so the queue
+// runner promotes and re-executes it on its next pass. Used to self-wake after a
+// suspension race (a message or result that landed before the suspension committed).
+func (s *sysDB) wakeSuspendedWorkflow(ctx context.Context, workflowID string) error {
+	query := s.renderSQL(`UPDATE %sworkflow_status
+		SET delay_until_epoch_ms = $1, updated_at = $1
+		WHERE workflow_uuid = $2
+		  AND status = $3`, s.dialect.SchemaPrefix(s.schema))
+	if _, err := s.pool.Exec(ctx, query, time.Now().UnixMilli(), workflowID, WorkflowStatusDelayed); err != nil {
+		return fmt.Errorf("failed to wake suspended workflow %s: %w", workflowID, err)
+	}
+	return nil
+}
+
+// hasUnconsumedNotification reports whether the workflow has an unconsumed message
+// pending on the given topic (the topic must already be normalized by the caller's
+// recv; an empty topic means the default topic).
+func (s *sysDB) hasUnconsumedNotification(ctx context.Context, destinationID string, topic string) (bool, error) {
+	if topic == "" {
+		topic = _DBOS_NULL_TOPIC
+	}
+	query := s.renderSQL(`SELECT EXISTS (SELECT 1 FROM %snotifications WHERE destination_uuid = $1 AND topic = $2 AND consumed = false)`, s.dialect.SchemaPrefix(s.schema))
+	var exists bool
+	if err := s.pool.QueryRow(ctx, query, destinationID, topic).Scan(&exists); err != nil {
+		return false, fmt.Errorf("failed to check pending notifications for workflow %s: %w", destinationID, err)
+	}
+	return exists, nil
 }
 
 // transitionDelayedWorkflows transitions DELAYED workflows whose delay has expired to ENQUEUED.

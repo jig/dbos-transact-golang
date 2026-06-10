@@ -250,6 +250,29 @@ while the child was suspended. Now (same `DurableSleepThreshold` opt-in):
   - A `GetResult` with an explicit timeout never suspends (timeout honored
     in-process). Calls from outside a workflow are unaffected.
 
-Phase 3 (not done): suspend on `Recv`/`GetEvent` — wake = notification insert
-or timeout expiry; same waiter pattern, but hooked into the notifications
-machinery.
+### Phase 3: suspend on `Recv` (await a message)
+
+Same opt-in. No `NoTimeout` sentinel was added: the existing timeout semantics
+are preserved exactly, only the waiting becomes free.
+
+- If no message arrives within the threshold, `sysDB.recv` returns a suspension
+  sentinel (recording nothing — the timeout's sleep step was already memoized on
+  first execution) and `dbosContext.Recv` suspends the workflow via
+  `suspendWorkflowForResult(X, X, delayUntil)`: the self-waiter row marks
+  "suspended waiting for a message".
+- `delay_until = min(timeout deadline, now + fallback)`: the deadline preserves
+  the recv timeout; the fallback bounds a lost wake-up. On a spurious/fallback
+  wake the replayed recv just re-suspends.
+- **Event-driven wake**: `send()` now inserts the notification and bumps the
+  destination's `delay_until` to now in the same transaction, guarded by the
+  self-waiter row (so workflows DELAYED for other reasons — initial enqueue
+  delay, durable sleep — are not woken by stray sends).
+- The completed-before-registered race is closed by re-checking for an
+  unconsumed notification after committing the suspension and self-waking.
+- A failed suspension (e.g. concurrent cancel) falls back to the in-process
+  wait, re-entering recv with the same step IDs.
+- `deleteWorkflows` now also clears waiter rows involving deleted workflows.
+
+Still pending: the same treatment for `GetEvent` (wake = `SetEvent` on the
+target; waiter = caller → target, which collides nicely with the existing
+result-waiter wake on the target's completion).

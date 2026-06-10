@@ -338,6 +338,126 @@ func TestDurableResultSuspension(t *testing.T) {
 	})
 }
 
+func TestDurableRecvSuspension(t *testing.T) {
+	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true, durableSleepThreshold: 200 * time.Millisecond})
+
+	var recvBody atomic.Int64
+	recvWorkflow := func(ctx DBOSContext, _ string) (string, error) {
+		recvBody.Add(1)
+		msg, err := Recv[string](ctx, "signal", 30*time.Second)
+		if err != nil {
+			return "", err
+		}
+		return "got-" + msg, nil
+	}
+
+	var timeoutBody atomic.Int64
+	timeoutWorkflow := func(ctx DBOSContext, _ string) (string, error) {
+		timeoutBody.Add(1)
+		if _, err := Recv[string](ctx, "never", 1*time.Second); err != nil {
+			return "timed-out", nil // expected: the recv deadline passed while suspended
+		}
+		return "unexpected-message", nil
+	}
+
+	senderWorkflow := func(ctx DBOSContext, destinationID string) (string, error) {
+		if err := Send(ctx, destinationID, "from-workflow", "signal"); err != nil {
+			return "", err
+		}
+		return "sent", nil
+	}
+
+	preludeEvent := NewEvent()
+	var gatedBody atomic.Int64
+	gatedRecvWorkflow := func(ctx DBOSContext, _ string) (string, error) {
+		gatedBody.Add(1)
+		if _, err := RunAsStep(ctx, func(c context.Context) (string, error) {
+			preludeEvent.Wait() // hold the workflow here until the message is in the database
+			return "gated", nil
+		}); err != nil {
+			return "", err
+		}
+		msg, err := Recv[string](ctx, "sig2", 30*time.Second)
+		if err != nil {
+			return "", err
+		}
+		return "got-" + msg, nil
+	}
+
+	RegisterWorkflow(dbosCtx, recvWorkflow)
+	RegisterWorkflow(dbosCtx, timeoutWorkflow)
+	RegisterWorkflow(dbosCtx, senderWorkflow)
+	RegisterWorkflow(dbosCtx, gatedRecvWorkflow)
+	require.NoError(t, Launch(dbosCtx))
+
+	t.Run("SendWakesSuspendedReceiver", func(t *testing.T) {
+		recvBody.Store(0)
+		handle, err := RunWorkflow(dbosCtx, recvWorkflow, "")
+		require.NoError(t, err, "failed to start receiver workflow")
+
+		// With a 30s timeout and a 200ms threshold, the receiver must suspend
+		status := waitForStatus(t, handle, WorkflowStatusDelayed, 5*time.Second)
+		assert.Equal(t, _DBOS_INTERNAL_QUEUE_NAME, status.QueueName)
+
+		tSend := time.Now()
+		require.NoError(t, Send(dbosCtx, handle.GetWorkflowID(), "hello", "signal"))
+
+		result, err := handle.GetResult(WithHandleTimeout(60*time.Second), WithHandlePollingInterval(100*time.Millisecond))
+		require.NoError(t, err, "failed to get receiver result")
+		assert.Equal(t, "got-hello", result)
+		assert.Less(t, time.Since(tSend), 15*time.Second, "the send must wake the receiver well before the 30s recv timeout")
+		assert.Equal(t, int64(2), recvBody.Load(), "receiver should run once before and once after suspension")
+	})
+
+	t.Run("WorkflowSendWakesSuspendedReceiver", func(t *testing.T) {
+		recvBody.Store(0)
+		receiver, err := RunWorkflow(dbosCtx, recvWorkflow, "")
+		require.NoError(t, err, "failed to start receiver workflow")
+		waitForStatus(t, receiver, WorkflowStatusDelayed, 5*time.Second)
+
+		// The send goes through the in-workflow (transactional step) path
+		sender, err := RunWorkflow(dbosCtx, senderWorkflow, receiver.GetWorkflowID())
+		require.NoError(t, err, "failed to start sender workflow")
+		_, err = sender.GetResult(WithHandleTimeout(60*time.Second), WithHandlePollingInterval(100*time.Millisecond))
+		require.NoError(t, err, "failed to get sender result")
+
+		result, err := receiver.GetResult(WithHandleTimeout(60*time.Second), WithHandlePollingInterval(100*time.Millisecond))
+		require.NoError(t, err, "failed to get receiver result")
+		assert.Equal(t, "got-from-workflow", result)
+		assert.Equal(t, int64(2), recvBody.Load())
+	})
+
+	t.Run("TimeoutWhileSuspended", func(t *testing.T) {
+		timeoutBody.Store(0)
+		tStart := time.Now()
+		handle, err := RunWorkflow(dbosCtx, timeoutWorkflow, "")
+		require.NoError(t, err, "failed to start workflow")
+
+		waitForStatus(t, handle, WorkflowStatusDelayed, 5*time.Second)
+
+		result, err := handle.GetResult(WithHandleTimeout(60*time.Second), WithHandlePollingInterval(100*time.Millisecond))
+		require.NoError(t, err, "failed to get workflow result")
+		assert.Equal(t, "timed-out", result)
+		assert.GreaterOrEqual(t, time.Since(tStart), 1*time.Second, "must not report a timeout before the recv deadline")
+		assert.Equal(t, int64(2), timeoutBody.Load(), "workflow should run once before and once after suspension")
+	})
+
+	t.Run("PendingMessageDoesNotSuspend", func(t *testing.T) {
+		gatedBody.Store(0)
+		handle, err := RunWorkflow(dbosCtx, gatedRecvWorkflow, "")
+		require.NoError(t, err, "failed to start gated workflow")
+
+		// Deliver the message while the workflow is still held inside its first step
+		require.NoError(t, Send(dbosCtx, handle.GetWorkflowID(), "early", "sig2"))
+		preludeEvent.Set()
+
+		result, err := handle.GetResult(WithHandleTimeout(60*time.Second), WithHandlePollingInterval(100*time.Millisecond))
+		require.NoError(t, err, "failed to get workflow result")
+		assert.Equal(t, "got-early", result)
+		assert.Equal(t, int64(1), gatedBody.Load(), "a recv with a pending message must keep run-once semantics")
+	})
+}
+
 func TestDurableSleepDisabledByDefault(t *testing.T) {
 	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
 
