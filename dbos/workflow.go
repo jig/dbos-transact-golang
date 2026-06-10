@@ -2722,12 +2722,21 @@ type getEventInput struct {
 	Key              string        // Event key to retrieve
 	Timeout          time.Duration // Maximum time to wait for the event to be set
 	serialization    string        // fallback serialization format (caller's) for recording when no event is found
+	suspendThreshold time.Duration // when > 0 (within a workflow) and the event is not set within it, return a suspension sentinel
+	stepID           *int          // pre-assigned step IDs, for re-entry after a failed suspension
+	sleepStepID      *int
 }
 
 // getEventResult carries the event value along with its serialization format from the workflow_events table.
+// When suspend is set, the event was not set within the suspension threshold and nothing
+// was recorded: the caller should durably suspend the workflow and let it replay.
 type getEventResult struct {
 	value         *string
 	serialization string
+	suspend       bool
+	delayUntil    time.Time // durable timeout deadline (set when suspend is)
+	stepID        int       // step IDs used, so a re-entry can reuse them
+	sleepStepID   int
 }
 
 func (c *dbosContext) GetEvent(_ DBOSContext, targetWorkflowID, key string, timeout time.Duration) (any, error) {
@@ -2737,9 +2746,64 @@ func (c *dbosContext) GetEvent(_ DBOSContext, targetWorkflowID, key string, time
 		Timeout:          timeout,
 		serialization:    resolveEncoder(c).Name(),
 	}
+	wfState, ok := c.Value(workflowStateKey).(*workflowState)
+	isWithinWorkflow := ok && wfState != nil
+	if isWithinWorkflow && !wfState.isWithinStep && c.config.DurableSleepThreshold > 0 {
+		input.suspendThreshold = c.config.DurableSleepThreshold
+	}
+	result, err := retryWithResult(c, func() (*getEventResult, error) {
+		return c.systemDB.getEvent(c, input)
+	}, withRetrierLogger(c.logger))
+	if err != nil || result == nil || !result.suspend {
+		return result, err
+	}
+
+	// Event not set within the threshold: durably suspend until the target's SetEvent
+	// wakes us or the timeout deadline passes. Does not return when it succeeds.
+	c.suspendForEvent(wfState, targetWorkflowID, key, result.delayUntil)
+
+	// Suspension failed (e.g. concurrent cancellation): wait in-process for the rest
+	// of the timeout, re-entering with the same step IDs.
+	input.suspendThreshold = 0
+	input.stepID = &result.stepID
+	input.sleepStepID = &result.sleepStepID
 	return retryWithResult(c, func() (*getEventResult, error) {
 		return c.systemDB.getEvent(c, input)
 	}, withRetrierLogger(c.logger))
+}
+
+// suspendForEvent durably parks the calling workflow (status DELAYED) until the target
+// workflow sets an event (SetEvent wakes the target's registered waiters) or the
+// getEvent timeout deadline passes, then unwinds the goroutine via workflowSuspension —
+// it does not return on success. The waiter registration is the same row used for
+// awaiting the target's result, so the target's completion also wakes the caller
+// (which then re-suspends or times out as appropriate). delay_until is capped by the
+// waiter fallback interval so a lost wake-up costs at most one spurious replay per
+// interval.
+func (c *dbosContext) suspendForEvent(wfState *workflowState, targetWorkflowID, key string, deadline time.Time) {
+	delayUntil := deadline
+	if fallback := time.Now().Add(_waiterWakeFallbackInterval); fallback.Before(delayUntil) {
+		delayUntil = fallback
+	}
+	suspended, err := retryWithResult(c, func() (bool, error) {
+		return c.systemDB.suspendWorkflowForResult(c, wfState.workflowID, targetWorkflowID, delayUntil)
+	}, withRetrierLogger(c.logger))
+	if err != nil || !suspended {
+		c.logger.Warn("could not suspend workflow awaiting an event; waiting in-process", "workflow_id", wfState.workflowID, "target_workflow_id", targetWorkflowID, "key", key, "error", err)
+		return
+	}
+
+	// Close the race where the event was set after getEvent's check but before the
+	// waiter row was committed (its SetEvent found no registered waiter to wake).
+	exists, err := c.systemDB.hasWorkflowEvent(c, targetWorkflowID, key)
+	if err == nil && exists {
+		if wakeErr := c.systemDB.wakeSuspendedWorkflow(c, wfState.workflowID); wakeErr != nil {
+			// Not fatal: the fallback delay still bounds the wait.
+			c.logger.Warn("failed to self-wake after the awaited event was set", "workflow_id", wfState.workflowID, "target_workflow_id", targetWorkflowID, "key", key, "error", wakeErr)
+		}
+	}
+
+	panic(&workflowSuspension{workflowID: wfState.workflowID, delayUntil: delayUntil, awaitedWorkflowID: targetWorkflowID})
 }
 
 // GetEvent retrieves a key-value event from a target workflow with type safety.
@@ -2747,6 +2811,13 @@ func (c *dbosContext) GetEvent(_ DBOSContext, targetWorkflowID, key string, time
 //
 // When called within a workflow, the get operation becomes part of the workflow's durable state.
 // The returned value is of type R and will be type-checked at runtime.
+//
+// If Config.DurableSleepThreshold is set and the caller is a workflow, a GetEvent
+// whose event is not set within the threshold suspends the workflow to the database
+// (status DELAYED, goroutine released) until the target's SetEvent wakes it or the
+// timeout deadline passes, then re-executes it with completed steps memoized. The
+// same determinism requirements as for a suspending Sleep apply; see the Sleep
+// documentation. Calls from outside a workflow always wait in-process.
 //
 // Example:
 //

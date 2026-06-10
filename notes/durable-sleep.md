@@ -273,6 +273,11 @@ are preserved exactly, only the waiting becomes free.
   wait, re-entering recv with the same step IDs.
 - `deleteWorkflows` now also clears waiter rows involving deleted workflows.
 
-Still pending: the same treatment for `GetEvent` (wake = `SetEvent` on the
-target; waiter = caller → target, which collides nicely with the existing
-result-waiter wake on the target's completion).
+`GetEvent` got the same treatment: the waiter row is caller → target (the same
+registration used for awaiting the target's result, so the target's completion
+also wakes the caller, which re-suspends or times out as appropriate), and
+`setEvent` wakes the target's registered waiters in its own transaction via
+`notifyWorkflowWaiters` — an UPDATE-only wake that keeps the waiter rows, since
+result-waiters must still be woken by the target's completion later. Spurious
+wakes (an event the waiter was not waiting for) just replay and re-suspend.
+Calls from outside a workflow are unaffected.

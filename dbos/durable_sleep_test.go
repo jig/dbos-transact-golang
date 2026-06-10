@@ -458,6 +458,116 @@ func TestDurableRecvSuspension(t *testing.T) {
 	})
 }
 
+func TestDurableGetEventSuspension(t *testing.T) {
+	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true, durableSleepThreshold: 200 * time.Millisecond})
+
+	// The producer sets the event between two gates, so the tests can observe the
+	// consumer being woken by SetEvent while the producer is still running (i.e. the
+	// wake is event-driven, not the producer's completion).
+	setGate := NewEvent()
+	finishGate := NewEvent()
+	producerWorkflow := func(ctx DBOSContext, _ string) (string, error) {
+		if _, err := RunAsStep(ctx, func(c context.Context) (string, error) {
+			setGate.Wait()
+			return "", nil
+		}); err != nil {
+			return "", err
+		}
+		if err := SetEvent(ctx, "status", "ready"); err != nil {
+			return "", err
+		}
+		if _, err := RunAsStep(ctx, func(c context.Context) (string, error) {
+			finishGate.Wait()
+			return "", nil
+		}); err != nil {
+			return "", err
+		}
+		return "produced", nil
+	}
+
+	var consumerBody atomic.Int64
+	consumerWorkflow := func(ctx DBOSContext, targetID string) (string, error) {
+		consumerBody.Add(1)
+		val, err := GetEvent[string](ctx, targetID, "status", 30*time.Second)
+		if err != nil {
+			return "", err
+		}
+		return "got-" + val, nil
+	}
+
+	var timeoutBody atomic.Int64
+	timeoutConsumerWorkflow := func(ctx DBOSContext, targetID string) (string, error) {
+		timeoutBody.Add(1)
+		if _, err := GetEvent[string](ctx, targetID, "missing", 1*time.Second); err != nil {
+			return "timed-out", nil // expected: the getEvent deadline passed while suspended
+		}
+		return "unexpected-event", nil
+	}
+
+	RegisterWorkflow(dbosCtx, producerWorkflow)
+	RegisterWorkflow(dbosCtx, consumerWorkflow)
+	RegisterWorkflow(dbosCtx, timeoutConsumerWorkflow)
+	require.NoError(t, Launch(dbosCtx))
+
+	producer, err := RunWorkflow(dbosCtx, producerWorkflow, "")
+	require.NoError(t, err, "failed to start producer workflow")
+	t.Cleanup(func() {
+		setGate.Set()
+		finishGate.Set()
+	})
+
+	t.Run("SetEventWakesSuspendedConsumer", func(t *testing.T) {
+		consumerBody.Store(0)
+		consumer, err := RunWorkflow(dbosCtx, consumerWorkflow, producer.GetWorkflowID())
+		require.NoError(t, err, "failed to start consumer workflow")
+
+		// With a 30s timeout and a 200ms threshold, the consumer must suspend
+		waitForStatus(t, consumer, WorkflowStatusDelayed, 5*time.Second)
+
+		setGate.Set() // the producer sets the event (and keeps running)
+
+		result, err := consumer.GetResult(WithHandleTimeout(60*time.Second), WithHandlePollingInterval(100*time.Millisecond))
+		require.NoError(t, err, "failed to get consumer result")
+		assert.Equal(t, "got-ready", result)
+		assert.Equal(t, int64(2), consumerBody.Load(), "consumer should run once before and once after suspension")
+
+		// The wake came from SetEvent: the producer is still running
+		producerStatus, err := producer.GetStatus()
+		require.NoError(t, err)
+		assert.Equal(t, WorkflowStatusPending, producerStatus.Status, "producer must still be running when the consumer wakes")
+	})
+
+	t.Run("TimeoutWhileSuspended", func(t *testing.T) {
+		timeoutBody.Store(0)
+		tStart := time.Now()
+		handle, err := RunWorkflow(dbosCtx, timeoutConsumerWorkflow, producer.GetWorkflowID())
+		require.NoError(t, err, "failed to start timeout consumer")
+
+		waitForStatus(t, handle, WorkflowStatusDelayed, 5*time.Second)
+
+		result, err := handle.GetResult(WithHandleTimeout(60*time.Second), WithHandlePollingInterval(100*time.Millisecond))
+		require.NoError(t, err, "failed to get timeout consumer result")
+		assert.Equal(t, "timed-out", result)
+		assert.GreaterOrEqual(t, time.Since(tStart), 1*time.Second, "must not report a timeout before the getEvent deadline")
+		assert.Equal(t, int64(2), timeoutBody.Load())
+	})
+
+	t.Run("ExistingEventDoesNotSuspend", func(t *testing.T) {
+		consumerBody.Store(0)
+		consumer, err := RunWorkflow(dbosCtx, consumerWorkflow, producer.GetWorkflowID())
+		require.NoError(t, err, "failed to start consumer workflow")
+
+		result, err := consumer.GetResult(WithHandleTimeout(60*time.Second), WithHandlePollingInterval(100*time.Millisecond))
+		require.NoError(t, err, "failed to get consumer result")
+		assert.Equal(t, "got-ready", result)
+		assert.Equal(t, int64(1), consumerBody.Load(), "a getEvent on an already-set event must keep run-once semantics")
+	})
+
+	finishGate.Set()
+	_, err = producer.GetResult(WithHandleTimeout(60*time.Second), WithHandlePollingInterval(100*time.Millisecond))
+	require.NoError(t, err, "failed to get producer result")
+}
+
 func TestDurableSleepDisabledByDefault(t *testing.T) {
 	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
 

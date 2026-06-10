@@ -92,6 +92,7 @@ type systemDatabase interface {
 	wakeWorkflowWaiters(ctx context.Context, runner Querier, workflowID string) error
 	wakeSuspendedWorkflow(ctx context.Context, workflowID string) error
 	hasUnconsumedNotification(ctx context.Context, destinationID string, topic string) (bool, error)
+	hasWorkflowEvent(ctx context.Context, targetWorkflowID string, key string) (bool, error)
 	dequeueWorkflows(ctx context.Context, input dequeueWorkflowsInput) ([]dequeuedWorkflow, error)
 	clearQueueAssignment(ctx context.Context, workflowID string) (bool, error)
 	getQueuePartitions(ctx context.Context, queueName string) ([]string, error)
@@ -3676,7 +3677,35 @@ func (s *sysDB) setEvent(ctx context.Context, input WorkflowSetEventInput) error
 	} else {
 		_, err = s.pool.Exec(ctx, insertHistoryQuery, wfState.workflowID, wfState.stepID, input.Key, input.Message, input.serialization)
 	}
-	return err
+	if err != nil {
+		return err
+	}
+
+	// Wake workflows durably suspended waiting on this workflow (GetEvent waiters
+	// register against the target's ID). Waiter rows are kept: result-waiters of this
+	// workflow must still be woken by its completion. A waiter woken by an event it
+	// was not waiting for simply replays and re-suspends.
+	runner := Querier(input.tx)
+	if runner == nil {
+		runner = s.pool
+	}
+	return s.notifyWorkflowWaiters(ctx, runner, wfState.workflowID)
+}
+
+// notifyWorkflowWaiters moves the delay_until of every DELAYED workflow registered as
+// a waiter on workflowID to now, without removing the waiter rows. Used for non-final
+// wake-ups (an event was set); wakeWorkflowWaiters handles the terminal case.
+func (s *sysDB) notifyWorkflowWaiters(ctx context.Context, runner Querier, workflowID string) error {
+	schemaPrefix := s.dialect.SchemaPrefix(s.schema)
+	query := s.renderSQL(`UPDATE %sworkflow_status
+		SET delay_until_epoch_ms = $1, updated_at = $1
+		WHERE status = $2
+		  AND workflow_uuid IN (SELECT waiter_workflow_uuid FROM %sworkflow_waiters WHERE awaited_workflow_uuid = $3)`,
+		schemaPrefix, schemaPrefix)
+	if _, err := runner.Exec(ctx, query, time.Now().UnixMilli(), WorkflowStatusDelayed, workflowID); err != nil {
+		return fmt.Errorf("failed to notify waiters of workflow %s: %w", workflowID, err)
+	}
+	return nil
 }
 
 func (s *sysDB) getEvent(ctx context.Context, input getEventInput) (*getEventResult, error) {
@@ -3694,8 +3723,15 @@ func (s *sysDB) getEvent(ctx context.Context, input getEventInput) (*getEventRes
 		if wfState.isWithinStep {
 			return nil, newStepExecutionError(wfState.workflowID, functionName, fmt.Errorf("cannot call GetEvent within a step"))
 		}
-		stepID = wfState.nextStepID()
-		sleepStepID = wfState.nextStepID() // We will use a sleep step to implement the timeout
+		// Allocate step IDs, unless the caller re-enters with pre-assigned ones
+		// (after a failed suspension attempt).
+		if input.stepID != nil && input.sleepStepID != nil {
+			stepID = *input.stepID
+			sleepStepID = *input.sleepStepID
+		} else {
+			stepID = wfState.nextStepID()
+			sleepStepID = wfState.nextStepID() // We will use a sleep step to implement the timeout
+		}
 
 		// Check if operation was already executed (only if in workflow)
 		checkInput := checkOperationExecutionDBInput{
@@ -3774,6 +3810,12 @@ func (s *sysDB) getEvent(ctx context.Context, input getEventInput) (*getEventRes
 			close(done)
 		}()
 
+		// When suspension is enabled and the remaining (durable) timeout exceeds the
+		// threshold, wait in-process only up to the threshold, then hand a suspension
+		// sentinel back to the caller. Armed once: repoll iterations must not extend
+		// the in-process wait.
+		var suspendChan <-chan time.Time
+
 	loop:
 		for valueString == nil {
 			// Wait for notification with timeout using condition variable
@@ -3788,6 +3830,10 @@ func (s *sysDB) getEvent(ctx context.Context, input getEventInput) (*getEventRes
 					return nil, fmt.Errorf("failed to sleep before getEvent timeout: %w", err)
 				}
 			}
+			deadline := time.Now().Add(timeout)
+			if suspendChan == nil && isInWorkflow && input.suspendThreshold > 0 && timeout > input.suspendThreshold {
+				suspendChan = time.After(input.suspendThreshold)
+			}
 
 			select {
 			case <-done:
@@ -3796,6 +3842,9 @@ func (s *sysDB) getEvent(ctx context.Context, input getEventInput) (*getEventRes
 					return nil, err
 				}
 				break loop
+			case <-suspendChan:
+				// Nothing recorded: the replayed getEvent reuses the memoized timeout deadline.
+				return &getEventResult{suspend: true, delayUntil: deadline, stepID: stepID, sleepStepID: sleepStepID}, nil
 			case <-time.After(timeout):
 				timeoutOccurred = true
 				s.logger.Warn("GetEvent() timeout reached", "target_workflow_id", input.TargetWorkflowID, "key", input.Key, "timeout", input.Timeout)
@@ -4285,6 +4334,17 @@ func (s *sysDB) hasUnconsumedNotification(ctx context.Context, destinationID str
 	var exists bool
 	if err := s.pool.QueryRow(ctx, query, destinationID, topic).Scan(&exists); err != nil {
 		return false, fmt.Errorf("failed to check pending notifications for workflow %s: %w", destinationID, err)
+	}
+	return exists, nil
+}
+
+// hasWorkflowEvent reports whether the target workflow has set an event under the
+// given key.
+func (s *sysDB) hasWorkflowEvent(ctx context.Context, targetWorkflowID string, key string) (bool, error) {
+	query := s.renderSQL(`SELECT EXISTS (SELECT 1 FROM %sworkflow_events WHERE workflow_uuid = $1 AND key = $2)`, s.dialect.SchemaPrefix(s.schema))
+	var exists bool
+	if err := s.pool.QueryRow(ctx, query, targetWorkflowID, key).Scan(&exists); err != nil {
+		return false, fmt.Errorf("failed to check event %s of workflow %s: %w", key, targetWorkflowID, err)
 	}
 	return exists, nil
 }
