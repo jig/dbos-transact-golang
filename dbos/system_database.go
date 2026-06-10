@@ -2558,6 +2558,18 @@ func (s *sysDB) getWorkflowSteps(ctx context.Context, input getWorkflowStepsInpu
 		return nil, fmt.Errorf("error iterating over step rows: %w", err)
 	}
 
+	// Transactional steps checkpoint into transaction_outputs (possibly in a separate
+	// application database), not operation_outputs: merge them in so the step listing
+	// has no step-ID gaps.
+	txnSteps, err := listTransactionSteps(ctx, s.appPool, s.appSchema, input.workflowID, input.loadOutput)
+	if err != nil {
+		return nil, err
+	}
+	if len(txnSteps) > 0 {
+		steps = append(steps, txnSteps...)
+		slices.SortFunc(steps, func(a, b stepInfo) int { return a.StepID - b.StepID })
+	}
+
 	return steps, nil
 }
 

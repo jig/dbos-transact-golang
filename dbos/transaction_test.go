@@ -139,6 +139,15 @@ func TestForkWorkflowWithTransactions(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "fork-row-step", result)
 
+	// The step listing must include the transactional step (recorded in
+	// transaction_outputs) merged with the regular step, without step-ID gaps.
+	steps, err := GetWorkflowSteps(dbosCtx, wfID)
+	require.NoError(t, err)
+	require.Len(t, steps, 2)
+	require.Equal(t, 0, steps[0].StepID)
+	require.Contains(t, steps[0].StepName, "TestForkWorkflowWithTransactions")
+	require.Equal(t, 1, steps[1].StepID)
+
 	// Fork past both steps: the transactional INSERT must NOT run again.
 	forkedHandle, err := ForkWorkflow[string](dbosCtx, ForkWorkflowInput{
 		OriginalWorkflowID: wfID,

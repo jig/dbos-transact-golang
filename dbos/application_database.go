@@ -2,6 +2,7 @@ package dbos
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -230,6 +231,60 @@ func deleteTransactionOutputs(ctx context.Context, pool Pool, schema string, wor
 		return fmt.Errorf("failed to delete transaction outputs: %w", err)
 	}
 	return nil
+}
+
+// listTransactionSteps returns the transactional-step checkpoints of a workflow as
+// stepInfo entries, so getWorkflowSteps can merge them with the regular steps from
+// operation_outputs (transactional steps are recorded only in transaction_outputs).
+// Returns nil for non-pgx pools, where transactional steps are unsupported.
+func listTransactionSteps(ctx context.Context, pool Pool, schema, workflowID string, loadOutput bool) ([]stepInfo, error) {
+	if PgxPool(pool) == nil {
+		return nil, nil
+	}
+	query := appDialect.RewriteQuery(fmt.Sprintf(
+		`SELECT function_id, function_name, output, error, started_at_epoch_ms, completed_at_epoch_ms, serialization
+		 FROM %stransaction_outputs
+		 WHERE workflow_uuid = $1
+		 ORDER BY function_id ASC`, appDialect.SchemaPrefix(schema)))
+
+	rows, err := pool.Query(ctx, query, workflowID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query transaction steps: %w", err)
+	}
+	defer rows.Close()
+
+	var steps []stepInfo
+	for rows.Next() {
+		var step stepInfo
+		var outputString *string
+		var errorString *string
+		var startedAtMs, completedAtMs *int64
+		var serialization *string
+
+		if err := rows.Scan(&step.StepID, &step.StepName, &outputString, &errorString, &startedAtMs, &completedAtMs, &serialization); err != nil {
+			return nil, fmt.Errorf("failed to scan transaction step row: %w", err)
+		}
+		if startedAtMs != nil {
+			step.StartedAt = time.Unix(0, *startedAtMs*int64(time.Millisecond))
+		}
+		if completedAtMs != nil {
+			step.CompletedAt = time.Unix(0, *completedAtMs*int64(time.Millisecond))
+		}
+		if loadOutput {
+			step.Output = outputString
+		}
+		if serialization != nil {
+			step.Serialization = *serialization
+		}
+		if errorString != nil && *errorString != "" {
+			step.Error = errors.New(*errorString)
+		}
+		steps = append(steps, step)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating over transaction step rows: %w", err)
+	}
+	return steps, nil
 }
 
 // recordTransactionResult inserts the transactional step's checkpoint into
