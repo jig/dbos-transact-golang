@@ -357,13 +357,15 @@ func serializeWorkflowError(err error, serialization string) string {
 
 // deserializeWorkflowError deserializes an error from DB storage.
 // For portable serialization, parses the JSON into a PortableWorkflowError.
-// For all others, creates a plain error from the string.
+// For all others, rebuilds a *DBOSError when the recorded text is a DBOSError
+// render (preserving the error code across recovery/suspension replays — see
+// errorFromRecorded), or returns a plain error otherwise.
 func deserializeWorkflowError(errStr *string, serialization string) error {
 	if errStr == nil || *errStr == "" {
 		return nil
 	}
 	if serialization != PortableSerializerName {
-		return errors.New(*errStr)
+		return errorFromRecorded(*errStr)
 	}
 	var pe PortableWorkflowError
 	if err := json.Unmarshal([]byte(*errStr), &pe); err != nil {

@@ -2,6 +2,8 @@ package dbos
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -355,7 +357,13 @@ func TestDurableRecvSuspension(t *testing.T) {
 	timeoutWorkflow := func(ctx DBOSContext, _ string) (string, error) {
 		timeoutBody.Add(1)
 		if _, err := Recv[string](ctx, "never", 1*time.Second); err != nil {
-			return "timed-out", nil // expected: the recv deadline passed while suspended
+			// The timeout surfaces on the post-suspension replay: the recorded error
+			// must still carry its DBOSError code (regression for errorFromRecorded).
+			var dbosErr *DBOSError
+			if errors.As(err, &dbosErr) && dbosErr.Code == TimeoutError {
+				return "timed-out", nil
+			}
+			return "", fmt.Errorf("expected a TimeoutError, got: %w", err)
 		}
 		return "unexpected-message", nil
 	}
@@ -499,7 +507,13 @@ func TestDurableGetEventSuspension(t *testing.T) {
 	timeoutConsumerWorkflow := func(ctx DBOSContext, targetID string) (string, error) {
 		timeoutBody.Add(1)
 		if _, err := GetEvent[string](ctx, targetID, "missing", 1*time.Second); err != nil {
-			return "timed-out", nil // expected: the getEvent deadline passed while suspended
+			// The timeout surfaces on the post-suspension replay: the recorded error
+			// must still carry its DBOSError code (regression for errorFromRecorded).
+			var dbosErr *DBOSError
+			if errors.As(err, &dbosErr) && dbosErr.Code == TimeoutError {
+				return "timed-out", nil
+			}
+			return "", fmt.Errorf("expected a TimeoutError, got: %w", err)
 		}
 		return "unexpected-event", nil
 	}
