@@ -2004,7 +2004,14 @@ func (c *dbosContext) runAsAppTxn(_ DBOSContext, fn txnFunc, opts ...StepOption)
 		return nil, newStepExecutionError(prep.WorkflowID, prep.StepOpts.stepName, fmt.Errorf("step function cannot be nil"))
 	}
 	if prep.IsWithinStep {
-		return fn(c, nil)
+		// Steps flatten when nested, which would hand the user a nil Tx here. Fail
+		// clearly instead of letting the first Tx use panic.
+		return nil, newStepExecutionError(prep.WorkflowID, prep.StepOpts.stepName,
+			fmt.Errorf("RunAsTransaction cannot be called from within a step; call it directly from the workflow function"))
+	}
+	if PgxPool(c.appDB) == nil {
+		return nil, newStepExecutionError(prep.WorkflowID, prep.StepOpts.stepName,
+			fmt.Errorf("transactional steps require a Postgres application database; the system database is not Postgres — set Config.ApplicationDatabaseURL (or ApplicationDBPool), or use a Postgres system database"))
 	}
 
 	uncancellableCtx := WithoutCancel(c)

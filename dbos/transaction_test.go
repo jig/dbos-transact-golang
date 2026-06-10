@@ -163,6 +163,61 @@ func TestForkWorkflowWithTransactions(t *testing.T) {
 	require.Equal(t, 1, copied)
 }
 
+// TestRunAsTransactionNestedInStep proves that calling RunAsTransaction from
+// within a step fails with a clear error instead of handing the user a nil Tx
+// (which used to panic on first use).
+func TestRunAsTransactionNestedInStep(t *testing.T) {
+	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
+
+	var txnRan atomic.Bool
+	nestedWorkflow := func(ctx DBOSContext, _ string) (string, error) {
+		return RunAsStep(ctx, func(stepCtx context.Context) (string, error) {
+			dctx, ok := stepCtx.(DBOSContext)
+			require.True(t, ok, "step context should be a DBOSContext")
+			return RunAsTransaction(dctx, func(txCtx context.Context, tx Tx) (string, error) {
+				txnRan.Store(true)
+				return "should-not-run", nil
+			})
+		})
+	}
+
+	RegisterWorkflow(dbosCtx, nestedWorkflow)
+	require.NoError(t, Launch(dbosCtx))
+
+	handle, err := RunWorkflow(dbosCtx, nestedWorkflow, "")
+	require.NoError(t, err)
+	_, err = handle.GetResult()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "cannot be called from within a step")
+	require.False(t, txnRan.Load(), "the transaction function must not run")
+}
+
+// TestRunAsTransactionRequiresPostgres proves that RunAsTransaction on a SQLite
+// system database (without a separate Postgres application database) fails with
+// a clear error instead of a cryptic SQL failure.
+func TestRunAsTransactionRequiresPostgres(t *testing.T) {
+	if !useSqliteBackend() {
+		t.Skip("only meaningful with a SQLite system database")
+	}
+
+	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
+
+	txnWorkflow := func(ctx DBOSContext, _ string) (string, error) {
+		return RunAsTransaction(ctx, func(txCtx context.Context, tx Tx) (string, error) {
+			return "should-not-run", nil
+		})
+	}
+
+	RegisterWorkflow(dbosCtx, txnWorkflow)
+	require.NoError(t, Launch(dbosCtx))
+
+	handle, err := RunWorkflow(dbosCtx, txnWorkflow, "")
+	require.NoError(t, err)
+	_, err = handle.GetResult()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "require a Postgres application database")
+}
+
 // TestRunAsTransactionSerializationRetry proves that a transactional step hit by
 // a serialization failure (PG 40001, expected under SERIALIZABLE contention) is
 // retried on a fresh transaction instead of failing the workflow.

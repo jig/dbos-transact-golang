@@ -25,9 +25,10 @@ type Transaction[R any] func(ctx context.Context, tx Tx) (R, error)
 //     the checkpoint is recorded in. By default that is the DBOS system database;
 //     set Config.ApplicationDatabaseURL (or ApplicationDBPool) to run transactions
 //     against a separate Postgres database instead.
-//   - It must be called directly from a workflow. If called nested within
-//     another step, steps are flattened and the engine passes a nil Tx — do not
-//     do that.
+//   - It must be called directly from a workflow, not nested within another
+//     step (nesting returns a step execution error), and it requires a Postgres
+//     application database (a SQLite system database without a separate
+//     application database returns a step execution error).
 //   - fn must be safe to re-run: it can be invoked several times before a commit
 //     succeeds (serialization-failure retries re-execute it on a fresh Tx).
 //     Keep the body to Tx operations and pure computation; side effects outside
