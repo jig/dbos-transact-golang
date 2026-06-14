@@ -362,14 +362,26 @@ func concurrentlyKw(isCockroach bool) string {
 }
 
 // buildMigrations renders the full list of migrations against the target schema.
-func buildMigrations(schema string, isCockroach bool) []migrationFile {
+//
+// usePLpgSQL controls whether to emit the PL/pgSQL objects on a Postgres target
+// (the LISTEN/NOTIFY trigger functions in migration 1, the external-client
+// functions in migration 14, and the search_path hardening in migration 20).
+// It is only consulted when !isCockroach; CockroachDB behaviour is unchanged.
+// With usePLpgSQL=false the database is created with plain SQL only and migration
+// 10 is applied via the runner check (like CockroachDB) instead of a DO block.
+func buildMigrations(schema string, isCockroach, usePLpgSQL bool) []migrationFile {
 	sanitizedSchema := pgx.Identifier{schema}.Sanitize()
+
+	// The LISTEN/NOTIFY trigger functions are PL/pgSQL: emit them only on a
+	// Postgres target that wants PL/pgSQL. CockroachDB has no LISTEN/NOTIFY, and
+	// plain-SQL Postgres uses the polling loop instead.
+	emitPLpgSQL := !isCockroach && usePLpgSQL
 
 	migration1SQLProcessed := fmt.Sprintf(migration1SQL,
 		sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema,
 		sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema,
 		sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema)
-	if !isCockroach {
+	if emitPLpgSQL {
 		migration1ListenNotifySQLProcessed := fmt.Sprintf(migration1ListenNotifySQL,
 			sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema)
 		migration1SQLProcessed = migration1SQLProcessed + "\n" + migration1ListenNotifySQLProcessed
@@ -377,10 +389,17 @@ func buildMigrations(schema string, isCockroach bool) []migrationFile {
 
 	c := concurrentlyKw(isCockroach)
 
-	// Migration 20 is a Postgres-only function-hardening pass; on CockroachDB
-	// it is a no-op (the version row still advances).
+	// Migration 14 creates the external-SQL-client functions (PL/pgSQL). The Go
+	// runtime never calls them; skip them on plain-SQL Postgres.
+	migration14SQLProcessed := fmt.Sprintf(migration14SQL, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema)
+	if !isCockroach && !usePLpgSQL {
+		migration14SQLProcessed = ""
+	}
+
+	// Migration 20 hardens the search_path of the migration-14 functions; it is a
+	// no-op on CockroachDB and on plain-SQL Postgres (no functions to harden).
 	migration20SQLProcessed := ""
-	if !isCockroach {
+	if emitPLpgSQL {
 		migration20SQLProcessed = fmt.Sprintf(migration20SQL, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema)
 	}
 
@@ -408,7 +427,7 @@ func buildMigrations(schema string, isCockroach bool) []migrationFile {
 		{version: 11, sql: fmt.Sprintf(migration11SQL, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema)},
 		{version: 12, sql: fmt.Sprintf(migration12SQL, sanitizedSchema, sanitizedSchema)},
 		{version: 13, sql: fmt.Sprintf(migration13SQL, sanitizedSchema)},
-		{version: 14, sql: fmt.Sprintf(migration14SQL, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema)},
+		{version: 14, sql: migration14SQLProcessed},
 		{version: 15, sql: fmt.Sprintf(migration15SQL, sanitizedSchema, sanitizedSchema, sanitizedSchema)},
 		{version: 16, sql: fmt.Sprintf(migration16SQL, sanitizedSchema, sanitizedSchema)},
 		{version: 17, sql: fmt.Sprintf(migration17SQL, sanitizedSchema)},
@@ -439,7 +458,7 @@ func buildMigrations(schema string, isCockroach bool) []migrationFile {
 // shouldMigrate reports whether any migration work remains for the schema.
 // Returns true if the schema is missing, the dbos_migrations table is missing,
 // or the recorded version is behind the latest.
-func shouldMigrate(ctx context.Context, pool *pgxpool.Pool, schema string, isCockroach bool) (bool, error) {
+func shouldMigrate(ctx context.Context, pool *pgxpool.Pool, schema string, isCockroach, usePLpgSQL bool) (bool, error) {
 	var schemaExists bool
 	err := pool.QueryRow(ctx,
 		`SELECT EXISTS(SELECT 1 FROM information_schema.schemata WHERE schema_name = $1)`,
@@ -468,7 +487,7 @@ func shouldMigrate(ctx context.Context, pool *pgxpool.Pool, schema string, isCoc
 	if err != nil && err != pgx.ErrNoRows {
 		return false, fmt.Errorf("failed to get current migration version: %v", err)
 	}
-	migrations := buildMigrations(schema, isCockroach)
+	migrations := buildMigrations(schema, isCockroach, usePLpgSQL)
 	return currentVersion < migrations[len(migrations)-1].version, nil
 }
 
@@ -530,8 +549,8 @@ func writeMigrationVersion(ctx context.Context, exec interface {
 	return nil
 }
 
-func runMigrations(ctx context.Context, pool *pgxpool.Pool, schema string, isCockroach bool, logger *slog.Logger) error {
-	migrations := buildMigrations(schema, isCockroach)
+func runMigrations(ctx context.Context, pool *pgxpool.Pool, schema string, isCockroach, usePLpgSQL bool, logger *slog.Logger) error {
+	migrations := buildMigrations(schema, isCockroach, usePLpgSQL)
 	sanitizedSchema := pgx.Identifier{schema}.Sanitize()
 
 	// Schema + migrations table setup in a single short transaction.
@@ -601,7 +620,7 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool, schema string, isCoc
 			continue
 		}
 
-		if err := applyCatalogMigration(ctx, pool, schema, sanitizedSchema, migration, isCockroach, currentVersion); err != nil {
+		if err := applyCatalogMigration(ctx, pool, schema, sanitizedSchema, migration, isCockroach, usePLpgSQL, currentVersion); err != nil {
 			return err
 		}
 		currentVersion = migration.version
@@ -616,7 +635,7 @@ func applyCatalogMigration(
 	pool *pgxpool.Pool,
 	schema, sanitizedSchema string,
 	migration migrationFile,
-	isCockroach bool,
+	isCockroach, usePLpgSQL bool,
 	currentVersion int64,
 ) error {
 	mtx, err := pool.Begin(ctx)
@@ -626,10 +645,11 @@ func applyCatalogMigration(
 	defer mtx.Rollback(ctx)
 
 	switch {
-	case migration.version == 10 && isCockroach:
-		// CockroachDB does not support the DO block used by the Postgres
-		// migration file; run the equivalent logic at the application layer
-		// inside the same transaction.
+	case migration.version == 10 && (isCockroach || !usePLpgSQL):
+		// The Postgres migration file for version 10 uses a PL/pgSQL DO block.
+		// CockroachDB does not support DO blocks, and plain-SQL Postgres avoids
+		// PL/pgSQL entirely; in both cases run the equivalent idempotence check
+		// at the application layer inside the same transaction.
 		if err := applyCockroachMigration10(ctx, mtx, schema, sanitizedSchema); err != nil {
 			return err
 		}
@@ -679,6 +699,7 @@ type newSystemDatabaseInput struct {
 	customSqliteDB  *sql.DB
 	logger          *slog.Logger
 	applicationName string
+	disablePLpgSQL  bool // Postgres only: create no PL/pgSQL objects, use polling instead of LISTEN/NOTIFY
 }
 
 // New creates a new SystemDatabase instance and runs migrations
@@ -800,7 +821,15 @@ func newSystemDatabase(ctx context.Context, inputs newSystemDatabaseInput) (syst
 		logger.Info("Detected CockroachDB")
 	}
 
-	needsMigration, smErr := shouldMigrate(ctx, pool, databaseSchema, isCockroach)
+	// usePLpgSQL is only meaningful on a real Postgres target (CockroachDB never
+	// uses PL/pgSQL). When the caller asked to disable it, the database is created
+	// with plain SQL only and notifications fall back to polling.
+	usePLpgSQL := !inputs.disablePLpgSQL
+	if !isCockroach && inputs.disablePLpgSQL {
+		logger.Info("PL/pgSQL disabled: using plain SQL and polling notifications")
+	}
+
+	needsMigration, smErr := shouldMigrate(ctx, pool, databaseSchema, isCockroach, usePLpgSQL)
 	if smErr != nil {
 		if customPool == nil {
 			pool.Close()
@@ -809,7 +838,7 @@ func newSystemDatabase(ctx context.Context, inputs newSystemDatabaseInput) (syst
 	}
 	if needsMigration {
 		if err := retry(ctx, func() error {
-			return runMigrations(ctx, pool, databaseSchema, isCockroach, logger)
+			return runMigrations(ctx, pool, databaseSchema, isCockroach, usePLpgSQL, logger)
 		}, withRetrierLogger(logger)); err != nil {
 			if customPool == nil {
 				pool.Close()
@@ -835,6 +864,10 @@ func newSystemDatabase(ctx context.Context, inputs newSystemDatabaseInput) (syst
 	dialect := Dialect(postgresDialect{})
 	if isCockroach {
 		dialect = cockroachDialect{}
+	} else if inputs.disablePLpgSQL {
+		// Plain-SQL Postgres: behaves like Postgres but reports no LISTEN/NOTIFY
+		// support, so launch() starts the polling loop instead of the listener.
+		dialect = postgresPlainDialect{}
 	}
 
 	return &sysDB{

@@ -89,6 +89,7 @@ type setupDBOSOptions struct {
 	serializer               Serializer[any]
 	schedulerPollingInterval time.Duration
 	durableSleepThreshold    time.Duration
+	disablePLpgSQL           bool
 }
 
 /* Test database setup */
@@ -109,6 +110,7 @@ func setupDBOS(t *testing.T, opts setupDBOSOptions) DBOSContext {
 		Serializer:               opts.serializer,
 		SchedulerPollingInterval: opts.schedulerPollingInterval,
 		DurableSleepThreshold:    opts.durableSleepThreshold,
+		DisablePLpgSQL:           opts.disablePLpgSQL,
 	}
 
 	dbosCtx, err := NewDBOSContext(context.Background(), config)

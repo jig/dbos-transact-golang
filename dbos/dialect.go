@@ -264,6 +264,19 @@ func (cockroachDialect) Name() DialectName          { return DialectCockroach }
 func (cockroachDialect) SupportsListenNotify() bool { return false }
 
 /* ---------------------------------------------------------------------------
+   Plain-SQL Postgres (Config.DisablePLpgSQL)
+
+   Real Postgres, but with no PL/pgSQL objects created and no reliance on
+   LISTEN/NOTIFY: like Postgres in every respect except it uses the polling
+   notification loop (the migrations that create the trigger functions and the
+   client functions are skipped — see buildMigrations).
+   ------------------------------------------------------------------------- */
+
+type postgresPlainDialect struct{ postgresDialect }
+
+func (postgresPlainDialect) SupportsListenNotify() bool { return false }
+
+/* ---------------------------------------------------------------------------
    SQLite
 
    - "?" placeholders

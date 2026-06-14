@@ -50,6 +50,7 @@ type Config struct {
 	Serializer                Serializer[any] // Custom serializer for encoding/decoding workflow inputs, outputs, and events (defaults to JSON serializer)
 	SchedulerPollingInterval  time.Duration   // controls how often dynamic schedules are reconciled with the database (defaults to 30 seconds)
 	DurableSleepThreshold     time.Duration   // When > 0, a Sleep with more than this duration remaining suspends the workflow to the database (status DELAYED) instead of holding a goroutine; the workflow is re-executed (with completed steps memoized) when the sleep expires. See the Sleep documentation for the determinism requirements this imposes. 0 (default) disables suspension.
+	DisablePLpgSQL            bool            // Postgres only: create the schema with plain SQL and no PL/pgSQL objects (no LISTEN/NOTIFY trigger functions, no external-client functions), falling back to polling for notifications. This is a per-database deploy-time choice: it only affects schema creation, so flipping it on an already-migrated database has no effect. No-op on CockroachDB (already plpgsql-free) and SQLite.
 }
 
 func processConfig(inputConfig *Config) (*Config, error) {
@@ -101,6 +102,7 @@ func processConfig(inputConfig *Config) (*Config, error) {
 		Serializer:                inputConfig.Serializer,
 		SchedulerPollingInterval:  inputConfig.SchedulerPollingInterval,
 		DurableSleepThreshold:     inputConfig.DurableSleepThreshold,
+		DisablePLpgSQL:            inputConfig.DisablePLpgSQL,
 	}
 
 	if dbosConfig.ConductorExecutorMetadata != nil {
@@ -652,6 +654,7 @@ func NewDBOSContext(ctx context.Context, inputConfig Config) (DBOSContext, error
 		customSqliteDB:  config.SqliteSystemDB,
 		logger:          initExecutor.logger,
 		applicationName: config.AppName,
+		disablePLpgSQL:  config.DisablePLpgSQL,
 	}
 
 	// Create the system database

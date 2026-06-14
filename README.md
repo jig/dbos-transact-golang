@@ -407,6 +407,33 @@ recvResult, err := recvHandle.GetResult()
 
 </details>
 
+<details><summary><strong>🐘 Plain-SQL Postgres (no PL/pgSQL)</strong></summary>
+
+By default, on Postgres DBOS installs two small PL/pgSQL trigger functions that
+fire `NOTIFY` so waiting `Recv`/`GetEvent` calls wake within milliseconds, plus
+optional helper functions for external SQL clients. If your environment forbids
+PL/pgSQL (locked-down or managed Postgres, strict review of stored code), set
+`DisablePLpgSQL` to create the schema with **plain SQL only**:
+
+```go
+ctx, err := dbos.NewDBOSContext(context.Background(), dbos.Config{
+    DatabaseURL:    os.Getenv("DBOS_SYSTEM_DATABASE_URL"),
+    AppName:        "myapp",
+    DisablePLpgSQL: true,
+})
+```
+
+Notifications then fall back to polling (the same mechanism CockroachDB uses), so
+wake-ups take up to ~1s instead of milliseconds. With `DurableSleepThreshold` set
+this rarely matters: a suspended (`DELAYED`) `Recv`/`GetEvent` is woken by the
+queue runner when a `Send`/`SetEvent` moves its wake-up time, not by `NOTIFY`.
+
+This is a per-database, deploy-time choice — it only affects schema creation, so
+flipping it on an already-migrated database has no effect. It is a no-op on
+CockroachDB (already PL/pgSQL-free) and SQLite.
+
+</details>
+
 ## Getting Started
 
 To get started, follow the [quickstart](https://docs.dbos.dev/quickstart) to install this open-source library and connect it to a Postgres database.
