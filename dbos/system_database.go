@@ -1170,7 +1170,7 @@ func (s *sysDB) listWorkflows(ctx context.Context, input listWorkflowsDBInput) (
 		"executor_id", "created_at", "updated_at", "application_version", "application_id",
 		"recovery_attempts", "queue_name", "workflow_timeout_ms", "workflow_deadline_epoch_ms", "started_at_epoch_ms",
 		"deduplication_id", "priority", "queue_partition_key", "forked_from", "parent_workflow_id",
-		"serialization", "delay_until_epoch_ms", "was_forked_from", "completed_at",
+		"serialization", "delay_until_epoch_ms", "was_forked_from", "completed_at", "class_name", "config_name",
 	}
 
 	if input.loadOutput {
@@ -1315,6 +1315,7 @@ func (s *sysDB) listWorkflows(ctx context.Context, input listWorkflowsDBInput) (
 		var applicationID *string
 		var delayUntilEpochMs *int64
 		var completedAtMs *int64
+		var className *string
 
 		// Build scan arguments dynamically based on loaded columns.
 		scanArgs := []any{
@@ -1323,7 +1324,7 @@ func (s *sysDB) listWorkflows(ctx context.Context, input listWorkflowsDBInput) (
 			&updatedAtMs, &applicationVersion, &applicationID,
 			&wf.Attempts, &queueName, &timeoutMs,
 			&deadlineMs, &startedAtMs, &deduplicationID, &wf.Priority, &queuePartitionKey, &forkedFrom, &parentWorkflowID,
-			&serialization, &delayUntilEpochMs, &wf.WasForkedFrom, &completedAtMs,
+			&serialization, &delayUntilEpochMs, &wf.WasForkedFrom, &completedAtMs, &className, &wf.ConfigName,
 		}
 
 		if input.loadOutput {
@@ -1340,6 +1341,9 @@ func (s *sysDB) listWorkflows(ctx context.Context, input listWorkflowsDBInput) (
 
 		if authenticatedUser != nil {
 			wf.AuthenticatedUser = *authenticatedUser
+		}
+		if className != nil {
+			wf.ClassName = *className
 		}
 		if assumedRole != nil {
 			wf.AssumedRole = *assumedRole
@@ -2091,8 +2095,10 @@ func (s *sysDB) forkWorkflow(ctx context.Context, input forkWorkflowDBInput) (st
 		updated_at,
 		recovery_attempts,
 		forked_from,
-		serialization
-	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`, s.dialect.SchemaPrefix(s.schema))
+		serialization,
+		class_name,
+		config_name
+	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`, s.dialect.SchemaPrefix(s.schema))
 
 	// Marshal authenticated roles (slice of strings) to JSON for TEXT column
 	authenticatedRoles, err := json.Marshal(originalWorkflow.AuthenticatedRoles)
@@ -2103,6 +2109,11 @@ func (s *sysDB) forkWorkflow(ctx context.Context, input forkWorkflowDBInput) (st
 	var queuePartitionKey any
 	if input.queuePartitionKey != "" {
 		queuePartitionKey = input.queuePartitionKey
+	}
+
+	var className any
+	if originalWorkflow.ClassName != "" {
+		className = originalWorkflow.ClassName
 	}
 
 	_, err = execCtx(ctx, insertQuery,
@@ -2120,8 +2131,10 @@ func (s *sysDB) forkWorkflow(ctx context.Context, input forkWorkflowDBInput) (st
 		time.Now().UnixMilli(),
 		time.Now().UnixMilli(),
 		0,
-		input.originalWorkflowID,       // forked_from
-		originalWorkflow.Serialization) // serialization
+		input.originalWorkflowID, // forked_from
+		originalWorkflow.Serialization,
+		className,
+		originalWorkflow.ConfigName)
 
 	if err != nil {
 		return "", fmt.Errorf("failed to insert forked workflow status: %w", err)
@@ -4225,6 +4238,7 @@ type dequeuedWorkflow struct {
 	name          string
 	input         *string
 	serialization string
+	configName    *string
 }
 
 type dequeueWorkflowsInput struct {
@@ -4391,7 +4405,7 @@ func (s *sysDB) dequeueWorkflows(ctx context.Context, input dequeueWorkflowsInpu
 		        ELSE workflow_deadline_epoch_ms
 		    END
 		WHERE workflow_uuid = $6 AND status = $7
-		RETURNING name, inputs, serialization`, schemaPrefix)
+		RETURNING name, inputs, serialization, config_name`, schemaPrefix)
 
 	var retWorkflows []dequeuedWorkflow
 	for _, id := range dequeuedIDs {
@@ -4410,7 +4424,7 @@ func (s *sysDB) dequeueWorkflows(ctx context.Context, input dequeueWorkflowsInpu
 			time.Now().UnixMilli(),
 			input.queue.RateLimit != nil,
 			id,
-			WorkflowStatusEnqueued).Scan(&retWorkflow.name, &retWorkflow.input, &serialization)
+			WorkflowStatusEnqueued).Scan(&retWorkflow.name, &retWorkflow.input, &serialization, &retWorkflow.configName)
 		if err != nil {
 			if err == pgx.ErrNoRows {
 				continue
