@@ -206,9 +206,6 @@ func createDatabaseIfNotExists(ctx context.Context, pool *pgxpool.Pool, logger *
 //go:embed migrations/1_initial_dbos_schema.sql
 var migration1SQL string
 
-//go:embed migrations/1_initial_dbos_schema_listen_notify.sql
-var migration1ListenNotifySQL string
-
 //go:embed migrations/2_add_queue_partition_key.sql
 var migration2SQL string
 
@@ -233,9 +230,11 @@ var migration8SQL string
 //go:embed migrations/9_add_workflow_schedules.sql
 var migration9SQL string
 
-//go:embed migrations/10_add_notifications_pkey.sql
-var migration10SQL string
-
+// Migration 10 (notifications primary key) is applied via the runner's plain-SQL
+// idempotence check (applyNotificationsPKeyMigration), not a PL/pgSQL DO block.
+// These two files originated as the CockroachDB variant; they are now used on
+// every backend.
+//
 //go:embed migrations/10_check_notifications_pkey_cockroach.sql
 var migration10CheckCockroachSQL string
 
@@ -251,9 +250,6 @@ var migration12SQL string
 //go:embed migrations/13_add_application_versions.sql
 var migration13SQL string
 
-//go:embed migrations/14_add_pgsql_client_functions.sql
-var migration14SQL string
-
 //go:embed migrations/15_add_workflow_schedule_columns.sql
 var migration15SQL string
 
@@ -268,9 +264,6 @@ var migration18SQL string
 
 //go:embed migrations/19_add_operation_outputs_completed_at_index.sql
 var migration19SQL string
-
-//go:embed migrations/20_set_function_search_path.sql
-var migration20SQL string
 
 //go:embed migrations/21_create_queues_table.sql
 var migration21SQL string
@@ -338,10 +331,6 @@ type migrationFile struct {
 const (
 	_DBOS_MIGRATION_TABLE = "dbos_migrations"
 
-	// Notification channels
-	_DBOS_NOTIFICATIONS_CHANNEL   = "dbos_notifications_channel"
-	_DBOS_WORKFLOW_EVENTS_CHANNEL = "dbos_workflow_events_channel"
-
 	// Stream sentinel value for closure
 	_DBOS_STREAM_CLOSED_SENTINEL = "__DBOS_STREAM_CLOSED__"
 
@@ -351,6 +340,12 @@ const (
 	_DB_CONNECTION_RETRY_MAX_RETRIES = 10
 	_DB_CONNECTION_MAX_DELAY         = 120 * time.Second
 	_DB_RETRY_INTERVAL               = 1 * time.Second
+
+	// _NOTIFICATION_POLL_INTERVAL is how often the notification poller checks for
+	// new messages/events. Notifications are always delivered by polling (no
+	// LISTEN/NOTIFY), so this bounds the wake-up latency for in-process
+	// Recv/GetEvent waits.
+	_NOTIFICATION_POLL_INTERVAL = 100 * time.Millisecond
 )
 
 // returns the CONCURRENTLY keyword for online index DDL.
@@ -363,45 +358,22 @@ func concurrentlyKw(isCockroach bool) string {
 
 // buildMigrations renders the full list of migrations against the target schema.
 //
-// usePLpgSQL controls whether to emit the PL/pgSQL objects on a Postgres target
-// (the LISTEN/NOTIFY trigger functions in migration 1, the external-client
-// functions in migration 14, and the search_path hardening in migration 20).
-// It is only consulted when !isCockroach; CockroachDB behaviour is unchanged.
-// With usePLpgSQL=false the database is created with plain SQL only and migration
-// 10 is applied via the runner check (like CockroachDB) instead of a DO block.
-func buildMigrations(schema string, isCockroach, usePLpgSQL bool) []migrationFile {
+// The schema is created with plain SQL only — no PL/pgSQL. Migrations that
+// upstream implemented with PL/pgSQL are dropped: the LISTEN/NOTIFY trigger
+// functions (migration 1, notifications are delivered by polling instead), the
+// external-SQL-client functions (migration 14, never called by the Go runtime),
+// and their search_path hardening (migration 20). Migration 10 is always applied
+// via the runner's idempotence check (see applyNotificationsPKeyMigration)
+// rather than a DO block.
+func buildMigrations(schema string, isCockroach bool) []migrationFile {
 	sanitizedSchema := pgx.Identifier{schema}.Sanitize()
-
-	// The LISTEN/NOTIFY trigger functions are PL/pgSQL: emit them only on a
-	// Postgres target that wants PL/pgSQL. CockroachDB has no LISTEN/NOTIFY, and
-	// plain-SQL Postgres uses the polling loop instead.
-	emitPLpgSQL := !isCockroach && usePLpgSQL
 
 	migration1SQLProcessed := fmt.Sprintf(migration1SQL,
 		sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema,
 		sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema,
 		sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema)
-	if emitPLpgSQL {
-		migration1ListenNotifySQLProcessed := fmt.Sprintf(migration1ListenNotifySQL,
-			sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema)
-		migration1SQLProcessed = migration1SQLProcessed + "\n" + migration1ListenNotifySQLProcessed
-	}
 
 	c := concurrentlyKw(isCockroach)
-
-	// Migration 14 creates the external-SQL-client functions (PL/pgSQL). The Go
-	// runtime never calls them; skip them on plain-SQL Postgres.
-	migration14SQLProcessed := fmt.Sprintf(migration14SQL, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema)
-	if !isCockroach && !usePLpgSQL {
-		migration14SQLProcessed = ""
-	}
-
-	// Migration 20 hardens the search_path of the migration-14 functions; it is a
-	// no-op on CockroachDB and on plain-SQL Postgres (no functions to harden).
-	migration20SQLProcessed := ""
-	if emitPLpgSQL {
-		migration20SQLProcessed = fmt.Sprintf(migration20SQL, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema)
-	}
 
 	// Migration 28 drops the legacy uq_workflow_status_queue_name_dedup_id
 	// constraint. CockroachDB exposes it as an index (DROP INDEX ... CASCADE);
@@ -423,17 +395,21 @@ func buildMigrations(schema string, isCockroach, usePLpgSQL bool) []migrationFil
 		{version: 7, sql: fmt.Sprintf(migration7SQL, sanitizedSchema)},
 		{version: 8, sql: fmt.Sprintf(migration8SQL, sanitizedSchema, sanitizedSchema)},
 		{version: 9, sql: fmt.Sprintf(migration9SQL, sanitizedSchema)},
-		{version: 10, sql: fmt.Sprintf(migration10SQL, schema, sanitizedSchema)},
+		// Migration 10 (notifications primary key) is always applied via the
+		// runner's idempotence check; its sql is unused (no DO block).
+		{version: 10, sql: ""},
 		{version: 11, sql: fmt.Sprintf(migration11SQL, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema)},
 		{version: 12, sql: fmt.Sprintf(migration12SQL, sanitizedSchema, sanitizedSchema)},
 		{version: 13, sql: fmt.Sprintf(migration13SQL, sanitizedSchema)},
-		{version: 14, sql: migration14SQLProcessed},
+		// Migration 14 (external-SQL-client PL/pgSQL functions) is intentionally
+		// omitted: the schema uses plain SQL only.
 		{version: 15, sql: fmt.Sprintf(migration15SQL, sanitizedSchema, sanitizedSchema, sanitizedSchema)},
 		{version: 16, sql: fmt.Sprintf(migration16SQL, sanitizedSchema, sanitizedSchema)},
 		{version: 17, sql: fmt.Sprintf(migration17SQL, sanitizedSchema)},
 		{version: 18, sql: fmt.Sprintf(migration18SQL, sanitizedSchema)},
 		{version: 19, sql: fmt.Sprintf(migration19SQL, sanitizedSchema)},
-		{version: 20, sql: migration20SQLProcessed},
+		// Migration 20 (search_path hardening of the migration-14 functions) is
+		// omitted along with migration 14.
 		{version: 21, sql: fmt.Sprintf(migration21SQL, sanitizedSchema)},
 		{version: 22, sql: fmt.Sprintf(migration22SQL, c, sanitizedSchema), online: !isCockroach},
 		{version: 23, sql: fmt.Sprintf(migration23SQL, c, sanitizedSchema), online: !isCockroach},
@@ -458,7 +434,7 @@ func buildMigrations(schema string, isCockroach, usePLpgSQL bool) []migrationFil
 // shouldMigrate reports whether any migration work remains for the schema.
 // Returns true if the schema is missing, the dbos_migrations table is missing,
 // or the recorded version is behind the latest.
-func shouldMigrate(ctx context.Context, pool *pgxpool.Pool, schema string, isCockroach, usePLpgSQL bool) (bool, error) {
+func shouldMigrate(ctx context.Context, pool *pgxpool.Pool, schema string, isCockroach bool) (bool, error) {
 	var schemaExists bool
 	err := pool.QueryRow(ctx,
 		`SELECT EXISTS(SELECT 1 FROM information_schema.schemata WHERE schema_name = $1)`,
@@ -487,7 +463,7 @@ func shouldMigrate(ctx context.Context, pool *pgxpool.Pool, schema string, isCoc
 	if err != nil && err != pgx.ErrNoRows {
 		return false, fmt.Errorf("failed to get current migration version: %v", err)
 	}
-	migrations := buildMigrations(schema, isCockroach, usePLpgSQL)
+	migrations := buildMigrations(schema, isCockroach)
 	return currentVersion < migrations[len(migrations)-1].version, nil
 }
 
@@ -549,8 +525,8 @@ func writeMigrationVersion(ctx context.Context, exec interface {
 	return nil
 }
 
-func runMigrations(ctx context.Context, pool *pgxpool.Pool, schema string, isCockroach, usePLpgSQL bool, logger *slog.Logger) error {
-	migrations := buildMigrations(schema, isCockroach, usePLpgSQL)
+func runMigrations(ctx context.Context, pool *pgxpool.Pool, schema string, isCockroach bool, logger *slog.Logger) error {
+	migrations := buildMigrations(schema, isCockroach)
 	sanitizedSchema := pgx.Identifier{schema}.Sanitize()
 
 	// Schema + migrations table setup in a single short transaction.
@@ -620,7 +596,7 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool, schema string, isCoc
 			continue
 		}
 
-		if err := applyCatalogMigration(ctx, pool, schema, sanitizedSchema, migration, isCockroach, usePLpgSQL, currentVersion); err != nil {
+		if err := applyCatalogMigration(ctx, pool, schema, sanitizedSchema, migration, currentVersion); err != nil {
 			return err
 		}
 		currentVersion = migration.version
@@ -635,7 +611,6 @@ func applyCatalogMigration(
 	pool *pgxpool.Pool,
 	schema, sanitizedSchema string,
 	migration migrationFile,
-	isCockroach, usePLpgSQL bool,
 	currentVersion int64,
 ) error {
 	mtx, err := pool.Begin(ctx)
@@ -645,17 +620,15 @@ func applyCatalogMigration(
 	defer mtx.Rollback(ctx)
 
 	switch {
-	case migration.version == 10 && (isCockroach || !usePLpgSQL):
-		// The Postgres migration file for version 10 uses a PL/pgSQL DO block.
-		// CockroachDB does not support DO blocks, and plain-SQL Postgres avoids
-		// PL/pgSQL entirely; in both cases run the equivalent idempotence check
-		// at the application layer inside the same transaction.
-		if err := applyCockroachMigration10(ctx, mtx, schema, sanitizedSchema); err != nil {
+	case migration.version == 10:
+		// The notifications primary key is applied via an application-layer
+		// idempotence check inside the same transaction (no PL/pgSQL DO block).
+		if err := applyNotificationsPKeyMigration(ctx, mtx, schema, sanitizedSchema); err != nil {
 			return err
 		}
 	case strings.TrimSpace(migration.sql) == "":
-		// No-op migration (e.g. migration 20 on CockroachDB). Still advance
-		// the version row so we don't re-evaluate it next time.
+		// No-op migration (an omitted PL/pgSQL migration). Still advance the
+		// version row so we don't re-evaluate it next time.
 	default:
 		if _, err := mtx.Exec(ctx, migration.sql); err != nil {
 			return fmt.Errorf("failed to execute migration %d: %v", migration.version, err)
@@ -671,9 +644,10 @@ func applyCatalogMigration(
 	return nil
 }
 
-// applyCockroachMigration10 applies migration 10 on CockroachDB, which does
-// not support the DO block used by the Postgres migration file.
-func applyCockroachMigration10(ctx context.Context, tx pgx.Tx, schema, sanitizedSchema string) error {
+// applyNotificationsPKeyMigration applies migration 10 (add the notifications
+// primary key) using a plain-SQL idempotence check at the application layer
+// instead of a PL/pgSQL DO block, so it needs no PL/pgSQL on any backend.
+func applyNotificationsPKeyMigration(ctx context.Context, tx pgx.Tx, schema, sanitizedSchema string) error {
 	rows, err := tx.Query(ctx, migration10CheckCockroachSQL, schema)
 	if err != nil {
 		return fmt.Errorf("failed to check notifications primary key for migration 10: %v", err)
@@ -699,7 +673,6 @@ type newSystemDatabaseInput struct {
 	customSqliteDB  *sql.DB
 	logger          *slog.Logger
 	applicationName string
-	disablePLpgSQL  bool // Postgres only: create no PL/pgSQL objects, use polling instead of LISTEN/NOTIFY
 }
 
 // New creates a new SystemDatabase instance and runs migrations
@@ -821,15 +794,7 @@ func newSystemDatabase(ctx context.Context, inputs newSystemDatabaseInput) (syst
 		logger.Info("Detected CockroachDB")
 	}
 
-	// usePLpgSQL is only meaningful on a real Postgres target (CockroachDB never
-	// uses PL/pgSQL). When the caller asked to disable it, the database is created
-	// with plain SQL only and notifications fall back to polling.
-	usePLpgSQL := !inputs.disablePLpgSQL
-	if !isCockroach && inputs.disablePLpgSQL {
-		logger.Info("PL/pgSQL disabled: using plain SQL and polling notifications")
-	}
-
-	needsMigration, smErr := shouldMigrate(ctx, pool, databaseSchema, isCockroach, usePLpgSQL)
+	needsMigration, smErr := shouldMigrate(ctx, pool, databaseSchema, isCockroach)
 	if smErr != nil {
 		if customPool == nil {
 			pool.Close()
@@ -838,7 +803,7 @@ func newSystemDatabase(ctx context.Context, inputs newSystemDatabaseInput) (syst
 	}
 	if needsMigration {
 		if err := retry(ctx, func() error {
-			return runMigrations(ctx, pool, databaseSchema, isCockroach, usePLpgSQL, logger)
+			return runMigrations(ctx, pool, databaseSchema, isCockroach, logger)
 		}, withRetrierLogger(logger)); err != nil {
 			if customPool == nil {
 				pool.Close()
@@ -864,10 +829,6 @@ func newSystemDatabase(ctx context.Context, inputs newSystemDatabaseInput) (syst
 	dialect := Dialect(postgresDialect{})
 	if isCockroach {
 		dialect = cockroachDialect{}
-	} else if inputs.disablePLpgSQL {
-		// Plain-SQL Postgres: behaves like Postgres but reports no LISTEN/NOTIFY
-		// support, so launch() starts the polling loop instead of the listener.
-		dialect = postgresPlainDialect{}
 	}
 
 	return &sysDB{
@@ -884,19 +845,10 @@ func newSystemDatabase(ctx context.Context, inputs newSystemDatabaseInput) (syst
 	}, nil
 }
 
-func (s *sysDB) listenNotifyPool() *pgxpool.Pool {
-	if s.dialect == nil || !s.dialect.SupportsListenNotify() {
-		return nil
-	}
-	return PgxPool(s.pool)
-}
-
 func (s *sysDB) launch(ctx context.Context) {
-	if s.listenNotifyPool() == nil {
-		go s.notificationPollerLoop(ctx)
-	} else {
-		go s.notificationListenerLoop(ctx)
-	}
+	// Notifications are always delivered by polling: the schema uses plain SQL
+	// with no LISTEN/NOTIFY triggers.
+	go s.notificationPollerLoop(ctx)
 	s.launched = true
 }
 
@@ -3145,139 +3097,6 @@ func (s *sysDB) patch(ctx context.Context, input patchDBInput) (bool, error) {
 /******* WORKFLOW COMMUNICATIONS ********/
 /****************************************/
 
-func (s *sysDB) notificationListenerLoop(ctx context.Context) {
-	defer func() {
-		s.logger.Debug("Notification listener loop exiting")
-		s.notificationLoopDone <- struct{}{}
-	}()
-
-	pgxPool := s.listenNotifyPool()
-	if pgxPool == nil {
-		s.logger.Error("Notification listener loop started without a pgx-backed pool; aborting")
-		return
-	}
-
-	acquire := func(ctx context.Context) (*pgxpool.Conn, error) {
-		// Acquire a connection from the pool and set up LISTEN on the notifications channels
-		pc, err := pgxPool.Acquire(ctx)
-		if err != nil {
-			return nil, err
-		}
-		tx, err := pc.Begin(ctx)
-		if err != nil {
-			pc.Release()
-			return nil, err
-		}
-		if _, err = tx.Exec(ctx, fmt.Sprintf("LISTEN %s", _DBOS_NOTIFICATIONS_CHANNEL)); err != nil {
-			rErr := tx.Rollback(ctx)
-			if rErr != nil {
-				s.logger.Error("Failed to rollback transaction after LISTEN error", "error", rErr)
-			}
-			pc.Release()
-			return nil, err
-		}
-		if _, err = tx.Exec(ctx, fmt.Sprintf("LISTEN %s", _DBOS_WORKFLOW_EVENTS_CHANNEL)); err != nil {
-			rErr := tx.Rollback(ctx)
-			if rErr != nil {
-				s.logger.Error("Failed to rollback transaction after LISTEN error", "error", rErr)
-			}
-			pc.Release()
-			return nil, err
-		}
-		if err = tx.Commit(ctx); err != nil {
-			rErr := tx.Rollback(ctx)
-			if rErr != nil {
-				s.logger.Error("Failed to rollback transaction after COMMIT error", "error", rErr)
-			}
-			pc.Release()
-			return nil, err
-		}
-		return pc, nil
-	}
-
-	s.logger.Debug("DBOS: Starting notification listener loop")
-
-	poolConn, err := retryWithResult(ctx, func() (*pgxpool.Conn, error) {
-		return acquire(ctx)
-	}, withRetrierLogger(s.logger))
-	if err != nil {
-		s.logger.Error("Failed to acquire listener connection", "error", err)
-		return
-	}
-	defer poolConn.Release()
-
-	retryAttempt := 0
-	for {
-		// Block until a notification is received. OnNotification will be called when a notification is received.
-		// WaitForNotification handles context cancellation: https://github.com/jackc/pgx/blob/15bca4a4e14e0049777c1245dba4c16300fe4fd0/pgconn/pgconn.go#L1050
-		n, err := poolConn.Conn().WaitForNotification(ctx)
-		if err != nil {
-			// Context cancellation -> graceful exit
-			if ctx.Err() != nil {
-				s.logger.Debug("Notification listener exiting (context canceled", "cause", context.Cause(ctx), "error", err)
-				poolConn.Release()
-				return
-			}
-			// If the underlying connection is closed, attempt to re-acquire a new one
-			if poolConn.Conn().IsClosed() {
-				s.logger.Debug("Notification listener connection closed. re-acquiring")
-				poolConn.Release()
-				for {
-					if ctx.Err() != nil {
-						s.logger.Debug("Notification listener exiting (context canceled)", "cause", context.Cause(ctx), "error", err)
-						return
-					}
-					poolConn, err = acquire(ctx)
-					if err == nil {
-						retryAttempt = 0
-						break
-					}
-					s.logger.Debug("failed to re-acquire connection for notification listener", "error", err)
-					time.Sleep(backoffWithJitter(retryAttempt))
-					retryAttempt++
-				}
-				// The connection is re-aquired. Signal to all waiters they should poll the database for a potentially missed value.
-				s.workflowNotificationRepollMap.Range(func(key, value any) bool {
-					repollChannel := value.(chan struct{})
-					repollChannel <- struct{}{}
-					return true
-				})
-				s.workflowEventsRepollMap.Range(func(key, value any) bool {
-					repollChannel := value.(chan struct{})
-					repollChannel <- struct{}{}
-					return true
-				})
-				continue
-			}
-			// Other transient errors. Backoff and continue on same conn
-			s.logger.Error("Error waiting for notification", "error", err)
-			time.Sleep(backoffWithJitter(retryAttempt))
-			retryAttempt++
-			continue
-		}
-
-		// Success: reduce backoff pressure
-		if retryAttempt > 0 {
-			retryAttempt--
-		}
-
-		switch n.Channel {
-		case _DBOS_NOTIFICATIONS_CHANNEL:
-			if cond, ok := s.workflowNotificationsMap.Load(n.Payload); ok {
-				cond.(*sync.Cond).L.Lock()
-				cond.(*sync.Cond).Broadcast()
-				cond.(*sync.Cond).L.Unlock()
-			}
-		case _DBOS_WORKFLOW_EVENTS_CHANNEL:
-			if cond, ok := s.workflowEventsMap.Load(n.Payload); ok {
-				cond.(*sync.Cond).L.Lock()
-				cond.(*sync.Cond).Broadcast()
-				cond.(*sync.Cond).L.Unlock()
-			}
-		}
-	}
-}
-
 func (s *sysDB) notificationPollerLoop(ctx context.Context) {
 	defer func() {
 		s.logger.Debug("Notification poller loop exiting")
@@ -3286,7 +3105,11 @@ func (s *sysDB) notificationPollerLoop(ctx context.Context) {
 
 	s.logger.Debug("DBOS: Starting notification poller loop")
 
-	ticker := time.NewTicker(1 * time.Second)
+	// All backends deliver notifications by polling (no LISTEN/NOTIFY). Poll
+	// frequently so in-process Recv/GetEvent waiters wake promptly — this is the
+	// only delivery path now, and latency-sensitive features (e.g. the debouncer's
+	// short ack timeouts) depend on it.
+	ticker := time.NewTicker(_NOTIFICATION_POLL_INTERVAL)
 	defer ticker.Stop()
 
 	for {

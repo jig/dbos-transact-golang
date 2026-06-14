@@ -75,11 +75,6 @@ type Dialect interface {
 	// snapshot=false allows the lighter read-committed path.
 	QueueDequeueIsolation(snapshot bool) IsoLevel
 
-	// SupportsListenNotify reports whether the dialect supports
-	// LISTEN/NOTIFY. False for CockroachDB and SQLite, which both fall back
-	// to the polling-based notification loop.
-	SupportsListenNotify() bool
-
 	// SupportsArrayParameters reports whether the dialect can bind a Go slice
 	// as a single array-typed parameter (e.g. pg's `= ANY($1)` with $1=[]string).
 	// SQLite cannot — callers must expand the slice into multiple positional
@@ -186,7 +181,6 @@ func (postgresDialect) QueueDequeueIsolation(snapshot bool) IsoLevel {
 	}
 	return IsoLevelReadCommitted
 }
-func (postgresDialect) SupportsListenNotify() bool     { return true }
 func (postgresDialect) SupportsArrayParameters() bool  { return true }
 func (postgresDialect) SupportsDataModifyingCTE() bool { return true }
 
@@ -253,28 +247,14 @@ func (postgresDialect) IsRetryable(err error, logger *slog.Logger) bool {
 /* ---------------------------------------------------------------------------
    CockroachDB
 
-   Wire-compatible with Postgres but:
-     - no LISTEN/NOTIFY (poll-based notification loop)
-     - migration 10 needs application-layer handling (see system_database.go)
+   Wire-compatible with Postgres; differs only in:
+     - migration 28 variant and no CONCURRENTLY index DDL (see buildMigrations)
+   (LISTEN/NOTIFY is off for Postgres too in this fork, so it inherits that.)
    ------------------------------------------------------------------------- */
 
 type cockroachDialect struct{ postgresDialect }
 
-func (cockroachDialect) Name() DialectName          { return DialectCockroach }
-func (cockroachDialect) SupportsListenNotify() bool { return false }
-
-/* ---------------------------------------------------------------------------
-   Plain-SQL Postgres (Config.DisablePLpgSQL)
-
-   Real Postgres, but with no PL/pgSQL objects created and no reliance on
-   LISTEN/NOTIFY: like Postgres in every respect except it uses the polling
-   notification loop (the migrations that create the trigger functions and the
-   client functions are skipped — see buildMigrations).
-   ------------------------------------------------------------------------- */
-
-type postgresPlainDialect struct{ postgresDialect }
-
-func (postgresPlainDialect) SupportsListenNotify() bool { return false }
+func (cockroachDialect) Name() DialectName { return DialectCockroach }
 
 /* ---------------------------------------------------------------------------
    SQLite
@@ -310,7 +290,6 @@ func (sqliteDialect) LockSkipLocked() string                { return "" }
 func (sqliteDialect) LockNoWait() string                    { return "" }
 func (sqliteDialect) SnapshotIsolation() IsoLevel           { return IsoLevelDefault }
 func (sqliteDialect) QueueDequeueIsolation(_ bool) IsoLevel { return IsoLevelDefault }
-func (sqliteDialect) SupportsListenNotify() bool            { return false }
 func (sqliteDialect) SupportsArrayParameters() bool         { return false }
 func (sqliteDialect) SupportsDataModifyingCTE() bool        { return false }
 
