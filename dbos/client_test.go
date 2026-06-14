@@ -1579,17 +1579,6 @@ func TestClientReadStreamAsyncGoroutineLeak(t *testing.T) {
 
 // TestDebouncerClient tests the DebouncerClient functionality using a Client interface
 func TestDebouncerClient(t *testing.T) {
-	// This fork creates no LISTEN/NOTIFY (plain SQL only); notifications are
-	// delivered by polling. The client debouncer's per-call ack uses a tight
-	// 2s GetEvent timeout (upstream flags it "unclear what's a good timeout"),
-	// and across the client/server split with two pollers it occasionally
-	// exceeds 2s on fast Postgres, triggering a retry that starts a second
-	// debouncer instance and fails the same-workflow-ID assertion. The core
-	// debounce behaviour is still covered by TestDebouncer,
-	// TestDebouncerWorkflowOptions and TestDebouncerClientWorkflowOptions, which
-	// are reliable on the polling path.
-	t.Skip("client debouncer ack timeout races without LISTEN/NOTIFY (plain-SQL polling); see comment")
-
 	// Setup server context - this will process tasks
 	serverCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
 
@@ -1641,26 +1630,12 @@ func TestDebouncerClient(t *testing.T) {
 	})
 
 	t.Run("TestMultipleCallsPushBackAndLatestInput", func(t *testing.T) {
-		// CockroachDB has longer notification latency due to polling. Only pg
-		// backends expose a *pgxpool.Pool we can sniff; sqlite is never CRDB.
-		isCockroach := false
-		if pgxPool := PgxPool(serverCtx.(*dbosContext).systemDB.(*sysDB).pool); pgxPool != nil {
-			conn, err := pgxPool.Acquire(serverCtx)
-			require.NoError(t, err)
-			defer conn.Release()
-			isCockroach = isCockroachDB(context.Background(), conn.Conn())
-		}
-
-		var delay time.Duration
-		if isCockroach || useSqliteBackend() {
-			// CRDB and sqlite both use polling for notifications. Each Debounce
-			// call's GetEvent ACK can take >200ms, so the debouncer expires
-			// before the next call arrives. Bump the delay so the debouncer
-			// stays alive across all 5 calls.
-			delay = 2000 * time.Millisecond
-		} else {
-			delay = 200 * time.Millisecond
-		}
+		// All backends deliver notifications by polling (this fork creates no
+		// LISTEN/NOTIFY). Each Debounce call's Send + GetEvent ACK round-trip can
+		// take a few poll cycles, so a short delay would let the debouncer expire
+		// between the rapid calls. Use a delay comfortably above the round-trip so
+		// the debouncer stays alive across all 5 calls.
+		delay := 2000 * time.Millisecond
 
 		// Call Debounce 5 times
 		key := "test-key-2"
