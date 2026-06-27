@@ -135,6 +135,19 @@ func PgxPool(p Pool) *pgxpool.Pool {
 	return nil
 }
 
+// poolIsPostgres reports whether the pool targets a Postgres-compatible database
+// (pgx, or a database/sql pool flagged as Postgres). Used to gate transactional
+// steps, which require Postgres regardless of the underlying driver.
+func poolIsPostgres(p Pool) bool {
+	switch a := p.(type) {
+	case *pgxPoolAdapter:
+		return true
+	case *sqlPoolAdapter:
+		return a.isPostgres
+	}
+	return false
+}
+
 type pgxTxAdapter struct{ tx pgx.Tx }
 
 func (t *pgxTxAdapter) Exec(ctx context.Context, q string, args ...any) (Result, error) {
@@ -206,10 +219,17 @@ func pgxTxOpts(o TxOptions) pgx.TxOptions {
    database/sql adapter (used by SQLite)
    ------------------------------------------------------------------------- */
 
-// newSQLPool wraps a *sql.DB so it satisfies Pool.
-func newSQLPool(db *sql.DB) Pool { return &sqlPoolAdapter{db: db} }
+// newSQLPool wraps a *sql.DB so it satisfies Pool. isPostgres marks the pool as
+// Postgres-compatible (e.g. lib/pq): transactional steps (transaction_outputs)
+// are enabled. false means SQLite, where they are skipped.
+func newSQLPool(db *sql.DB, isPostgres bool) Pool {
+	return &sqlPoolAdapter{db: db, isPostgres: isPostgres}
+}
 
-type sqlPoolAdapter struct{ db *sql.DB }
+type sqlPoolAdapter struct {
+	db         *sql.DB
+	isPostgres bool
+}
 
 func (a *sqlPoolAdapter) Exec(ctx context.Context, q string, args ...any) (Result, error) {
 	res, err := a.db.ExecContext(ctx, q, args...)
@@ -246,6 +266,16 @@ func (a *sqlPoolAdapter) Close()                         { _ = a.db.Close() }
 func SQLDB(p Pool) *sql.DB {
 	if a, ok := p.(*sqlPoolAdapter); ok {
 		return a.db
+	}
+	return nil
+}
+
+// SQLTx unwraps the underlying *sql.Tx from a Tx, or returns nil if the Tx is not
+// database/sql-backed. Lets a caller that owns its own driver (e.g. Persist via
+// lib/pq) bind to the same transaction that commits the DBOS checkpoint.
+func SQLTx(tx Tx) *sql.Tx {
+	if a, ok := tx.(*sqlTxAdapter); ok {
+		return a.tx
 	}
 	return nil
 }

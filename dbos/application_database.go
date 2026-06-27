@@ -49,6 +49,9 @@ func setupApplicationDB(ctx context.Context, config *Config, systemPool Pool, sc
 	case config.ApplicationDBPool != nil:
 		logger.Info("Using custom application database connection pool")
 		pool = newPgxPool(config.ApplicationDBPool)
+	case config.ApplicationSQLDB != nil:
+		logger.Info("Using custom database/sql application database connection pool")
+		pool = newSQLPool(config.ApplicationSQLDB, true)
 	case config.ApplicationDatabaseURL != "":
 		p, err := newApplicationPool(ctx, config.ApplicationDatabaseURL, config.AppName, logger)
 		if err != nil {
@@ -122,7 +125,7 @@ var appDialect Dialect = postgresDialect{}
 // pools (e.g. a SQLite system database), since transactional steps are
 // Postgres-only.
 func ensureTransactionOutputsTable(ctx context.Context, pool Pool, schema string) error {
-	if PgxPool(pool) == nil {
+	if !poolIsPostgres(pool) {
 		return nil
 	}
 
@@ -201,7 +204,7 @@ func checkTransactionExecution(ctx context.Context, tx Tx, schema, workflowID st
 // No-op for non-pgx pools (SQLite system database), where transactional steps are
 // unsupported anyway.
 func copyTransactionOutputsForFork(ctx context.Context, pool Pool, schema, originalID, forkedID string, startStep int) error {
-	if startStep <= 0 || PgxPool(pool) == nil {
+	if startStep <= 0 || !poolIsPostgres(pool) {
 		return nil
 	}
 	prefix := appDialect.SchemaPrefix(schema)
@@ -221,7 +224,7 @@ func copyTransactionOutputsForFork(ctx context.Context, pool Pool, schema, origi
 // workflows from the application database. Used to clean up after a failed fork and
 // by workflow deletion/garbage collection. No-op for non-pgx pools.
 func deleteTransactionOutputs(ctx context.Context, pool Pool, schema string, workflowIDs []string) error {
-	if len(workflowIDs) == 0 || PgxPool(pool) == nil {
+	if len(workflowIDs) == 0 || !poolIsPostgres(pool) {
 		return nil
 	}
 	query := appDialect.RewriteQuery(fmt.Sprintf(
@@ -238,7 +241,7 @@ func deleteTransactionOutputs(ctx context.Context, pool Pool, schema string, wor
 // operation_outputs (transactional steps are recorded only in transaction_outputs).
 // Returns nil for non-pgx pools, where transactional steps are unsupported.
 func listTransactionSteps(ctx context.Context, pool Pool, schema, workflowID string, loadOutput bool) ([]stepInfo, error) {
-	if PgxPool(pool) == nil {
+	if !poolIsPostgres(pool) {
 		return nil, nil
 	}
 	query := appDialect.RewriteQuery(fmt.Sprintf(
@@ -305,4 +308,21 @@ func recordTransactionResult(ctx context.Context, tx Tx, schema string, input re
 		return err
 	}
 	return nil
+}
+
+// recordTransactionFailure checkpoints a transactional step's permanent failure
+// in its own transaction. It is used after the step's own transaction was rolled
+// back to discard the user's writes: keeping the failure record separate is what
+// lets a returned error roll back the writes while still checkpointing the step
+// exactly once, so recovery replays the recorded error instead of re-executing.
+func recordTransactionFailure(ctx context.Context, pool Pool, schema string, txOpts TxOptions, input recordOperationResultDBInput) error {
+	tx, err := pool.BeginTx(ctx, txOpts)
+	if err != nil {
+		return fmt.Errorf("failed to begin failure-record transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if err := recordTransactionResult(ctx, tx, schema, input); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }

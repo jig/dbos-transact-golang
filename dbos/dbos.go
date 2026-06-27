@@ -37,6 +37,7 @@ type Config struct {
 	SqliteSystemDB            *sql.DB         // SqliteSystemDB is a custom sqlite handle (e.g. from modernc.org/sqlite). Optional; takes precedence over DatabaseURL. Mutually exclusive with SystemDBPool.
 	ApplicationDatabaseURL    string          // ApplicationDatabaseURL is the database where RunAsTransaction runs user SQL and records its checkpoint. Postgres/CockroachDB only. Optional; when empty, transactions use the system database.
 	ApplicationDBPool         *pgxpool.Pool   // ApplicationDBPool is a custom pg/CRDB pool for transactional steps. Optional; takes precedence over ApplicationDatabaseURL.
+	ApplicationSQLDB          *sql.DB         // ApplicationSQLDB is a custom database/sql Postgres pool (e.g. lib/pq) for transactional steps. Optional; takes precedence over ApplicationDatabaseURL. Lets a caller that owns the connection (e.g. Persist) share it with the combined transaction.
 	DatabaseSchema            string          // Database schema name (defaults to "dbos")
 	Logger                    *slog.Logger    // Custom logger instance (defaults to a new slog logger)
 	AdminServer               bool            // Enable Transact admin HTTP server (disabled by default)
@@ -97,6 +98,7 @@ func processConfig(inputConfig *Config) (*Config, error) {
 		SqliteSystemDB:            inputConfig.SqliteSystemDB,
 		ApplicationDatabaseURL:    inputConfig.ApplicationDatabaseURL,
 		ApplicationDBPool:         inputConfig.ApplicationDBPool,
+		ApplicationSQLDB:          inputConfig.ApplicationSQLDB,
 		EnablePatching:            inputConfig.EnablePatching,
 		Serializer:                inputConfig.Serializer,
 		SchedulerPollingInterval:  inputConfig.SchedulerPollingInterval,

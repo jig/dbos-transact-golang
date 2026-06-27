@@ -164,7 +164,7 @@ func newSqliteSystemDatabase(
 		return nil, fmt.Errorf("failed to ping sqlite database: %v", err)
 	}
 	return &sysDB{
-		pool:                          newSQLPool(db),
+		pool:                          newSQLPool(db, false),
 		dialect:                       sqliteDialect{},
 		workflowNotificationsMap:      &sync.Map{},
 		workflowNotificationRepollMap: &sync.Map{},

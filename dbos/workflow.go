@@ -2261,9 +2261,9 @@ func (c *dbosContext) runAsAppTxn(_ DBOSContext, fn txnFunc, opts ...StepOption)
 		return nil, newStepExecutionError(prep.WorkflowID, prep.StepOpts.stepName,
 			fmt.Errorf("RunAsTransaction cannot be called from within a step; call it directly from the workflow function"))
 	}
-	if PgxPool(c.appDB) == nil {
+	if !poolIsPostgres(c.appDB) {
 		return nil, newStepExecutionError(prep.WorkflowID, prep.StepOpts.stepName,
-			fmt.Errorf("transactional steps require a Postgres application database; the system database is not Postgres — set Config.ApplicationDatabaseURL (or ApplicationDBPool), or use a Postgres system database"))
+			fmt.Errorf("transactional steps require a Postgres application database; the system database is not Postgres — set Config.ApplicationDatabaseURL (or ApplicationDBPool/ApplicationSQLDB), or use a Postgres system database"))
 	}
 
 	uncancellableCtx := WithoutCancel(c)
@@ -2314,31 +2314,56 @@ func (c *dbosContext) runAsAppTxn(_ DBOSContext, fn txnFunc, opts ...StepOption)
 			return nil, newStepExecutionError(stepState.workflowID, stepOpts.stepName, fmt.Errorf("failed to serialize step output: %w", serErr))
 		}
 
-		var serializedTxnErr *string
 		if stepError != nil {
+			// A returned error rolls back the user's writes: the transaction's DB
+			// changes are discarded so a failed (e.g. guarded) operation leaves no
+			// partial state. Release the locks first.
+			_ = tx.Rollback(uncancellableCtx)
+
+			// Retryable failures (e.g. serialization) are re-run by the outer retrier
+			// on a fresh transaction; they are not checkpointed.
+			if isRetryableTransaction(stepError, c.logger) {
+				return nil, stepError
+			}
+
+			// A permanent failure is still checkpointed exactly once — in its own
+			// transaction, since the step's transaction was rolled back — so recovery
+			// replays the recorded error instead of re-executing the step.
 			s := serializeWorkflowError(stepError, txnSer.Name())
-			serializedTxnErr = &s
+			recErr := recordTransactionFailure(uncancellableCtx, pool, schema, txOpts, recordOperationResultDBInput{
+				workflowID:    stepState.workflowID,
+				stepName:      stepOpts.stepName,
+				stepID:        stepState.stepID,
+				errStr:        &s,
+				startedAt:     stepStartTime,
+				completedAt:   time.Now(),
+				output:        encodedStepOutput,
+				serialization: txnSer.Name(),
+			})
+			if recErr != nil {
+				return nil, newStepExecutionError(stepState.workflowID, stepOpts.stepName, errors.Join(recErr, stepError))
+			}
+			return stepOutput, stepError
 		}
+
+		// Success: the checkpoint commits atomically with the user's writes.
 		recErr := recordTransactionResult(uncancellableCtx, tx, schema, recordOperationResultDBInput{
 			workflowID:    stepState.workflowID,
 			stepName:      stepOpts.stepName,
 			stepID:        stepState.stepID,
-			errStr:        serializedTxnErr,
+			errStr:        nil,
 			startedAt:     stepStartTime,
 			completedAt:   time.Now(),
 			output:        encodedStepOutput,
 			serialization: txnSer.Name(),
 		})
 		if recErr != nil {
-			if stepError != nil {
-				recErr = errors.Join(recErr, stepError)
-			}
 			return nil, newStepExecutionError(stepState.workflowID, stepOpts.stepName, recErr)
 		}
 		if err := tx.Commit(uncancellableCtx); err != nil {
 			return nil, newStepExecutionError(stepState.workflowID, stepOpts.stepName, fmt.Errorf("failed to commit transaction: %w", err))
 		}
-		return stepOutput, stepError
+		return stepOutput, nil
 	}, withRetrierLogger(c.logger), withRetryCondition(isRetryableTransaction))
 }
 
