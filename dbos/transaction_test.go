@@ -2,6 +2,7 @@ package dbos
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"net/url"
 	"sync/atomic"
@@ -11,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" database/sql driver, for ApplicationSQLDB tests
 	"github.com/stretchr/testify/require"
 )
 
@@ -452,4 +454,143 @@ func TestRunAsTransactionSeparateAppDB(t *testing.T) {
 	require.Equal(t, 70, remaining2)
 	require.NoError(t, appPool.QueryRow(ctx, `SELECT balance FROM accounts WHERE name = 'alice'`).Scan(&aliceBal))
 	require.Equal(t, 70, aliceBal)
+}
+
+// TestRunAsTransactionRollsBackOnError proves the error semantics of
+// transactional steps: when the transaction function returns an error, the
+// user's writes are rolled back (no partial state is committed) and the
+// permanent failure is checkpointed once in transaction_outputs, so recovery
+// replays the recorded error instead of re-executing the SQL.
+func TestRunAsTransactionRollsBackOnError(t *testing.T) {
+	skipIfSqlite(t, "transactional steps are Postgres-only")
+
+	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true})
+
+	verifyPool, err := pgxpool.New(context.Background(), getDatabaseURL())
+	require.NoError(t, err)
+	t.Cleanup(verifyPool.Close)
+	_, err = verifyPool.Exec(context.Background(),
+		`CREATE TABLE IF NOT EXISTS rollback_txn_data (id text PRIMARY KEY, note text)`)
+	require.NoError(t, err)
+	// Drop before closing the pool (cleanups run LIFO; this is registered last).
+	t.Cleanup(func() {
+		_, _ = verifyPool.Exec(context.Background(), `DROP TABLE IF EXISTS rollback_txn_data`)
+	})
+
+	const rowID = "row-1"
+	const failMsg = "guard rejected after write"
+
+	// The transaction writes a row and THEN fails, like a guard that rejects the
+	// operation only after a partial write.
+	failingWorkflow := func(ctx DBOSContext, _ string) (string, error) {
+		return RunAsTransaction(ctx, func(txCtx context.Context, tx Tx) (string, error) {
+			if _, err := tx.Exec(txCtx,
+				`INSERT INTO rollback_txn_data (id, note) VALUES ($1, $2)`, rowID, "written"); err != nil {
+				return "", err
+			}
+			return "", fmt.Errorf(failMsg)
+		})
+	}
+	RegisterWorkflow(dbosCtx, failingWorkflow)
+	require.NoError(t, Launch(dbosCtx))
+
+	wfID := uuid.NewString()
+	handle, err := RunWorkflow(dbosCtx, failingWorkflow, "", WithWorkflowID(wfID))
+	require.NoError(t, err)
+	_, err = handle.GetResult()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), failMsg)
+
+	// The write was rolled back: the row is not visible to a separate connection.
+	var count int
+	require.NoError(t, verifyPool.QueryRow(context.Background(),
+		`SELECT count(*) FROM rollback_txn_data WHERE id = $1`, rowID).Scan(&count))
+	require.Equal(t, 0, count, "a failed transaction must leave no partial state")
+
+	// The permanent failure is checkpointed exactly once, with a non-null error,
+	// so recovery replays it instead of re-executing the step.
+	var txnRows int
+	require.NoError(t, verifyPool.QueryRow(context.Background(),
+		`SELECT count(*) FROM dbos.transaction_outputs WHERE workflow_uuid = $1`, wfID).Scan(&txnRows))
+	require.Equal(t, 1, txnRows)
+	var txnErr *string
+	require.NoError(t, verifyPool.QueryRow(context.Background(),
+		`SELECT error FROM dbos.transaction_outputs WHERE workflow_uuid = $1`, wfID).Scan(&txnErr))
+	require.NotNil(t, txnErr, "the failed transaction must be checkpointed with its error")
+	require.Contains(t, *txnErr, failMsg)
+}
+
+// TestRunAsTransactionApplicationSQLDB proves that a database/sql Postgres pool
+// supplied via Config.ApplicationSQLDB enables transactional steps (it is no
+// longer mistaken for SQLite and skipped), and that SQLTx exposes the underlying
+// *sql.Tx so a caller owning its own driver can write through the same
+// transaction that commits the DBOS checkpoint.
+func TestRunAsTransactionApplicationSQLDB(t *testing.T) {
+	skipIfSqlite(t, "transactional steps are Postgres-only")
+
+	ctx := context.Background()
+	sysURL := getDatabaseURL()
+	resetTestDatabase(t, sysURL)
+
+	// A database/sql Postgres pool (via pgx's stdlib driver) as the application pool.
+	appDB, err := sql.Open("pgx", sysURL)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = appDB.Close() }) // runs after Shutdown (registered earlier => LIFO)
+
+	dbosCtx, err := NewDBOSContext(ctx, Config{
+		DatabaseURL:      sysURL,
+		ApplicationSQLDB: appDB,
+		AppName:          "test-app",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, dbosCtx)
+	t.Cleanup(func() { Shutdown(dbosCtx, 30*time.Second) })
+
+	verifyPool, err := pgxpool.New(ctx, sysURL)
+	require.NoError(t, err)
+	t.Cleanup(verifyPool.Close)
+	_, err = verifyPool.Exec(ctx, `CREATE TABLE IF NOT EXISTS sqldb_txn_data (id text PRIMARY KEY, note text)`)
+	require.NoError(t, err)
+	t.Cleanup(func() { _, _ = verifyPool.Exec(ctx, `DROP TABLE IF EXISTS sqldb_txn_data`) })
+
+	const rowID = "row-1"
+
+	// The write goes through the raw *sql.Tx obtained via SQLTx, mirroring a
+	// caller (e.g. Persist) that uses its own driver on the DBOS transaction.
+	insertWorkflow := func(wfCtx DBOSContext, note string) (string, error) {
+		return RunAsTransaction(wfCtx, func(txCtx context.Context, tx Tx) (string, error) {
+			raw := SQLTx(tx)
+			if raw == nil {
+				return "", fmt.Errorf("SQLTx returned nil; expected a database/sql-backed transaction")
+			}
+			if _, err := raw.ExecContext(txCtx,
+				`INSERT INTO sqldb_txn_data (id, note) VALUES ($1, $2)`, rowID, note); err != nil {
+				return "", err
+			}
+			return rowID, nil
+		})
+	}
+	RegisterWorkflow(dbosCtx, insertWorkflow)
+	require.NoError(t, Launch(dbosCtx))
+
+	wfID := uuid.NewString()
+	handle, err := RunWorkflow(dbosCtx, insertWorkflow, "hello", WithWorkflowID(wfID))
+	require.NoError(t, err)
+	id, err := handle.GetResult()
+	require.NoError(t, err)
+	require.Equal(t, rowID, id)
+
+	// The write committed atomically with the checkpoint, visible to a separate
+	// connection.
+	var note string
+	require.NoError(t, verifyPool.QueryRow(ctx,
+		`SELECT note FROM sqldb_txn_data WHERE id = $1`, rowID).Scan(&note))
+	require.Equal(t, "hello", note)
+
+	// The checkpoint was recorded in transaction_outputs, proving the *sql.DB
+	// pool was treated as Postgres rather than skipped as SQLite.
+	var txnCount int
+	require.NoError(t, verifyPool.QueryRow(ctx,
+		`SELECT count(*) FROM dbos.transaction_outputs WHERE workflow_uuid = $1`, wfID).Scan(&txnCount))
+	require.Equal(t, 1, txnCount)
 }
