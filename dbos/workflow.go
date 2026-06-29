@@ -1634,6 +1634,18 @@ func (c *dbosContext) RunWorkflow(_ DBOSContext, fn WorkflowFunc, input any, opt
 			close(outcomeChan)
 			return
 		} else {
+			// Engine shutdown (not an explicit cancel): leave the workflow
+			// PENDING so the next executor recovers it, mirroring the suspension
+			// path above. Without this, a long-lived wait (Recv/timeout) would be
+			// finalised ERROR on every restart. Explicit cancel and durable
+			// deadlines register a stopFunc, so they are excluded.
+			if err != nil && stopFunc == nil && workflowCtx.Err() != nil {
+				c.logger.Info("Workflow interrupted by shutdown; left pending for recovery", "workflow_id", workflowID)
+				outcomeChan <- workflowOutcome[any]{result: nil, err: err}
+				close(outcomeChan)
+				return
+			}
+
 			status := WorkflowStatusSuccess
 
 			// If an error occurred, set the status to error
