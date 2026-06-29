@@ -7189,3 +7189,73 @@ func TestGetStepAggregates(t *testing.T) {
 		require.Error(t, err)
 	})
 }
+
+// TestWorkflowLeftPendingOnShutdown proves that a workflow interrupted by engine
+// shutdown is left PENDING (not finalized ERROR) so a later executor recovers it.
+// Regression test for the shutdown-interruption fix: before it, the cancelled
+// workflow context made the function return an error that was recorded as ERROR,
+// a terminal state recovery would never resume.
+func TestWorkflowLeftPendingOnShutdown(t *testing.T) {
+	url := backendDatabaseURL(t)
+	if !useSqliteBackend() {
+		resetTestDatabase(t, url)
+	}
+
+	const wfID = "shutdown-pending-wf"
+
+	var runCount atomic.Int32
+	started := make(chan struct{}, 1)
+
+	// First execution blocks until the engine shuts down (its context is
+	// cancelled), then returns the context error. The recovery re-execution
+	// completes normally.
+	blockingWorkflow := func(ctx DBOSContext, _ string) (string, error) {
+		if runCount.Add(1) == 1 {
+			started <- struct{}{}
+			<-ctx.Done()
+			return "", ctx.Err()
+		}
+		return "recovered", nil
+	}
+
+	newEngine := func() DBOSContext {
+		c, err := NewDBOSContext(context.Background(), Config{
+			DatabaseURL: url,
+			AppName:     "test-app",
+		})
+		require.NoError(t, err)
+		RegisterWorkflow(c, blockingWorkflow)
+		return c
+	}
+
+	// First engine: start the workflow, wait until it is running, then shut down.
+	ctx1 := newEngine()
+	require.NoError(t, Launch(ctx1))
+	_, err := RunWorkflow(ctx1, blockingWorkflow, "", WithWorkflowID(wfID))
+	require.NoError(t, err)
+	<-started
+	Shutdown(ctx1, 30*time.Second)
+
+	// Second engine on the same database. Before recovery runs (i.e. before
+	// Launch), the interrupted workflow must still be PENDING — not ERROR, which
+	// the pre-fix code would have recorded and which recovery would never resume.
+	ctx2 := newEngine()
+	t.Cleanup(func() { Shutdown(ctx2, 30*time.Second) })
+
+	h, err := RetrieveWorkflow[string](ctx2, wfID)
+	require.NoError(t, err)
+	st, err := h.GetStatus()
+	require.NoError(t, err)
+	require.Equal(t, WorkflowStatusPending, st.Status, "interrupted workflow must be left PENDING, not finalized")
+
+	// Launching the second engine recovers the PENDING workflow; it re-executes
+	// and completes successfully.
+	require.NoError(t, Launch(ctx2))
+	result, err := h.GetResult()
+	require.NoError(t, err)
+	require.Equal(t, "recovered", result)
+
+	st, err = h.GetStatus()
+	require.NoError(t, err)
+	require.Equal(t, WorkflowStatusSuccess, st.Status)
+}
