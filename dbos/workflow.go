@@ -1640,6 +1640,15 @@ func (c *dbosContext) RunWorkflow(_ DBOSContext, fn WorkflowFunc, input any, opt
 			// finalised ERROR on every restart. Explicit cancel and durable
 			// deadlines register a stopFunc, so they are excluded.
 			if err != nil && stopFunc == nil && workflowCtx.Err() != nil {
+				// Reset recovery_attempts so repeated clean restarts do not count
+				// toward the DLQ budget (a reboot is not a failed attempt), mirroring
+				// the reset on suspension. A crash skips this path, so its counter
+				// keeps accumulating and crash-loop protection is preserved.
+				if sdb, ok := c.systemDB.(*sysDB); ok {
+					if resetErr := sdb.resetWorkflowRecoveryAttempts(uncancellableCtx, workflowID); resetErr != nil {
+						c.logger.Warn("Failed to reset recovery attempts on shutdown", "workflow_id", workflowID, "error", resetErr)
+					}
+				}
 				c.logger.Info("Workflow interrupted by shutdown; left pending for recovery", "workflow_id", workflowID)
 				outcomeChan <- workflowOutcome[any]{result: nil, err: err}
 				close(outcomeChan)

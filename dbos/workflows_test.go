@@ -7259,3 +7259,79 @@ func TestWorkflowLeftPendingOnShutdown(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, WorkflowStatusSuccess, st.Status)
 }
+
+// TestGracefulRebootDoesNotExhaustRecoveryAttempts proves that repeatedly
+// restarting the engine while a workflow is in-flight does not push it to
+// MAX_RECOVERY_ATTEMPTS_EXCEEDED: a clean shutdown resets recovery_attempts, so
+// a reboot is not counted as a failed attempt. The workflow is registered with a
+// low max-retries so that, without the reset, it would be dead-lettered after a
+// few reboots; with the reset it survives any number and completes once released.
+func TestGracefulRebootDoesNotExhaustRecoveryAttempts(t *testing.T) {
+	url := backendDatabaseURL(t)
+	if !useSqliteBackend() {
+		resetTestDatabase(t, url)
+	}
+
+	const wfID = "reboot-recovery-wf"
+	const maxRetries = 2
+
+	var release atomic.Bool
+	started := make(chan struct{}, 1)
+
+	// Until released, every execution blocks until the engine shuts down (its
+	// context is cancelled) and returns the context error, so each reboot catches
+	// it in-flight. Once released, it completes.
+	rebootWorkflow := func(ctx DBOSContext, _ string) (string, error) {
+		if release.Load() {
+			return "done", nil
+		}
+		started <- struct{}{}
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
+
+	newEngine := func() DBOSContext {
+		c, err := NewDBOSContext(context.Background(), Config{
+			DatabaseURL: url,
+			AppName:     "test-app",
+		})
+		require.NoError(t, err)
+		RegisterWorkflow(c, rebootWorkflow, WithMaxRetries(maxRetries))
+		return c
+	}
+
+	// Start the workflow on the first engine, then shut down mid-flight.
+	ctx1 := newEngine()
+	require.NoError(t, Launch(ctx1))
+	_, err := RunWorkflow(ctx1, rebootWorkflow, "", WithWorkflowID(wfID))
+	require.NoError(t, err)
+	<-started
+	Shutdown(ctx1, 30*time.Second)
+
+	// Reboot several times (more than maxRetries+1): each restart recovers the
+	// still-PENDING workflow and is interrupted again. Without the reset this
+	// would dead-letter it.
+	for range maxRetries + 2 {
+		c := newEngine()
+		require.NoError(t, Launch(c))
+		<-started
+		Shutdown(c, 30*time.Second)
+	}
+
+	// Release and start a final engine: recovery now runs the workflow to
+	// completion instead of finding it dead-lettered.
+	release.Store(true)
+	ctxFinal := newEngine()
+	t.Cleanup(func() { Shutdown(ctxFinal, 30*time.Second) })
+	require.NoError(t, Launch(ctxFinal))
+
+	h, err := RetrieveWorkflow[string](ctxFinal, wfID)
+	require.NoError(t, err)
+	result, err := h.GetResult()
+	require.NoError(t, err, "workflow must complete, not be dead-lettered by reboots")
+	require.Equal(t, "done", result)
+
+	st, err := h.GetStatus()
+	require.NoError(t, err)
+	require.Equal(t, WorkflowStatusSuccess, st.Status)
+}

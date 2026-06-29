@@ -4199,6 +4199,23 @@ func (s *sysDB) suspendWorkflowToDelayed(ctx context.Context, runner Querier, wo
 	return n > 0, nil
 }
 
+// resetWorkflowRecoveryAttempts zeroes a still-PENDING workflow's recovery_attempts.
+// Used when a workflow is left PENDING after a graceful engine shutdown so repeated
+// clean restarts do not count toward the DLQ (MAX_RECOVERY_ATTEMPTS_EXCEEDED) budget:
+// a reboot is not a failed attempt. It mirrors the reset suspendWorkflowToDelayed
+// performs on suspension. A real crash never calls this, so its recovery_attempts
+// keep accumulating and crash-loop protection is preserved.
+func (s *sysDB) resetWorkflowRecoveryAttempts(ctx context.Context, workflowID string) error {
+	query := s.renderSQL(`UPDATE %sworkflow_status
+		SET recovery_attempts = 0, updated_at = $1
+		WHERE workflow_uuid = $2 AND status = $3`, s.dialect.SchemaPrefix(s.schema))
+	_, err := s.pool.Exec(ctx, query, time.Now().UnixMilli(), workflowID, WorkflowStatusPending)
+	if err != nil {
+		return fmt.Errorf("failed to reset recovery attempts for workflow %s: %w", workflowID, err)
+	}
+	return nil
+}
+
 // suspendWorkflowForSleep parks a PENDING workflow in the database for the remainder of a
 // durable sleep. See suspendWorkflowToDelayed for the semantics.
 func (s *sysDB) suspendWorkflowForSleep(ctx context.Context, workflowID string, delayUntil time.Time) (bool, error) {
