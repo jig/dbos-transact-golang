@@ -675,7 +675,7 @@ func NewDBOSContext(ctx context.Context, inputConfig Config) (DBOSContext, error
 	// Set up the application database for transactional steps. Defaults to the
 	// system database pool when no separate application database is configured.
 	var systemPool Pool
-	if sdb, ok := systemDB.(*sysDB); ok {
+	if sdb := systemDB.concrete(); sdb != nil {
 		systemPool = sdb.pool
 	}
 	appDB, err := setupApplicationDB(initExecutor, config, systemPool, config.DatabaseSchema, initExecutor.logger)
@@ -686,7 +686,7 @@ func NewDBOSContext(ctx context.Context, inputConfig Config) (DBOSContext, error
 	initExecutor.appDB = appDB.pool
 	initExecutor.appDBSchema = appDB.schema
 	initExecutor.appDBOwned = appDB.owned
-	if sdb, ok := systemDB.(*sysDB); ok {
+	if sdb := systemDB.concrete(); sdb != nil {
 		// Let workflow deletion and GC clean up transaction_outputs in the application database.
 		sdb.setApplicationDB(appDB.pool, appDB.schema)
 	}

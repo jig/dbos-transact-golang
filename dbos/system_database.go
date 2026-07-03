@@ -33,6 +33,13 @@ type systemDatabase interface {
 	shutdown(ctx context.Context, timeout time.Duration)
 	resetSystemDB(ctx context.Context) error
 
+	// concrete returns the underlying *sysDB when this systemDatabase is (or
+	// wraps, by embedding the interface) the real implementation. Runtime code
+	// that needs sysDB internals (the shared pool, dialect flags) must use it
+	// instead of a type assertion, so test facades that wrap the interface
+	// (e.g. for fault injection) keep working.
+	concrete() *sysDB
+
 	// Workflows
 	insertWorkflowStatus(ctx context.Context, input insertWorkflowStatusDBInput) (*insertWorkflowResult, error)
 	listWorkflows(ctx context.Context, input listWorkflowsDBInput) ([]WorkflowStatus, error)
@@ -852,6 +859,10 @@ func newSystemDatabase(ctx context.Context, inputs newSystemDatabaseInput) (syst
 		isCockroachDB:                 isCockroach,
 	}, nil
 }
+
+// concrete implements systemDatabase; facades that embed the interface
+// inherit it and hand back the real implementation.
+func (s *sysDB) concrete() *sysDB { return s }
 
 func (s *sysDB) launch(ctx context.Context) {
 	// Notifications are always delivered by polling: the schema uses plain SQL
@@ -3395,8 +3406,11 @@ func (s *sysDB) recv(ctx context.Context, input recvInput) (*recvResult, error) 
 		return nil, newStepExecutionError("", functionName, fmt.Errorf("workflow state not found in context: are you running this step within a workflow?"))
 	}
 
-	// Allocate step IDs, unless the caller re-enters with pre-assigned ones
-	// (after a failed suspension attempt).
+	// The caller pre-assigns the step IDs (allocated once, outside its
+	// transient-error retry loop, and reused on re-entry after a failed
+	// suspension attempt). The fallback allocation is defensive only:
+	// allocating here, inside a retried call, would leak IDs on transient
+	// errors and gap the recorded history.
 	var stepID, sleepStepID int
 	if input.stepID != nil && input.sleepStepID != nil {
 		stepID = *input.stepID
@@ -3687,8 +3701,9 @@ func (s *sysDB) getEvent(ctx context.Context, input getEventInput) (*getEventRes
 		if wfState.isWithinStep {
 			return nil, newStepExecutionError(wfState.workflowID, functionName, fmt.Errorf("cannot call GetEvent within a step"))
 		}
-		// Allocate step IDs, unless the caller re-enters with pre-assigned ones
-		// (after a failed suspension attempt).
+		// The caller pre-assigns the step IDs (allocated once, outside its
+		// transient-error retry loop, and reused on re-entry after a failed
+		// suspension attempt); the fallback allocation is defensive only.
 		if input.stepID != nil && input.sleepStepID != nil {
 			stepID = *input.stepID
 			sleepStepID = *input.sleepStepID
@@ -3744,32 +3759,40 @@ func (s *sysDB) getEvent(ctx context.Context, input getEventInput) (*getEventRes
 	var row pgx.Row
 	var err error
 
-	// Helper function to query the event and handle errors
+	// Helper function to query the event and handle errors. It never touches
+	// cond.L: lock ownership is handled at the call sites (the caller holds the
+	// lock only until the waiter goroutine below takes it over).
 	queryEvent := func() error {
 		row = s.pool.QueryRow(ctx, query, input.TargetWorkflowID, input.Key)
 		err = row.Scan(&valueString, &evtSerialization)
 		if err != nil && err != pgx.ErrNoRows {
-			if !loaded {
-				cond.L.Unlock()
-			}
 			return fmt.Errorf("failed to query workflow event: %w", err)
 		}
 		return nil
 	}
 
 	if err := queryEvent(); err != nil {
+		if !loaded {
+			cond.L.Unlock()
+		}
 		return nil, err
 	}
 
 	var timeoutOccurred bool
 	if valueString == nil {
-		// Start a goroutine to wait for the event to be set
-		// This goroutine is responsible for unlocking the CV, which will happen whenever the event is set (through either the deferred Broadcast or from the notification listener)
+		// Start a goroutine to wait for the event to be set. From this point on
+		// the waiter OWNS the unlock of cond.L: it wakes on a Broadcast (the
+		// notification listener, or the deferred one above on every return path)
+		// and releases the lock exactly once. No other path may unlock after the
+		// waiter exists — a second unlock is a runtime fatal. cond.Wait requires
+		// the lock to be held: the !loaded caller already holds it; a waiter on a
+		// reused (loaded) cond must acquire it first.
 		done := make(chan struct{})
 		go func() {
-			if !loaded {
-				defer cond.L.Unlock()
+			if loaded {
+				cond.L.Lock()
 			}
+			defer cond.L.Unlock()
 			cond.Wait()
 			close(done)
 		}()
@@ -3827,9 +3850,8 @@ func (s *sysDB) getEvent(ctx context.Context, input getEventInput) (*getEventRes
 				continue
 			case <-ctx.Done():
 				s.logger.Warn("GetEvent() context cancelled", "target_workflow_id", input.TargetWorkflowID, "key", input.Key, "cause", context.Cause(ctx))
-				if !loaded {
-					cond.L.Unlock()
-				}
+				// The waiter goroutine owns the cond.L unlock (woken by the
+				// deferred Broadcast); unlocking here too would double-unlock.
 				return nil, ctx.Err()
 			}
 		}

@@ -102,7 +102,7 @@ protection is preserved.
 | Area | Files | Type | Notes |
 |---|---|---|---|
 | Leave-PENDING + reset | `workflow.go` (`RunWorkflow` shutdown branch) | **Hot-rewrite** | |
-| Reset helper | `system_database.go` (`resetWorkflowRecoveryAttempts`) | Additive | called via `*sysDB` type assertion (no interface change) |
+| Reset helper | `system_database.go` (`resetWorkflowRecoveryAttempts`) | Additive | reached via `systemDatabase.concrete()` (see §6) |
 | Tests | `workflows_test.go` (`TestWorkflowLeftPendingOnShutdown`, `TestGracefulRebootDoesNotExhaustRecoveryAttempts`) | Additive | |
 
 Re-apply notes: the principled long-term fix (lease/heartbeat liveness instead of
@@ -118,7 +118,29 @@ A recorded step/workflow error is rebuilt as a `*DBOSError` with its original
 | `errors.go` (rebuild from "DBOS Error <code>: ..."), `serialization.go` (de/serializeWorkflowError) | Hot-rewrite (small) |
 | `errors_test.go` (new) | Additive |
 
-## 6. Upstream changes deliberately NOT taken
+## 6. Step-ID stability across transient retries
+
+`Recv` / `GetEvent` / `Sleep` used to allocate their step ID(s) inside the
+`retryWithResult` closure (in `sysDB.recv` / `getEvent` / `sleep`), so a
+transient error (SQLITE_BUSY, dropped connection) leaked IDs on each attempt:
+the recorded history gets a gap and a later replay re-executes inside it
+(caught by fluxos8's golden-history harness). The IDs are now reserved once by
+the caller, outside the retry loop, and passed via the existing re-entry
+fields (`recvInput.stepID` / `sleepStepID`, etc.); the callee-side allocation
+remains as a defensive fallback only.
+
+Supporting change: `systemDatabase` gains `concrete() *sysDB` and runtime code
+uses it instead of `.(*sysDB)` type assertions, so tests can wrap the system
+database with fault-injecting facades (embedding the interface inherits
+`concrete()`).
+
+| Area | Files | Type | Notes |
+|---|---|---|---|
+| Caller-side ID reservation | `workflow.go` (`Recv`, `GetEvent`, `Sleep`) | **Hot-rewrite** (small) | |
+| `concrete()` seam | `system_database.go` (interface + impl), assertion sites in `workflow.go`, `client.go`, `dbos.go` | Mechanical | behaviour unchanged for the real `*sysDB` |
+| Tests | `retry_step_ids_test.go` (new) | Additive | facade asserts every attempt carries the same pre-assigned IDs |
+
+## 7. Upstream changes deliberately NOT taken
 
 | Upstream | Why skipped |
 |---|---|
@@ -131,7 +153,7 @@ upstream 38/39/40) is the single nastiest re-application detail. On a fresh fork
 renumber the fork-specific migrations above the upstream range (e.g. 1000+) to
 end the collision permanently — drop & recreate makes this free.
 
-## 7. Infra / docs
+## 8. Infra / docs
 
 | Files | Type | Notes |
 |---|---|---|

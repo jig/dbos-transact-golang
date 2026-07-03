@@ -1408,7 +1408,7 @@ func (c *dbosContext) RunWorkflow(_ DBOSContext, fn WorkflowFunc, input any, opt
 
 	// Init status and record child workflow relationship in a single transaction
 	insertWorkflowStatusTx := func() error {
-		tx, err := c.systemDB.(*sysDB).pool.BeginTx(uncancellableCtx, TxOptions{})
+		tx, err := c.systemDB.concrete().pool.BeginTx(uncancellableCtx, TxOptions{})
 		if err != nil {
 			return newWorkflowExecutionError(workflowID, fmt.Errorf("failed to begin transaction: %w", err))
 		}
@@ -1644,7 +1644,7 @@ func (c *dbosContext) RunWorkflow(_ DBOSContext, fn WorkflowFunc, input any, opt
 				// toward the DLQ budget (a reboot is not a failed attempt), mirroring
 				// the reset on suspension. A crash skips this path, so its counter
 				// keeps accumulating and crash-loop protection is preserved.
-				if sdb, ok := c.systemDB.(*sysDB); ok {
+				if sdb := c.systemDB.concrete(); sdb != nil {
 					if resetErr := sdb.resetWorkflowRecoveryAttempts(uncancellableCtx, workflowID); resetErr != nil {
 						c.logger.Warn("Failed to reset recovery attempts on shutdown", "workflow_id", workflowID, "error", resetErr)
 					}
@@ -2167,7 +2167,7 @@ func (c *dbosContext) runAsTxn(_ DBOSContext, fn txnFunc, opts ...StepOption) (a
 	uncancellableCtx := WithoutCancel(c)
 	stepState := prep.StepState
 	stepOpts := prep.StepOpts
-	pool := c.systemDB.(*sysDB).pool
+	pool := c.systemDB.concrete().pool
 	stepCtx := WithValue(c, workflowStateKey, stepState)
 	stepStartTime := time.Now()
 
@@ -2302,7 +2302,7 @@ func (c *dbosContext) runAsAppTxn(_ DBOSContext, fn txnFunc, opts ...StepOption)
 	// The dedup checkpoint is in the application database, so we cannot read the
 	// workflow status inside the same transaction. Guard against running for a
 	// cancelled or non-existent workflow against the system database first.
-	if sdb, ok := c.systemDB.(*sysDB); ok {
+	if sdb := c.systemDB.concrete(); sdb != nil {
 		if err := sdb.checkWorkflowCancellation(uncancellableCtx, stepState.workflowID); err != nil {
 			return nil, err
 		}
@@ -2740,8 +2740,17 @@ func (c *dbosContext) Recv(_ DBOSContext, topic string, timeout time.Duration) (
 	if c.config.DurableSleepThreshold > 0 {
 		input.suspendThreshold = c.config.DurableSleepThreshold
 	}
+	// Reserve the operation's step IDs once, OUTSIDE the transient-error retry
+	// loop: a retry re-runs the same logical operation and must reuse them.
+	// Allocating inside the retried closure leaks two IDs per failed attempt,
+	// recording a gapped history that later replays non-deterministically (the
+	// replayed recv finds no row at the leaked position and re-executes there).
+	stepID := wfState.nextStepID()
+	sleepStepID := wfState.nextStepID()
+	input.stepID = &stepID
+	input.sleepStepID = &sleepStepID
 	recvRetryOpts := []retryOption{withRetrierLogger(c.logger)}
-	if sysDB, ok := c.systemDB.(*sysDB); ok && sysDB.isCockroachDB {
+	if sysDB := c.systemDB.concrete(); sysDB != nil && sysDB.isCockroachDB {
 		recvRetryOpts = append(recvRetryOpts, withRetryCondition(cockroachDialect{}.IsRetryableTransaction))
 	}
 	result, err := retryWithResult(c, func() (*recvResult, error) {
@@ -2958,8 +2967,16 @@ func (c *dbosContext) GetEvent(_ DBOSContext, targetWorkflowID, key string, time
 	}
 	wfState, ok := c.Value(workflowStateKey).(*workflowState)
 	isWithinWorkflow := ok && wfState != nil
-	if isWithinWorkflow && !wfState.isWithinStep && c.config.DurableSleepThreshold > 0 {
-		input.suspendThreshold = c.config.DurableSleepThreshold
+	if isWithinWorkflow && !wfState.isWithinStep {
+		if c.config.DurableSleepThreshold > 0 {
+			input.suspendThreshold = c.config.DurableSleepThreshold
+		}
+		// Reserve the step IDs once, outside the transient-error retry loop
+		// (see Recv): allocating per attempt gaps the recorded history.
+		stepID := wfState.nextStepID()
+		sleepStepID := wfState.nextStepID()
+		input.stepID = &stepID
+		input.sleepStepID = &sleepStepID
 	}
 	result, err := retryWithResult(c, func() (*getEventResult, error) {
 		return c.systemDB.getEvent(c, input)
@@ -3585,9 +3602,13 @@ func (c *dbosContext) Sleep(_ DBOSContext, duration time.Duration) (time.Duratio
 		return 0, newStepExecutionError(wfState.workflowID, "DBOS.sleep", fmt.Errorf("cannot call Sleep within a step"))
 	}
 
+	// Reserve the step ID once, outside the transient-error retry loop (see
+	// Recv): allocating per attempt gaps the recorded history.
+	stepID := wfState.nextStepID()
+
 	// Record (or read back) the durable wake-up time and compute the remaining duration.
 	remaining, err := retryWithResult(c, func() (time.Duration, error) {
-		return c.systemDB.sleep(c, sleepInput{duration: duration, skipSleep: true})
+		return c.systemDB.sleep(c, sleepInput{duration: duration, skipSleep: true, stepID: &stepID})
 	}, withRetrierLogger(c.logger))
 	if err != nil {
 		return 0, err
@@ -4313,8 +4334,8 @@ func (c *dbosContext) ForkWorkflow(_ DBOSContext, input ForkWorkflowInput) (Work
 		}, WithStepName("DBOS.forkWorkflow"))
 	} else {
 		forkedWorkflowID, err = retryWithResult(c, func() (string, error) {
-			sdb, ok := c.systemDB.(*sysDB)
-			if !ok { // Mocked system database: no transactional checkpoints to copy
+			sdb := c.systemDB.concrete()
+			if sdb == nil { // Mocked system database: no transactional checkpoints to copy
 				return c.systemDB.forkWorkflow(c, dbInput)
 			}
 			tx, err := sdb.pool.BeginTx(c, TxOptions{})
@@ -5393,7 +5414,7 @@ func (c *dbosContext) ApplySchedules(_ DBOSContext, schedules []ApplySchedulesRe
 	}
 
 	return retry(c, func() error {
-		tx, err := c.systemDB.(*sysDB).pool.BeginTx(c, TxOptions{})
+		tx, err := c.systemDB.concrete().pool.BeginTx(c, TxOptions{})
 		if err != nil {
 			return fmt.Errorf("failed to begin transaction: %w", err)
 		}
