@@ -2714,6 +2714,7 @@ type recvInput struct {
 	suspendThreshold time.Duration // when > 0 and no message arrives within it, return a suspension sentinel instead of waiting in-process
 	stepID           *int          // pre-assigned step IDs, for re-entry after a failed suspension
 	sleepStepID      *int
+	gate             *gateSpec // when set, this recv IS a gate: open before waiting, close on completion
 }
 
 // recvResult carries the received message along with its serialization format from the notifications table.
@@ -2722,6 +2723,7 @@ type recvInput struct {
 type recvResult struct {
 	message       *string
 	serialization string
+	deliveryID    string // gate recv: audit row of the consumed delivery
 	suspend       bool
 	delayUntil    time.Time // durable timeout deadline (set when suspend is)
 	stepID        int       // step IDs used, so a re-entry can reuse them
@@ -5818,7 +5820,7 @@ func (c *dbosContext) SetLatestApplicationVersion(_ DBOSContext, versionName str
 		return errors.New("version_name is required")
 	}
 	return retry(c, func() error {
-		return c.systemDB.updateApplicationVersionTimestamp(c, versionName, time.Now().UnixMilli())
+		return c.systemDB.promoteApplicationVersion(c, versionName, time.Now().UnixMilli())
 	}, withRetrierLogger(c.logger))
 }
 

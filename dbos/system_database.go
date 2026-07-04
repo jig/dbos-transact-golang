@@ -70,6 +70,9 @@ type systemDatabase interface {
 	// Communication (special steps)
 	send(ctx context.Context, input WorkflowSendInput) error
 	recv(ctx context.Context, input recvInput) (*recvResult, error)
+	promoteApplicationVersion(ctx context.Context, versionName string, nowMs int64) error
+	deliverToGate(ctx context.Context, in DeliverInput, encodedPayload *string, serialization string) (GateOutcome, string, error)
+	ignoreDelivery(ctx context.Context, deliveryID string) error
 	setEvent(ctx context.Context, input WorkflowSetEventInput) error
 	getEvent(ctx context.Context, input getEventInput) (*getEventResult, error)
 
@@ -3335,6 +3338,7 @@ type WorkflowSendInput struct {
 	Topic         string
 	tx            Tx
 	serialization string
+	messageUUID   *string // pre-assigned notification ID (gate deliveries correlate audit rows to it)
 }
 
 // Send is a special type of step that sends a message to another workflow.
@@ -3368,6 +3372,9 @@ func (s *sysDB) send(ctx context.Context, input WorkflowSendInput) error {
 
 	insertQuery := s.renderSQL(`INSERT INTO %snotifications (destination_uuid, topic, message, serialization, message_uuid, created_at_epoch_ms) VALUES ($1, $2, $3, $4, $5, $6)`, s.dialect.SchemaPrefix(s.schema))
 	messageUUID := uuid.NewString()
+	if input.messageUUID != nil {
+		messageUUID = *input.messageUUID
+	}
 	createdAtMs := time.Now().UnixMilli()
 	if _, err := runner.Exec(ctx, insertQuery, input.DestinationID, topic, input.Message, input.serialization, messageUUID, createdAtMs); err != nil {
 		s.logger.Error("failed to insert notification", "error", err, "query", insertQuery, "destination_id", input.DestinationID, "topic", topic, "message", input.Message)
@@ -3447,6 +3454,16 @@ func (s *sysDB) recv(ctx context.Context, input recvInput) (*recvResult, error) 
 			recvErr = errorFromRecorded(*recordedResult.errStr)
 		}
 		return &recvResult{message: recordedResult.output, serialization: recordedResult.serialization}, recvErr
+	}
+
+	// A gate recv opens (or re-opens) its gate before waiting. Idempotent
+	// upsert: a crash between this and the first checkpoint re-runs it. On
+	// replay the memoized branch above returns first, so a finished gate is
+	// never re-opened.
+	if input.gate != nil {
+		if err := s.openGate(ctx, destinationID, stepID, *input.gate); err != nil {
+			return nil, fmt.Errorf("failed to open gate: %w", err)
+		}
 	}
 
 	// First check if there's already a receiver for this workflow/topic to avoid unnecessary database load
@@ -3562,11 +3579,12 @@ loop:
     UPDATE %snotifications
     SET consumed = true
     WHERE message_uuid = (SELECT message_uuid FROM oldest_entry)
-    RETURNING message, serialization`, s.dialect.SchemaPrefix(s.schema), s.dialect.SchemaPrefix(s.schema))
+    RETURNING message_uuid, message, serialization`, s.dialect.SchemaPrefix(s.schema), s.dialect.SchemaPrefix(s.schema))
 
+	var consumedMessageUUID *string
 	var messageString *string
 	var msgSerialization *string
-	err = tx.QueryRow(ctx, query, destinationID, topic).Scan(&messageString, &msgSerialization)
+	err = tx.QueryRow(ctx, query, destinationID, topic).Scan(&consumedMessageUUID, &messageString, &msgSerialization)
 	if err != nil {
 		if err != pgx.ErrNoRows {
 			return nil, fmt.Errorf("failed to consume message: %w", err)
@@ -3605,12 +3623,23 @@ loop:
 		return nil, err
 	}
 
+	// A gate recv closes its gate in the SAME transaction as the recv
+	// checkpoint (message consumed or timeout): the gate state can never
+	// disagree with the recorded history.
+	var deliveryID string
+	if input.gate != nil {
+		deliveryID, err = s.closeGate(ctx, tx, destinationID, input.gate.Name, consumedMessageUUID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to close gate: %w", err)
+		}
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
 	// Return the message and its serialization format
-	return &recvResult{message: messageString, serialization: serialization}, timeoutErr
+	return &recvResult{message: messageString, serialization: serialization, deliveryID: deliveryID}, timeoutErr
 }
 
 type WorkflowSetEventInput struct {
@@ -5440,6 +5469,29 @@ func (s *sysDB) updateApplicationVersionTimestamp(ctx context.Context, versionNa
 	`, s.dialect.SchemaPrefix(s.schema))
 	if _, err := s.pool.Exec(ctx, query, newTimestamp, versionName); err != nil {
 		return fmt.Errorf("failed to update application version timestamp: %w", err)
+	}
+	return nil
+}
+
+// promoteApplicationVersion makes versionName the latest. A promotion must
+// WIN: getLatest orders by version_timestamp with millisecond resolution, so
+// a bare now() ties with (and can lose to) a version registered in the same
+// millisecond. Clamp to strictly greater than every other version's
+// timestamp.
+func (s *sysDB) promoteApplicationVersion(ctx context.Context, versionName string, nowMs int64) error {
+	query := s.renderSQL(`
+		UPDATE %sapplication_versions
+		SET version_timestamp = (
+			SELECT MAX(ts) FROM (
+				SELECT $1 AS ts
+				UNION ALL
+				SELECT COALESCE(MAX(version_timestamp), 0) + 1 FROM %sapplication_versions WHERE version_name <> $2
+			) candidates
+		)
+		WHERE version_name = $2
+	`, s.dialect.SchemaPrefix(s.schema), s.dialect.SchemaPrefix(s.schema))
+	if _, err := s.pool.Exec(ctx, query, nowMs, versionName); err != nil {
+		return fmt.Errorf("failed to promote application version: %w", err)
 	}
 	return nil
 }

@@ -166,6 +166,9 @@ type DBOSContext interface {
 	Select(_ DBOSContext, channels []<-chan StepOutcome[any]) (any, error)                                      // Performs a durable select over a slice of channels, checkpointing the selected channel and value
 	Send(_ DBOSContext, destinationID string, message any, topic string, opts ...SendOption) error              // Send a message to another workflow
 	Recv(_ DBOSContext, topic string, timeout time.Duration) (any, error)                                       // Receive a message sent to this workflow
+	GateRecv(_ DBOSContext, in GateRecvInput) (any, string, error)                                              // Gate-aware Recv: opens the gate, waits, closes transactionally
+	DeliverToGate(_ DBOSContext, in DeliverInput) (GateOutcome, string, error)                                  // Conditional atomic delivery to an open gate
+	IgnoreDelivery(_ DBOSContext, deliveryID string) error                                                      // Mark a delivered audit row ignored (workflow policy)
 	SetEvent(_ DBOSContext, key string, message any, opts ...SetEventOption) error                              // Set a key-value event for this workflow
 	GetEvent(_ DBOSContext, targetWorkflowID string, key string, timeout time.Duration) (any, error)            // Get a key-value event from a target workflow
 	WriteStream(_ DBOSContext, key string, value any, opts ...WriteStreamOption) error                          // Write a value to a durable stream

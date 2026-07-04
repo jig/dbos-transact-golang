@@ -148,7 +148,22 @@ database with fault-injecting facades (embedding the interface inherits
 | `concrete()` seam | `system_database.go` (interface + impl), assertion sites in `workflow.go`, `client.go`, `dbos.go` | Mechanical | behaviour unchanged for the real `*sysDB` |
 | Tests | `retry_step_ids_test.go` (new) | Additive | facade asserts every attempt carries the same pre-assigned IDs |
 
-## 7. Upstream changes deliberately NOT taken
+## 7. Gates as a runtime primitive (fluxos8 ADR 0012)
+
+Design: `notes/GATES-DESIGN.md`. A gate is a recv with authoritative,
+transactional state: `GateRecv` opens it (idempotent upsert before waiting),
+closes it in the same transaction as the recv checkpoint; `DeliverToGate`
+verifies open+audience and records an audited outcome atomically, signalling
+only when delivered; `IgnoreDelivery` is the D6 policy mark.
+
+| Area | Files | Type | Notes |
+|---|---|---|---|
+| Migration 39 (3 tables) | `migrations/39_create_workflow_gates.sql` (+ sqlite) | Additive | symbolic audiences; delivery audit with outcomes |
+| Runtime API + sysDB ops | `gates.go` (new), `recvInput.gate` hook in `workflow.go`/`system_database.go` | Additive + small hot-rewrite (recv close joins its checkpoint tx; send accepts a pre-assigned message_uuid) | recv step name/shape unchanged → replay-compatible |
+| Interface | `DBOSContext` + `systemDatabase` gain the 3 ops | Additive | |
+| Tests | `gates_test.go` (new) | Additive | lifecycle, rejects, ignore, timeout-close |
+
+## 8. Upstream changes deliberately NOT taken
 
 | Upstream | Why skipped |
 |---|---|
@@ -161,7 +176,7 @@ upstream 38/39/40) is the single nastiest re-application detail. On a fresh fork
 renumber the fork-specific migrations above the upstream range (e.g. 1000+) to
 end the collision permanently — drop & recreate makes this free.
 
-## 8. Infra / docs
+## 9. Infra / docs
 
 | Files | Type | Notes |
 |---|---|---|
