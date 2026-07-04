@@ -162,6 +162,7 @@ only when delivered; `IgnoreDelivery` is the D6 policy mark.
 | Runtime API + sysDB ops | `gates.go` (new), `recvInput.gate` hook in `workflow.go`/`system_database.go` | Additive + small hot-rewrite (recv close joins its checkpoint tx; send accepts a pre-assigned message_uuid) | recv step name/shape unchanged → replay-compatible |
 | Interface | `DBOSContext` + `systemDatabase` gain the 3 ops | Additive | |
 | Tests | `gates_test.go` (new) | Additive | lifecycle, rejects, ignore, timeout-close |
+| Read audience + inbox (fluxos8 ADR 0013 / 0012 D5) | `migrations/40_create_workflow_read_audience.sql` (+ sqlite), `readaudience.go` (AddReadAudience, ReadAllowed = read ∪ gate rows, ListOpenGatesFor/ListDeliveriesBy/ListInitiatedBy), interface additions | Additive | 'initiator' principal type doubles as the my-workflows index |
 
 ## 8. Upstream changes deliberately NOT taken
 

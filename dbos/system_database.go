@@ -73,6 +73,11 @@ type systemDatabase interface {
 	promoteApplicationVersion(ctx context.Context, versionName string, nowMs int64) error
 	deliverToGate(ctx context.Context, in DeliverInput, encodedPayload *string, serialization string) (GateOutcome, string, error)
 	ignoreDelivery(ctx context.Context, deliveryID string) error
+	addReadAudience(ctx context.Context, workflowID, org string, principals []GatePrincipal) error
+	readAllowed(ctx context.Context, workflowID, org, subject string, groups []string) (bool, error)
+	listOpenGatesFor(ctx context.Context, org, subject string, groups []string, limit int) ([]OpenGateRow, error)
+	listDeliveriesBy(ctx context.Context, org, subject string, limit int) ([]DeliveryRow, error)
+	listInitiatedBy(ctx context.Context, org, subject string, limit int) ([]string, error)
 	setEvent(ctx context.Context, input WorkflowSetEventInput) error
 	getEvent(ctx context.Context, input getEventInput) (*getEventResult, error)
 
@@ -340,6 +345,9 @@ var migration38SQL string
 //go:embed migrations/39_create_workflow_gates.sql
 var migration39SQL string
 
+//go:embed migrations/40_create_workflow_read_audience.sql
+var migration40SQL string
+
 type migrationFile struct {
 	version int64
 	sql     string
@@ -446,6 +454,7 @@ func buildMigrations(schema string, isCockroach bool) []migrationFile {
 		{version: 37, sql: fmt.Sprintf(migration37SQL, c, sanitizedSchema), online: !isCockroach},
 		{version: 38, sql: fmt.Sprintf(migration38SQL, sanitizedSchema, sanitizedSchema)},
 		{version: 39, sql: fmt.Sprintf(migration39SQL, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema)},
+		{version: 40, sql: fmt.Sprintf(migration40SQL, sanitizedSchema, sanitizedSchema, sanitizedSchema)},
 	}
 }
 
