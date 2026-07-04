@@ -430,7 +430,11 @@ func TestAdminServer(t *testing.T) {
 		require.NoError(t, err, "Failed to get first workflow result")
 		assert.Equal(t, "result-workflow1", result1)
 
-		// Record time between workflows
+		// Record time between workflows. CreatedAt has millisecond resolution,
+		// so put a real gap on BOTH sides of the boundary: without the leading
+		// sleep, workflow1's CreatedAt can land in the same millisecond as
+		// timeBetween and the strict before/after assertions flake.
+		time.Sleep(5 * time.Millisecond)
 		timeBetween := time.Now()
 		time.Sleep(500 * time.Millisecond)
 

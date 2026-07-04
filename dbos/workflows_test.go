@@ -4072,15 +4072,29 @@ func TestWorkflowTimeout(t *testing.T) {
 		res, err := RunAsStep(stepCtx, func(context context.Context) (string, error) {
 			return detachedStep(context, timeout*2)
 		})
-		require.NoError(t, err, "failed to run detached step")
-		assert.Equal(t, "detached-step-completed", res, "expected detached step result to be 'detached-step-completed'")
+		// Surface failures as workflow errors, never require/FailNow here: this
+		// closure runs on the workflow outcome goroutine, and FailNow's Goexit
+		// would skip the outcome-channel send — hanging the caller's GetResult
+		// (and the suite) instead of failing the test.
+		if err != nil {
+			return "", fmt.Errorf("detached step: %w", err)
+		}
+		if res != "detached-step-completed" {
+			return "", fmt.Errorf("unexpected detached step result %q", res)
+		}
 		return res, ctx.Err()
 	}
 	RegisterWorkflow(dbosCtx, detachedStepWorkflow)
 
 	t.Run("DetachedStepWorkflow", func(t *testing.T) {
-		// Start a workflow that runs a step that is not cancelable
-		cancelCtx, cancelFunc := WithTimeout(dbosCtx, 1*time.Millisecond)
+		// Start a workflow that runs a step that is not cancelable. The timeout
+		// must be short enough to fire while the (2×input) step is running, but
+		// long enough that the step has reliably STARTED first: if the durable
+		// deadline cancels the workflow in the database before the step passes
+		// checkOperationExecution, the step is refused with "workflow was
+		// cancelled" and the detached-step contract under test never comes into
+		// play (with 1ms it was a coin flip under load).
+		cancelCtx, cancelFunc := WithTimeout(dbosCtx, 200*time.Millisecond)
 		defer cancelFunc() // Ensure we clean up the context
 
 		handle, err := RunWorkflow(cancelCtx, detachedStepWorkflow, 1*time.Second)
@@ -7258,6 +7272,42 @@ func TestWorkflowLeftPendingOnShutdown(t *testing.T) {
 	st, err = h.GetStatus()
 	require.NoError(t, err)
 	require.Equal(t, WorkflowStatusSuccess, st.Status)
+}
+
+// TestUserCancellationFinalizesWorkflow pins the boundary of the
+// leave-PENDING-on-shutdown behaviour: only an engine Shutdown (matched by its
+// cancellation cause) leaves an interrupted workflow PENDING for recovery. A
+// caller cancelling its own context finalises the workflow (ERROR), exactly as
+// upstream does — it must NOT be left PENDING, or the next launch would
+// silently re-execute a workflow its caller had abandoned.
+func TestUserCancellationFinalizesWorkflow(t *testing.T) {
+	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true})
+
+	started := make(chan struct{}, 1)
+	blockingWorkflow := func(ctx DBOSContext, _ string) (string, error) {
+		started <- struct{}{}
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
+	RegisterWorkflow(dbosCtx, blockingWorkflow)
+	require.NoError(t, Launch(dbosCtx))
+
+	cancelCtx, cancelFunc := WithCancelCause(dbosCtx)
+	defer cancelFunc(nil)
+
+	h, err := RunWorkflow(cancelCtx, blockingWorkflow, "", WithWorkflowID("user-cancelled-wf"))
+	require.NoError(t, err)
+	<-started
+	cancelFunc(nil)
+
+	_, err = h.GetResult()
+	require.Error(t, err, "expected the cancellation error from the workflow")
+	require.True(t, errors.Is(err, context.Canceled), "expected context.Canceled, got: %v", err)
+
+	st, err := h.GetStatus()
+	require.NoError(t, err)
+	require.Equal(t, WorkflowStatusError, st.Status,
+		"a user-cancelled workflow must be finalised, not left PENDING for recovery")
 }
 
 // TestGracefulRebootDoesNotExhaustRecoveryAttempts proves that repeatedly

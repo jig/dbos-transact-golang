@@ -1638,8 +1638,12 @@ func (c *dbosContext) RunWorkflow(_ DBOSContext, fn WorkflowFunc, input any, opt
 			// PENDING so the next executor recovers it, mirroring the suspension
 			// path above. Without this, a long-lived wait (Recv/timeout) would be
 			// finalised ERROR on every restart. Explicit cancel and durable
-			// deadlines register a stopFunc, so they are excluded.
-			if err != nil && stopFunc == nil && workflowCtx.Err() != nil {
+			// deadlines register a stopFunc, so they are excluded; a caller
+			// cancelling its own context (WithCancelCause and friends) is
+			// excluded by the cause check — only Shutdown's sentinel cause
+			// leaves the workflow PENDING, anything else finalises it below.
+			if err != nil && stopFunc == nil && workflowCtx.Err() != nil &&
+				errors.Is(context.Cause(workflowCtx), errShutdownInitiated) {
 				// Reset recovery_attempts so repeated clean restarts do not count
 				// toward the DLQ budget (a reboot is not a failed attempt), mirroring
 				// the reset on suspension. A crash skips this path, so its counter

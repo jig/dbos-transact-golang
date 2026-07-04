@@ -99,11 +99,19 @@ A workflow interrupted by a clean engine shutdown is left `PENDING` (not finaliz
 deploys don't dead-letter it. A real crash takes neither path, so crash-loop
 protection is preserved.
 
+The branch matches the shutdown by its cancellation **cause**: `Shutdown` cancels
+the root context with the `errShutdownInitiated` sentinel, and only that cause
+leaves the workflow `PENDING`. A caller cancelling its own context
+(`WithCancelCause` etc.) finalises the workflow (`ERROR`), as upstream does —
+the original condition could not tell the two apart and left user-cancelled
+workflows `PENDING`, to be silently re-executed on the next launch (surfaced as
+`TestSelect` flakiness).
+
 | Area | Files | Type | Notes |
 |---|---|---|---|
-| Leave-PENDING + reset | `workflow.go` (`RunWorkflow` shutdown branch) | **Hot-rewrite** | |
+| Leave-PENDING + reset | `workflow.go` (`RunWorkflow` shutdown branch) | **Hot-rewrite** | gated on `context.Cause(...) == errShutdownInitiated` (`dbos.go`) |
 | Reset helper | `system_database.go` (`resetWorkflowRecoveryAttempts`) | Additive | reached via `systemDatabase.concrete()` (see §6) |
-| Tests | `workflows_test.go` (`TestWorkflowLeftPendingOnShutdown`, `TestGracefulRebootDoesNotExhaustRecoveryAttempts`) | Additive | |
+| Tests | `workflows_test.go` (`TestWorkflowLeftPendingOnShutdown`, `TestGracefulRebootDoesNotExhaustRecoveryAttempts`, `TestUserCancellationFinalizesWorkflow`) | Additive | |
 
 Re-apply notes: the principled long-term fix (lease/heartbeat liveness instead of
 a dispatch counter) is deferred.
