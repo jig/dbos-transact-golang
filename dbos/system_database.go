@@ -334,6 +334,9 @@ var migration37SQL string
 //go:embed migrations/38_create_workflow_waiters.sql
 var migration38SQL string
 
+//go:embed migrations/39_create_workflow_gates.sql
+var migration39SQL string
+
 type migrationFile struct {
 	version int64
 	sql     string
@@ -439,6 +442,7 @@ func buildMigrations(schema string, isCockroach bool) []migrationFile {
 		{version: 36, sql: fmt.Sprintf(migration36SQL, sanitizedSchema, sanitizedSchema)},
 		{version: 37, sql: fmt.Sprintf(migration37SQL, c, sanitizedSchema), online: !isCockroach},
 		{version: 38, sql: fmt.Sprintf(migration38SQL, sanitizedSchema, sanitizedSchema)},
+		{version: 39, sql: fmt.Sprintf(migration39SQL, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema)},
 	}
 }
 
