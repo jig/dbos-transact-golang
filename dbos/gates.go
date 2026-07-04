@@ -23,9 +23,10 @@ import (
 
 // Gate principal types stored in workflow_gate_audience.
 const (
-	GatePrincipalUser  = "user"
-	GatePrincipalGroup = "group"
-	GatePrincipalAll   = "all"
+	GatePrincipalUser   = "user"
+	GatePrincipalGroup  = "group"
+	GatePrincipalAll    = "all"
+	GatePrincipalExcept = "except" // categorical exclusion (e.g. the initiator); data, not policy (ADR 0012 D6)
 )
 
 // GatePrincipal is one symbolic audience row.
@@ -247,6 +248,14 @@ func (s *sysDB) openGate(ctx context.Context, workflowID string, recvStepID int,
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback(ctx)
+	if g.Org == "" {
+		// Default the gate's organisation to the workflow's tenant, so the
+		// author-facing API needs no explicit org plumbing.
+		q := s.renderSQL(`SELECT COALESCE(authenticated_user, '') FROM %sworkflow_status WHERE workflow_uuid = $1`, s.dialect.SchemaPrefix(s.schema))
+		if err := tx.QueryRow(ctx, q, workflowID).Scan(&g.Org); err != nil {
+			return fmt.Errorf("failed to resolve gate org: %w", err)
+		}
+	}
 	now := time.Now().UnixMilli()
 	var expires *int64
 	if !g.ExpiresAt.IsZero() {
@@ -388,7 +397,11 @@ func (s *sysDB) audienceMatches(ctx context.Context, tx Tx, in DeliverInput) (bo
 			principal_type = $3
 			OR (principal_type = $4 AND principal = $5)
 			OR (principal_type = $6 AND `+groupClause+`)
-		))`, s.dialect.SchemaPrefix(s.schema))
+		))
+		AND NOT EXISTS (SELECT 1 FROM %sworkflow_gate_audience
+		WHERE workflow_uuid = $1 AND gate = $2
+			AND principal_type = '`+GatePrincipalExcept+`' AND principal = $5)`,
+		s.dialect.SchemaPrefix(s.schema), s.dialect.SchemaPrefix(s.schema))
 	var match bool
 	if err := tx.QueryRow(ctx, q, args...).Scan(&match); err != nil {
 		return false, fmt.Errorf("failed to match gate audience: %w", err)
