@@ -372,6 +372,13 @@ const (
 	_DB_CONNECTION_RETRY_FACTOR     = 2
 	_DB_CONNECTION_MAX_DELAY        = 120 * time.Second
 	_DB_RETRY_INTERVAL              = 1 * time.Second
+
+	// _NOTIFICATION_POLL_INTERVAL is how often the notification poller checks for
+	// new messages/events. In the plain-SQL fork notifications are always delivered
+	// by polling (no LISTEN/NOTIFY), so this bounds the wake-up latency for
+	// in-process Recv/GetEvent waits. Kept low so short-timeout waits (e.g. gate
+	// commands) don't race the poll interval. See notes/DIVERGENCES.md §2.
+	_NOTIFICATION_POLL_INTERVAL = 100 * time.Millisecond
 )
 
 // returns the CONCURRENTLY keyword for online index DDL.
@@ -3314,7 +3321,7 @@ func (s *sysDB) notificationPollerLoop(ctx context.Context) {
 
 	s.logger.Debug("DBOS: Starting notification poller loop")
 
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(_NOTIFICATION_POLL_INTERVAL)
 	defer ticker.Stop()
 
 	for {
