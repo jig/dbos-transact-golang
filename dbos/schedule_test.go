@@ -27,13 +27,13 @@ func TestScheduleCRUD(t *testing.T) {
 
 	c := dbosCtx.(*dbosContext)
 
-	const workflowFQN = "github.com/dbos-inc/dbos-transact-golang/dbos.testWorkflowForSchedule"
+	const workflowFQN = "github.com/jig/dbos-transact-golang/dbos.testWorkflowForSchedule"
 
 	t.Run("CreateDelete", func(t *testing.T) {
 		scheduledInputCapture = sync.Map{}
 		const name = "create-delete-schedule"
 		const ctxValue = "test-context"
-		capturingFQN := "github.com/dbos-inc/dbos-transact-golang/dbos.testCapturingScheduledWorkflow"
+		capturingFQN := "github.com/jig/dbos-transact-golang/dbos.testCapturingScheduledWorkflow"
 		err := CreateSchedule(dbosCtx, testCapturingScheduledWorkflow, CreateScheduleRequest{
 			ScheduleName: name,
 			Schedule:     "*/1 * * * * *",
@@ -641,7 +641,7 @@ func TestAutomaticBackfillOnRestart(t *testing.T) {
 	require.NoError(t, dbosCtx.Launch())
 
 	const scheduleName = "test-backfill-restart"
-	const wfFQN = "github.com/dbos-inc/dbos-transact-golang/dbos.testWorkflowForBackfillRestart"
+	const wfFQN = "github.com/jig/dbos-transact-golang/dbos.testWorkflowForBackfillRestart"
 
 	err := CreateSchedule(dbosCtx, testWorkflowForBackfillRestart, CreateScheduleRequest{
 		ScheduleName: scheduleName,

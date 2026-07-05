@@ -1,11 +1,11 @@
 <div align="center">
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/dbos-inc/dbos-transact-golang.svg)](https://pkg.go.dev/github.com/dbos-inc/dbos-transact-golang)
-[![Go Report Card](https://goreportcard.com/badge/github.com/dbos-inc/dbos-transact-golang)](https://goreportcard.com/report/github.com/dbos-inc/dbos-transact-golang)
-[![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/dbos-inc/dbos-transact-golang?sort=semver)](https://github.com/dbos-inc/dbos-transact-golang/releases)
+[![Go Reference](https://pkg.go.dev/badge/github.com/jig/dbos-transact-golang.svg)](https://pkg.go.dev/github.com/jig/dbos-transact-golang)
+[![Go Report Card](https://goreportcard.com/badge/github.com/jig/dbos-transact-golang)](https://goreportcard.com/report/github.com/jig/dbos-transact-golang)
+[![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/dbos-inc/dbos-transact-golang?sort=semver)](https://github.com/jig/dbos-transact-golang/releases)
 [![Join Discord](https://img.shields.io/badge/Discord-Join%20Chat-5865F2?logo=discord&logoColor=white)](https://discord.com/invite/jsmC6pXGgX)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![GitHub Stars](https://img.shields.io/github/stars/dbos-inc/dbos-transact-golang?style=social)](https://github.com/dbos-inc/dbos-transact-golang)
+[![GitHub Stars](https://img.shields.io/github/stars/dbos-inc/dbos-transact-golang?style=social)](https://github.com/jig/dbos-transact-golang)
 
 
 # DBOS Transact: Lightweight Durable Workflow Orchestration with Postgres
@@ -47,7 +47,7 @@ import (
     "os"
     "time"
 
-    "github.com/dbos-inc/dbos-transact-golang/dbos"
+    "github.com/jig/dbos-transact-golang/dbos"
 )
 
 func workflow(dbosCtx dbos.DBOSContext, _ string) (string, error) {
@@ -133,7 +133,7 @@ import (
     "os"
     "time"
 
-    "github.com/dbos-inc/dbos-transact-golang/dbos"
+    "github.com/jig/dbos-transact-golang/dbos"
 )
 
 func task(ctx dbos.DBOSContext, i int) (int, error) {
@@ -322,5 +322,5 @@ By contrast, Celery/BullMQ are Redis-backed and don't provide workflows, so they
 </details>
 
 ## ⭐️ Like this project?
-[Star it on GitHub](https://github.com/dbos-inc/dbos-transact-golang)
-[![GitHub Stars](https://img.shields.io/github/stars/dbos-inc/dbos-transact-golang?style=social)](https://github.com/dbos-inc/dbos-transact-golang)
+[Star it on GitHub](https://github.com/jig/dbos-transact-golang)
+[![GitHub Stars](https://img.shields.io/github/stars/dbos-inc/dbos-transact-golang?style=social)](https://github.com/jig/dbos-transact-golang)

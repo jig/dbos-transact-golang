@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dbos-inc/dbos-transact-golang/integration/mocks"
+	"github.com/jig/dbos-transact-golang/integration/mocks"
 
-	"github.com/dbos-inc/dbos-transact-golang/dbos"
+	"github.com/jig/dbos-transact-golang/dbos"
 	"github.com/stretchr/testify/mock"
 	"go.uber.org/goleak"
 )

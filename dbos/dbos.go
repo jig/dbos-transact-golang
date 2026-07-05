@@ -899,12 +899,12 @@ func computeApplicationVersion() string {
 func getDBOSVersion() string {
 	if info, ok := debug.ReadBuildInfo(); ok {
 		for _, dep := range info.Deps {
-			if dep.Path == "github.com/dbos-inc/dbos-transact-golang" {
+			if dep.Path == "github.com/jig/dbos-transact-golang" {
 				return dep.Version
 			}
 		}
 		// If running as main module, return main module version
-		if info.Main.Path == "github.com/dbos-inc/dbos-transact-golang" {
+		if info.Main.Path == "github.com/jig/dbos-transact-golang" {
 			return info.Main.Version
 		}
 	}

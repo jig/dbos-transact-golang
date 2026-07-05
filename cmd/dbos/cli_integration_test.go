@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dbos-inc/dbos-transact-golang/dbos"
+	"github.com/jig/dbos-transact-golang/dbos"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -326,7 +326,7 @@ func testProjectInitialization(t *testing.T, cliPath string) {
 
 	// Use go mod edit to replace the dependency with the local path
 	replaceCmd := exec.Command("go", "mod", "edit", "-replace",
-		fmt.Sprintf("github.com/dbos-inc/dbos-transact-golang=%s", repoRoot))
+		fmt.Sprintf("github.com/jig/dbos-transact-golang=%s", repoRoot))
 	replaceOutput, err := replaceCmd.CombinedOutput()
 	require.NoError(t, err, "go mod edit -replace failed: %s", string(replaceOutput))
 

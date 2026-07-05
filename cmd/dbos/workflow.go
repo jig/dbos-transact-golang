@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/dbos-inc/dbos-transact-golang/dbos"
+	"github.com/jig/dbos-transact-golang/dbos"
 	"github.com/spf13/cobra"
 )
 

@@ -2104,7 +2104,7 @@ func TestClientSchedules(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { c.Shutdown(30 * time.Second) })
 
-	const workflowFQN = "github.com/dbos-inc/dbos-transact-golang/dbos.testWorkflowForSchedule"
+	const workflowFQN = "github.com/jig/dbos-transact-golang/dbos.testWorkflowForSchedule"
 
 	t.Run("CreateGetListPauseResumeDelete", func(t *testing.T) {
 		const name = "client-schedule-lifecycle"

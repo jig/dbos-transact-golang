@@ -1,4 +1,4 @@
-module github.com/dbos-inc/dbos-transact-golang
+module github.com/jig/dbos-transact-golang
 
 go 1.25.0
 
