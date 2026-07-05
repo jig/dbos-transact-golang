@@ -79,6 +79,13 @@ hard removal or as a config flag — the interim `DisablePLpgSQL` flag was tried
 
 ## 3. Transactional steps (`RunAsTransaction`)
 
+> **RE-FORK STATUS (2026-07): SUPERSEDED — adopted upstream `datasources` (#358).**
+> The base already ships upstream's `NewDataSource` + `RunAsTransaction(ctx, ds,
+> fn)` API (durability in a `transaction_completion` table). This fork's own
+> transactional-steps files below (`application_database.go`, `transaction.go`,
+> `ApplicationSQLDB`) were **NOT** re-applied; consumers use the upstream API.
+> The section is kept for history. fluxos8 migrates to the upstream API.
+
 User SQL + the DBOS checkpoint commit in one transaction, recorded in a
 `transaction_outputs` table that can live in a separate application database.
 
@@ -123,6 +130,13 @@ Re-apply notes: the principled long-term fix (lease/heartbeat liveness instead o
 a dispatch counter) is deferred.
 
 ## 5. DBOSError code preservation across replay
+
+> **RE-FORK STATUS (2026-07): SUPERSEDED — upstream now preserves it natively.**
+> The base gob-encodes Go↔Go errors, preserving the concrete `*DBOSError` type
+> (and its `Code`) across replay, with upstream's own
+> `TestGoToGoErrorTypePreservation`. The fork's string-parsing approach
+> (`errorFromRecorded`, "DBOS Error <code>: …") was **NOT** re-applied. Section
+> kept for history.
 
 A recorded step/workflow error is rebuilt as a `*DBOSError` with its original
 `Code` on replay, so `errors.As`/code checks behave identically after recovery.
