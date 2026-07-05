@@ -1644,6 +1644,29 @@ func (c *dbosContext) RunWorkflow(_ DBOSContext, fn WorkflowFunc, input any, opt
 			close(outcomeChan)
 			return
 		} else {
+			// Fork §4: a workflow interrupted by engine shutdown is left PENDING so
+			// the next executor recovers it (mirroring the suspension path above).
+			// Explicit cancel and durable deadlines register a stopFunc, and a caller
+			// cancelling its own context is excluded by the cause check — only
+			// Shutdown's sentinel cause leaves the workflow PENDING; anything else
+			// finalises it below.
+			if err != nil && stopFunc == nil && workflowCtx.Err() != nil &&
+				errors.Is(context.Cause(workflowCtx), errShutdownInitiated) {
+				// Reset recovery_attempts so repeated clean restarts do not count
+				// toward the DLQ budget (a reboot is not a failed attempt), mirroring
+				// the reset on suspension. A crash skips this path, so its counter
+				// keeps accumulating and crash-loop protection is preserved.
+				if sdb := c.systemDB.concrete(); sdb != nil {
+					if resetErr := sdb.resetWorkflowRecoveryAttempts(uncancellableCtx, workflowID); resetErr != nil {
+						c.logger.Warn("Failed to reset recovery attempts on shutdown", "workflow_id", workflowID, "error", resetErr)
+					}
+				}
+				c.logger.Info("Workflow interrupted by shutdown; left pending for recovery", "workflow_id", workflowID)
+				outcomeChan <- workflowOutcome[any]{result: nil, err: err}
+				close(outcomeChan)
+				return
+			}
+
 			status := WorkflowStatusSuccess
 
 			// If an error occurred, set the status to error

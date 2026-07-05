@@ -787,11 +787,18 @@ func (c *dbosContext) Launch() error {
 // a warning is logged and the shutdown continues to the next component.
 //
 // Shutdown is a permanent operation and should be called when the application is terminating.
+//
+// errShutdownInitiated is the cancellation cause Shutdown sets on the root
+// context. RunWorkflow's leave-PENDING branch (fork §4) matches it via
+// context.Cause to distinguish an engine shutdown from a user-initiated context
+// cancellation, which must finalise the workflow instead.
+var errShutdownInitiated = errors.New("DBOS cancellation initiated")
+
 func (c *dbosContext) Shutdown(timeout time.Duration) {
 	c.logger.Debug("Shutting down DBOS context")
 
 	// Cancel the context to signal all resources to stop
-	c.ctxCancelFunc(errors.New("DBOS cancellation initiated"))
+	c.ctxCancelFunc(errShutdownInitiated)
 
 	// Stop workflow producers before draining in-flight workflows. Producers
 	// (.e.g, queue runner) call RunWorkflow, which calls workflowsWg.Add(1);
