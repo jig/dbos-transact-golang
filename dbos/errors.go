@@ -1,6 +1,29 @@
 package dbos
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+)
+
+// errorFromRecorded reconstructs a *DBOSError (preserving its Code) from a
+// recorded step error string of the form "DBOS Error <code>: <message>", so that
+// a memoized Recv/GetEvent/Sleep error replays with the same type and code the
+// first execution saw (e.g. a TimeoutError the workflow branches on). Anything
+// else is returned as a plain error. Fork §5: step-level error paths record the
+// error as a plain string, so upstream's gob type-preservation does not cover
+// them; this restores it. See notes/DIVERGENCES.md §5.
+func errorFromRecorded(s string) error {
+	if rest, ok := strings.CutPrefix(s, "DBOS Error "); ok {
+		if i := strings.Index(rest, ": "); i > 0 {
+			if code, err := strconv.Atoi(rest[:i]); err == nil {
+				return &DBOSError{Code: DBOSErrorCode(code), Message: rest[i+2:]}
+			}
+		}
+	}
+	return errors.New(s)
+}
 
 // DBOSErrorCode represents the different types of errors that can occur in DBOS operations.
 type DBOSErrorCode int
