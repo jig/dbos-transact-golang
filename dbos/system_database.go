@@ -2183,6 +2183,20 @@ func (s *sysDB) forkWorkflow(ctx context.Context, input forkWorkflowDBInput) (st
 		return "", fmt.Errorf("failed to mark original workflow as forked: %w", err)
 	}
 
+	// The fork inherits the original's read audience (fluxos8 ADR 0013): a
+	// migrated instance must stay visible to exactly the principals that
+	// could see the original. Gate rows and delivery audit are NOT copied -
+	// gates re-open when the fork re-executes, and deliveries belong to the
+	// original's audit trail.
+	copyReadAudienceQuery := s.renderSQL(`INSERT INTO %sworkflow_read_audience
+		(workflow_uuid, principal_type, principal, org)
+		SELECT $1, principal_type, principal, org
+		FROM %sworkflow_read_audience WHERE workflow_uuid = $2`,
+		s.dialect.SchemaPrefix(s.schema), s.dialect.SchemaPrefix(s.schema))
+	if _, err = tx.Exec(ctx, copyReadAudienceQuery, forkedWorkflowID, input.originalWorkflowID); err != nil {
+		return "", fmt.Errorf("failed to copy read audience: %w", err)
+	}
+
 	// If startStep > 0, copy the original workflow's outputs into the forked workflow
 	if input.startStep > 0 {
 		copyOutputsQuery := s.renderSQL(`INSERT INTO %soperation_outputs
