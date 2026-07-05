@@ -433,6 +433,7 @@ func (c *dbosContext) WithCancel() (DBOSContext, context.CancelFunc) {
 	newCtx, cancelFunc := context.WithCancel(c.ctx)
 	childCtx := &dbosContext{
 		ctx:                     newCtx,
+		config:                  c.config, // fork §1: config must propagate (Sleep/Recv/GetEvent read DurableSleepThreshold)
 		logger:                  c.logger,
 		systemDB:                c.systemDB,
 		workflowsWg:             c.workflowsWg,
@@ -464,6 +465,7 @@ func (c *dbosContext) WithCancelCause() (DBOSContext, context.CancelCauseFunc) {
 	newCtx, cancelCauseFunc := context.WithCancelCause(c.ctx)
 	childCtx := &dbosContext{
 		ctx:                     newCtx,
+		config:                  c.config, // fork §1: config must propagate (Sleep/Recv/GetEvent read DurableSleepThreshold)
 		logger:                  c.logger,
 		systemDB:                c.systemDB,
 		workflowsWg:             c.workflowsWg,
