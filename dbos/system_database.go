@@ -3426,6 +3426,23 @@ func (s *sysDB) send(ctx context.Context, input WorkflowSendInput) error {
 		}
 		return fmt.Errorf("failed to insert notification: %w", err)
 	}
+
+	// Durable suspension (fork §1): if the destination is suspended in a Recv
+	// (a self-waiter, status DELAYED), move its delay_until to now so the queue
+	// runner resumes it. Runs in the same transaction as the insert when provided.
+	var runner Querier = s.pool
+	if input.tx != nil {
+		runner = input.tx
+	}
+	wakeQuery := s.renderSQL(`UPDATE %sworkflow_status
+		SET delay_until_epoch_ms = $1, updated_at = $1
+		WHERE workflow_uuid = $2
+		  AND status = $3
+		  AND EXISTS (SELECT 1 FROM %sworkflow_waiters WHERE waiter_workflow_uuid = $2 AND awaited_workflow_uuid = $2)`,
+		s.dialect.SchemaPrefix(s.schema), s.dialect.SchemaPrefix(s.schema))
+	if _, err := runner.Exec(ctx, wakeQuery, time.Now().UnixMilli(), input.DestinationID, WorkflowStatusDelayed); err != nil {
+		return fmt.Errorf("failed to wake suspended receiver %s: %w", input.DestinationID, err)
+	}
 	return nil
 }
 
@@ -3505,6 +3522,11 @@ func (s *sysDB) recv(ctx context.Context, input recvInput) (*recvResult, error) 
 		cond.L.Unlock()
 	}
 
+	// Durable suspension (fork §1): when enabled and the remaining timeout exceeds
+	// the threshold, wait in-process only up to the threshold, then hand a
+	// suspension sentinel back to the caller. Armed once; repoll must not extend it.
+	var suspendChan <-chan time.Time
+
 loop:
 	for !exists {
 		timeout, err := s.sleep(ctx, sleepInput{
@@ -3516,6 +3538,10 @@ loop:
 		if err != nil {
 			return nil, fmt.Errorf("failed to sleep before recv timeout: %w", err)
 		}
+		deadline := time.Now().Add(timeout)
+		if suspendChan == nil && input.suspendThreshold > 0 && timeout > input.suspendThreshold {
+			suspendChan = time.After(input.suspendThreshold)
+		}
 
 		select {
 		case <-done:
@@ -3524,6 +3550,9 @@ loop:
 			timeoutOccurred = true
 			s.logger.Warn("Recv() timeout reached", "payload", payload, "timeout", input.Timeout)
 			break loop
+		case <-suspendChan:
+			// Nothing recorded: the replayed recv reuses the memoized timeout deadline.
+			return &recvResult{suspend: true, delayUntil: deadline, stepID: stepID, sleepStepID: sleepStepID}, nil
 		case <-repollChannel:
 			s.logger.Warn("Receive polling after repoll channel signal", "payload", payload)
 			// We were instructed to poll again because the connection was disconnected
@@ -3655,7 +3684,17 @@ func (s *sysDB) setEvent(ctx context.Context, input WorkflowSetEventInput) error
 	} else {
 		_, err = s.pool.Exec(ctx, insertHistoryQuery, input.workflowID, input.stepID, input.Key, input.Message, input.serialization)
 	}
-	return err
+	if err != nil {
+		return err
+	}
+
+	// Durable suspension (fork §1): wake any GetEvent waiters suspended on this
+	// workflow's events (they wait on workflowID in workflow_waiters).
+	var runner Querier = s.pool
+	if input.tx != nil {
+		runner = input.tx
+	}
+	return s.notifyWorkflowWaiters(ctx, runner, input.workflowID)
 }
 
 func (s *sysDB) getEvent(ctx context.Context, input getEventInput) (*getEventResult, error) {
@@ -3744,6 +3783,10 @@ func (s *sysDB) getEvent(ctx context.Context, input getEventInput) (*getEventRes
 			close(done)
 		}()
 
+		// Durable suspension (fork §1): armed once when enabled, so repoll
+		// iterations do not extend the in-process wait.
+		var suspendChan <-chan time.Time
+
 	loop:
 		for valueString == nil {
 			// Wait for notification with timeout using condition variable
@@ -3759,6 +3802,10 @@ func (s *sysDB) getEvent(ctx context.Context, input getEventInput) (*getEventRes
 					return nil, fmt.Errorf("failed to sleep before getEvent timeout: %w", err)
 				}
 			}
+			deadline := time.Now().Add(timeout)
+			if suspendChan == nil && isInWorkflow && input.suspendThreshold > 0 && timeout > input.suspendThreshold {
+				suspendChan = time.After(input.suspendThreshold)
+			}
 
 			select {
 			case <-done:
@@ -3767,6 +3814,9 @@ func (s *sysDB) getEvent(ctx context.Context, input getEventInput) (*getEventRes
 					return nil, err
 				}
 				break loop
+			case <-suspendChan:
+				// Nothing recorded: the replayed getEvent reuses the memoized deadline.
+				return &getEventResult{suspend: true, delayUntil: deadline, stepID: stepID, sleepStepID: sleepStepID}, nil
 			case <-time.After(timeout):
 				timeoutOccurred = true
 				s.logger.Warn("GetEvent() timeout reached", "target_workflow_id", input.TargetWorkflowID, "key", input.Key, "timeout", input.Timeout)

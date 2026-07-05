@@ -2616,18 +2616,25 @@ func Send[P any](ctx DBOSContext, destinationID string, message P, topic string,
 }
 
 type recvInput struct {
-	Topic         string        // Topic to listen for (empty string receives from default topic)
-	Timeout       time.Duration // Maximum time to wait for a message
-	serialization string        // fallback serialization format (receiver's) for recording when no message is found
-	workflowID    string        // Receiving workflow (resolved by the caller from context)
-	stepID        int           // Step ID for the recv
-	sleepStepID   int           // Step ID for the internal timeout sleep
+	Topic            string        // Topic to listen for (empty string receives from default topic)
+	Timeout          time.Duration // Maximum time to wait for a message
+	serialization    string        // fallback serialization format (receiver's) for recording when no message is found
+	workflowID       string        // Receiving workflow (resolved by the caller from context)
+	stepID           int           // Step ID for the recv
+	sleepStepID      int           // Step ID for the internal timeout sleep
+	suspendThreshold time.Duration // fork §1: when > 0 and no message arrives within it, return a suspension sentinel instead of waiting in-process
 }
 
 // recvResult carries the received message along with its serialization format from the notifications table.
+// When suspend is set, no message arrived within the suspension threshold and nothing was
+// recorded: the caller should durably suspend the workflow and let it replay.
 type recvResult struct {
 	message       *string
 	serialization string
+	suspend       bool
+	delayUntil    time.Time // durable timeout deadline (set when suspend is)
+	stepID        int       // step IDs used, so a re-entry can reuse them
+	sleepStepID   int
 }
 
 func (c *dbosContext) Recv(_ DBOSContext, topic string, timeout time.Duration) (any, error) {
@@ -2646,10 +2653,29 @@ func (c *dbosContext) Recv(_ DBOSContext, topic string, timeout time.Duration) (
 		stepID:        wfState.nextStepID(),
 		sleepStepID:   wfState.nextStepID(),
 	}
+	if c.config.DurableSleepThreshold > 0 {
+		input.suspendThreshold = c.config.DurableSleepThreshold
+	}
 	recvRetryOpts := []retryOption{withRetrierLogger(c.logger)}
 	if sysDB, ok := c.systemDB.(*sysDB); ok && sysDB.isCockroachDB {
 		recvRetryOpts = append(recvRetryOpts, withRetryCondition(cockroachDialect{}.IsRetryableTransaction))
 	}
+	result, err := retryWithResult(c, func() (*recvResult, error) {
+		return c.systemDB.recv(c, input)
+	}, recvRetryOpts...)
+	if err != nil || result == nil || !result.suspend {
+		return result, err
+	}
+
+	// Durable suspension (fork §1): no message within the threshold. Suspend until a
+	// Send wakes us or the timeout deadline passes. Does not return on success.
+	c.suspendForRecv(wfState, topic, result.delayUntil)
+
+	// Suspension failed (e.g. concurrent cancellation): wait in-process for the rest
+	// of the timeout, re-entering with the same step IDs.
+	input.suspendThreshold = 0
+	input.stepID = result.stepID
+	input.sleepStepID = result.sleepStepID
 	return retryWithResult(c, func() (*recvResult, error) {
 		return c.systemDB.recv(c, input)
 	}, recvRetryOpts...)
@@ -2792,12 +2818,19 @@ type getEventInput struct {
 	workflowID       string        // Calling workflow (resolved by the caller from context; empty when outside a workflow)
 	stepID           int           // Step ID for the getEvent, allocated by the caller before any retry
 	sleepStepID      int           // Step ID for the internal timeout sleep, allocated by the caller before any retry
+	suspendThreshold time.Duration // fork §1: when > 0 (within a workflow) and the event is not set within it, return a suspension sentinel
 }
 
 // getEventResult carries the event value along with its serialization format from the workflow_events table.
+// When suspend is set, the event was not set within the suspension threshold and nothing
+// was recorded: the caller should durably suspend the workflow and let it replay.
 type getEventResult struct {
 	value         *string
 	serialization string
+	suspend       bool
+	delayUntil    time.Time // durable timeout deadline (set when suspend is)
+	stepID        int       // step IDs used, so a re-entry can reuse them
+	sleepStepID   int
 }
 
 func (c *dbosContext) GetEvent(_ DBOSContext, targetWorkflowID, key string, timeout time.Duration) (any, error) {
@@ -2808,7 +2841,8 @@ func (c *dbosContext) GetEvent(_ DBOSContext, targetWorkflowID, key string, time
 		serialization:    resolveEncoder(c).Name(),
 	}
 	// GetEvent may run inside or outside a workflow. When inside, allocate step IDs.
-	if wfState, ok := c.Value(workflowStateKey).(*workflowState); ok && wfState != nil {
+	wfState, _ := c.Value(workflowStateKey).(*workflowState)
+	if wfState != nil {
 		if wfState.isWithinStep {
 			return nil, newStepExecutionError(wfState.workflowID, "DBOS.getEvent", fmt.Errorf("cannot call GetEvent within a step"))
 		}
@@ -2816,7 +2850,26 @@ func (c *dbosContext) GetEvent(_ DBOSContext, targetWorkflowID, key string, time
 		input.workflowID = wfState.workflowID
 		input.stepID = wfState.nextStepID()
 		input.sleepStepID = wfState.nextStepID()
+		if c.config.DurableSleepThreshold > 0 {
+			input.suspendThreshold = c.config.DurableSleepThreshold
+		}
 	}
+	result, err := retryWithResult(c, func() (*getEventResult, error) {
+		return c.systemDB.getEvent(c, input)
+	}, withRetrierLogger(c.logger))
+	if err != nil || result == nil || !result.suspend {
+		return result, err
+	}
+
+	// Durable suspension (fork §1): the event was not set within the threshold.
+	// Suspend until the target's SetEvent wakes us or the deadline passes.
+	c.suspendForEvent(wfState, input.TargetWorkflowID, input.Key, result.delayUntil)
+
+	// Suspension failed: wait in-process for the rest of the timeout, re-entering
+	// with the same step IDs.
+	input.suspendThreshold = 0
+	input.stepID = result.stepID
+	input.sleepStepID = result.sleepStepID
 	return retryWithResult(c, func() (*getEventResult, error) {
 		return c.systemDB.getEvent(c, input)
 	}, withRetrierLogger(c.logger))
@@ -5653,4 +5706,60 @@ func (c *dbosContext) suspendForResult(wfState *workflowState, awaitedWorkflowID
 	}
 
 	panic(&workflowSuspension{workflowID: wfState.workflowID, delayUntil: delayUntil, awaitedWorkflowID: awaitedWorkflowID})
+}
+
+/* ===== §1 durable suspension: Recv/GetEvent suspend helpers (re-fork) ===== */
+
+func (c *dbosContext) suspendForRecv(wfState *workflowState, topic string, deadline time.Time) {
+	delayUntil := deadline
+	if fallback := time.Now().Add(_waiterWakeFallbackInterval); fallback.Before(delayUntil) {
+		delayUntil = fallback
+	}
+	// Register the workflow as a waiter on itself: this marks it as "suspended waiting
+	// for a message", which is what send's wake-up targets.
+	suspended, err := retryWithResult(c, func() (bool, error) {
+		return c.systemDB.suspendWorkflowForResult(c, wfState.workflowID, wfState.workflowID, delayUntil)
+	}, withRetrierLogger(c.logger))
+	if err != nil || !suspended {
+		c.logger.Warn("could not suspend workflow awaiting a message; waiting in-process", "workflow_id", wfState.workflowID, "topic", topic, "error", err)
+		return
+	}
+
+	// Close the race where a message landed after recv's check but before the waiter
+	// row was committed (its send found no suspended waiter to wake).
+	exists, err := c.systemDB.hasUnconsumedNotification(c, wfState.workflowID, topic)
+	if err == nil && exists {
+		if wakeErr := c.systemDB.wakeSuspendedWorkflow(c, wfState.workflowID); wakeErr != nil {
+			// Not fatal: the fallback delay still bounds the wait.
+			c.logger.Warn("failed to self-wake after a message arrived", "workflow_id", wfState.workflowID, "topic", topic, "error", wakeErr)
+		}
+	}
+
+	panic(&workflowSuspension{workflowID: wfState.workflowID, delayUntil: delayUntil})
+}
+
+func (c *dbosContext) suspendForEvent(wfState *workflowState, targetWorkflowID, key string, deadline time.Time) {
+	delayUntil := deadline
+	if fallback := time.Now().Add(_waiterWakeFallbackInterval); fallback.Before(delayUntil) {
+		delayUntil = fallback
+	}
+	suspended, err := retryWithResult(c, func() (bool, error) {
+		return c.systemDB.suspendWorkflowForResult(c, wfState.workflowID, targetWorkflowID, delayUntil)
+	}, withRetrierLogger(c.logger))
+	if err != nil || !suspended {
+		c.logger.Warn("could not suspend workflow awaiting an event; waiting in-process", "workflow_id", wfState.workflowID, "target_workflow_id", targetWorkflowID, "key", key, "error", err)
+		return
+	}
+
+	// Close the race where the event was set after getEvent's check but before the
+	// waiter row was committed (its SetEvent found no registered waiter to wake).
+	exists, err := c.systemDB.hasWorkflowEvent(c, targetWorkflowID, key)
+	if err == nil && exists {
+		if wakeErr := c.systemDB.wakeSuspendedWorkflow(c, wfState.workflowID); wakeErr != nil {
+			// Not fatal: the fallback delay still bounds the wait.
+			c.logger.Warn("failed to self-wake after the awaited event was set", "workflow_id", wfState.workflowID, "target_workflow_id", targetWorkflowID, "key", key, "error", wakeErr)
+		}
+	}
+
+	panic(&workflowSuspension{workflowID: wfState.workflowID, delayUntil: delayUntil, awaitedWorkflowID: targetWorkflowID})
 }
