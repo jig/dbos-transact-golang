@@ -83,6 +83,13 @@ type systemDatabase interface {
 	// Queues
 	setWorkflowDelay(ctx context.Context, input setWorkflowDelayDBInput) error
 	transitionDelayedWorkflows(ctx context.Context) error
+	// Durable suspension (fork; notes/DIVERGENCES.md §1).
+	suspendWorkflowForSleep(ctx context.Context, workflowID string, delayUntil time.Time) (bool, error)
+	suspendWorkflowForResult(ctx context.Context, waiterID string, awaitedID string, delayUntil time.Time) (bool, error)
+	wakeWorkflowWaiters(ctx context.Context, runner Querier, workflowID string) error
+	wakeSuspendedWorkflow(ctx context.Context, workflowID string) error
+	hasUnconsumedNotification(ctx context.Context, destinationID string, topic string) (bool, error)
+	hasWorkflowEvent(ctx context.Context, targetWorkflowID string, key string) (bool, error)
 	dequeueWorkflows(ctx context.Context, input dequeueWorkflowsInput) ([]dequeuedWorkflow, error)
 	clearQueueAssignment(ctx context.Context, workflowID string) (bool, error)
 	getQueuePartitions(ctx context.Context, queueName string) ([]string, error)
@@ -1494,6 +1501,13 @@ func (s *sysDB) updateWorkflowOutcome(ctx context.Context, input updateWorkflowO
 
 	if err != nil {
 		return fmt.Errorf("failed to update workflow status: %w", err)
+	}
+
+	// Durable suspension (fork §1): the workflow reached a terminal state, so wake
+	// any workflows suspended on its result. When input.tx is nil the wake runs in
+	// its own transaction (see wakeWorkflowWaiters).
+	if err := s.wakeWorkflowWaiters(ctx, input.tx, input.workflowID); err != nil {
+		return err
 	}
 	return nil
 }

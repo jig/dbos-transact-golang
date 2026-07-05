@@ -197,6 +197,7 @@ type setupDBOSOptions struct {
 	checkLeaks               bool
 	serializer               Serializer[any]
 	schedulerPollingInterval time.Duration
+	durableSleepThreshold    time.Duration
 }
 
 /* Test database setup */
@@ -216,6 +217,7 @@ func setupDBOS(t *testing.T, opts setupDBOSOptions) DBOSContext {
 		AppName:                  "test-app",
 		Serializer:               opts.serializer,
 		SchedulerPollingInterval: opts.schedulerPollingInterval,
+		DurableSleepThreshold:    opts.durableSleepThreshold,
 	}
 
 	dbosCtx, err := NewDBOSContext(context.Background(), config)
