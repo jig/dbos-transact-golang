@@ -354,6 +354,11 @@ func concurrentlyKw(isCockroach bool) string {
 }
 
 // buildMigrations renders the full list of migrations against the target schema.
+// _plainSQLNoOp occupies a migration version whose upstream body is PL/pgSQL
+// (functions/triggers/search_path). The plain-SQL fork installs none of those, so
+// the version advances while creating nothing. See notes/DIVERGENCES.md §2.
+const _plainSQLNoOp = "-- plain-SQL fork: upstream PL/pgSQL migration neutralized (no functions/triggers)"
+
 func buildMigrations(schema string, isCockroach bool) []migrationFile {
 	sanitizedSchema := pgx.Identifier{schema}.Sanitize()
 
@@ -361,20 +366,19 @@ func buildMigrations(schema string, isCockroach bool) []migrationFile {
 		sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema,
 		sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema,
 		sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema)
-	if !isCockroach {
-		migration1ListenNotifySQLProcessed := fmt.Sprintf(migration1ListenNotifySQL,
-			sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema)
-		migration1SQLProcessed = migration1SQLProcessed + "\n" + migration1ListenNotifySQLProcessed
-	}
+	// Plain-SQL fork (notes/DIVERGENCES.md §2): the LISTEN/NOTIFY trigger functions
+	// are never installed; notifications, events and streams are delivered by the
+	// polling loop instead. _plainSQLNoOp keeps upstream's PL/pgSQL migration
+	// versions occupied (so version numbers and idempotency stay aligned) while
+	// creating no functions or triggers.
+	_, _, _ = migration1ListenNotifySQL, migration10SQL, migration14SQL
 
 	c := concurrentlyKw(isCockroach)
 
-	// Migration 20 is a Postgres-only function-hardening pass; on CockroachDB
-	// it is a no-op (the version row still advances).
-	migration20SQLProcessed := ""
-	if !isCockroach {
-		migration20SQLProcessed = fmt.Sprintf(migration20SQL, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema)
-	}
+	// Migration 20 (function search_path hardening): no functions are created in
+	// the plain-SQL fork, so this is neutralized.
+	migration20SQLProcessed := _plainSQLNoOp
+	_ = migration20SQL
 
 	// Migration 28 drops the legacy uq_workflow_status_queue_name_dedup_id
 	// constraint. CockroachDB exposes it as an index (DROP INDEX ... CASCADE);
@@ -386,23 +390,15 @@ func buildMigrations(schema string, isCockroach bool) []migrationFile {
 	}
 	migration28SQLProcessed := fmt.Sprintf(migration28File, sanitizedSchema)
 
-	// Migration 38 replaces enqueue_workflow with a signature adding
-	// authenticated_user, authenticated_roles, and delay_until_epoch_ms. The
-	// DROP/CREATE base runs everywhere; the trailing search_path hardening is
-	// Postgres-only (CockroachDB rejects ALTER FUNCTION ... SET).
-	migration38SQLProcessed := fmt.Sprintf(migration38SQL, sanitizedSchema, sanitizedSchema, sanitizedSchema)
-	if !isCockroach {
-		migration38SQLProcessed = migration38SQLProcessed + "\n" + fmt.Sprintf(migration38SearchPathSQL, sanitizedSchema)
-	}
+	// Migration 38 (enqueue_workflow PL/pgSQL rewrite): the fork enqueues via plain
+	// Go INSERTs, never calling this function, so it is not created.
+	migration38SQLProcessed := _plainSQLNoOp
+	_, _ = migration38SQL, migration38SearchPathSQL
 
-	// Migration 39 installs the streams notification trigger. Gated on
-	// LISTEN/NOTIFY support, mirroring the migration 1 triggers; on CockroachDB
-	// it is a no-op (the version row still advances).
-	migration39SQLProcessed := ""
-	if !isCockroach {
-		migration39SQLProcessed = fmt.Sprintf(migration39SQL,
-			sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema)
-	}
+	// Migration 39 (streams LISTEN/NOTIFY trigger): streams are drained by the
+	// reader's polling fallback, so no trigger is installed.
+	migration39SQLProcessed := _plainSQLNoOp
+	_ = migration39SQL
 
 	return []migrationFile{
 		{version: 1, sql: migration1SQLProcessed},
@@ -414,11 +410,12 @@ func buildMigrations(schema string, isCockroach bool) []migrationFile {
 		{version: 7, sql: fmt.Sprintf(migration7SQL, sanitizedSchema)},
 		{version: 8, sql: fmt.Sprintf(migration8SQL, sanitizedSchema, sanitizedSchema)},
 		{version: 9, sql: fmt.Sprintf(migration9SQL, sanitizedSchema)},
-		{version: 10, sql: fmt.Sprintf(migration10SQL, schema, sanitizedSchema)},
+		{version: 10, sql: _plainSQLNoOp}, // PL/pgSQL DO block; base schema already has the notifications pkey (drop&recreate PoC)
 		{version: 11, sql: fmt.Sprintf(migration11SQL, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema)},
 		{version: 12, sql: fmt.Sprintf(migration12SQL, sanitizedSchema, sanitizedSchema)},
 		{version: 13, sql: fmt.Sprintf(migration13SQL, sanitizedSchema)},
-		{version: 14, sql: fmt.Sprintf(migration14SQL, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema)},
+		{version: 14, sql: _plainSQLNoOp}, // enqueue_workflow client functions; Go enqueues with plain SQL
+		// (migration10SQL/migration14SQL kept embedded but neutralized above)
 		{version: 15, sql: fmt.Sprintf(migration15SQL, sanitizedSchema, sanitizedSchema, sanitizedSchema)},
 		{version: 16, sql: fmt.Sprintf(migration16SQL, sanitizedSchema, sanitizedSchema)},
 		{version: 17, sql: fmt.Sprintf(migration17SQL, sanitizedSchema)},

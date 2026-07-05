@@ -194,7 +194,10 @@ func (postgresDialect) QueueDequeueIsolation(snapshot bool) IsoLevel {
 	}
 	return IsoLevelReadCommitted
 }
-func (postgresDialect) SupportsListenNotify() bool     { return true }
+
+// Plain-SQL fork: Postgres uses the polling notification path (no LISTEN/NOTIFY),
+// so no PL/pgSQL trigger functions are installed. See notes/DIVERGENCES.md §2.
+func (postgresDialect) SupportsListenNotify() bool     { return false }
 func (postgresDialect) SupportsArrayParameters() bool  { return true }
 func (postgresDialect) SupportsDataModifyingCTE() bool { return true }
 
