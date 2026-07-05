@@ -321,6 +321,12 @@ var migration39SQL string
 //go:embed migrations/40_add_attributes.sql
 var migration40SQL string
 
+// Fork migrations use high version numbers (1000+) to avoid colliding with
+// upstream's migration sequence. See notes/DIVERGENCES.md §1/§6.
+//
+//go:embed migrations/1001_create_workflow_waiters.sql
+var migration1001SQL string
+
 type migrationFile struct {
 	version int64
 	sql     string
@@ -442,6 +448,7 @@ func buildMigrations(schema string, isCockroach bool) []migrationFile {
 		{version: 38, sql: migration38SQLProcessed},
 		{version: 39, sql: migration39SQLProcessed},
 		{version: 40, sql: fmt.Sprintf(migration40SQL, sanitizedSchema, sanitizedSchema)},
+		{version: 1001, sql: fmt.Sprintf(migration1001SQL, sanitizedSchema, sanitizedSchema)}, // fork: workflow_waiters (durable suspension)
 	}
 }
 
@@ -5940,3 +5947,179 @@ func (s *sysDB) importWorkflow(ctx context.Context, workflows []ExportedWorkflow
 	}
 	return nil
 }
+
+/* ===== §1 durable suspension: waiter/suspend sysDB methods (re-fork) ===== */
+
+func (s *sysDB) notifyWorkflowWaiters(ctx context.Context, runner Querier, workflowID string) error {
+	schemaPrefix := s.dialect.SchemaPrefix(s.schema)
+	query := s.renderSQL(`UPDATE %sworkflow_status
+		SET delay_until_epoch_ms = $1, updated_at = $1
+		WHERE status = $2
+		  AND workflow_uuid IN (SELECT waiter_workflow_uuid FROM %sworkflow_waiters WHERE awaited_workflow_uuid = $3)`,
+		schemaPrefix, schemaPrefix)
+	if _, err := runner.Exec(ctx, query, time.Now().UnixMilli(), WorkflowStatusDelayed, workflowID); err != nil {
+		return fmt.Errorf("failed to notify waiters of workflow %s: %w", workflowID, err)
+	}
+	return nil
+}
+
+func (s *sysDB) suspendWorkflowToDelayed(ctx context.Context, runner Querier, workflowID string, delayUntil time.Time) (bool, error) {
+	query := s.renderSQL(`UPDATE %sworkflow_status
+		SET status = $1,
+		    delay_until_epoch_ms = $2,
+		    updated_at = $3,
+		    queue_name = COALESCE(NULLIF(queue_name, ''), $4),
+		    started_at_epoch_ms = NULL,
+		    recovery_attempts = 0
+		WHERE workflow_uuid = $5
+		  AND status = $6`, s.dialect.SchemaPrefix(s.schema))
+
+	commandTag, err := runner.Exec(ctx, query,
+		WorkflowStatusDelayed,
+		delayUntil.UnixMilli(),
+		time.Now().UnixMilli(),
+		_DBOS_INTERNAL_QUEUE_NAME,
+		workflowID,
+		WorkflowStatusPending)
+	if err != nil {
+		return false, fmt.Errorf("failed to suspend workflow %s: %w", workflowID, err)
+	}
+	n, err := commandTag.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("failed to read rows affected after suspending workflow %s: %w", workflowID, err)
+	}
+	return n > 0, nil
+}
+
+// resetWorkflowRecoveryAttempts zeroes a still-PENDING workflow's recovery_attempts.
+// Used when a workflow is left PENDING after a graceful engine shutdown so repeated
+// clean restarts do not count toward the DLQ (MAX_RECOVERY_ATTEMPTS_EXCEEDED) budget:
+// a reboot is not a failed attempt. It mirrors the reset suspendWorkflowToDelayed
+// performs on suspension. A real crash never calls this, so its recovery_attempts
+// keep accumulating and crash-loop protection is preserved.
+func (s *sysDB) resetWorkflowRecoveryAttempts(ctx context.Context, workflowID string) error {
+	query := s.renderSQL(`UPDATE %sworkflow_status
+		SET recovery_attempts = 0, updated_at = $1
+		WHERE workflow_uuid = $2 AND status = $3`, s.dialect.SchemaPrefix(s.schema))
+	_, err := s.pool.Exec(ctx, query, time.Now().UnixMilli(), workflowID, WorkflowStatusPending)
+	if err != nil {
+		return fmt.Errorf("failed to reset recovery attempts for workflow %s: %w", workflowID, err)
+	}
+	return nil
+}
+
+// suspendWorkflowForSleep parks a PENDING workflow in the database for the remainder of a
+// durable sleep. See suspendWorkflowToDelayed for the semantics.
+func (s *sysDB) suspendWorkflowForSleep(ctx context.Context, workflowID string, delayUntil time.Time) (bool, error) {
+	return s.suspendWorkflowToDelayed(ctx, s.pool, workflowID, delayUntil)
+}
+
+// suspendWorkflowForResult parks a PENDING workflow (the waiter) while it waits for
+// another workflow to reach a terminal state. The waiter registration and the DELAYED
+// transition commit atomically; the awaited workflow's completion wakes the waiter via
+// wakeWorkflowWaiters. delayUntil acts as a periodic fallback wake-up in case a
+// completion wake-up is lost: the woken waiter simply re-suspends if the awaited
+// workflow is still running.
+func (s *sysDB) suspendWorkflowForResult(ctx context.Context, waiterID string, awaitedID string, delayUntil time.Time) (bool, error) {
+	tx, err := s.pool.BeginTx(ctx, TxOptions{})
+	if err != nil {
+		return false, fmt.Errorf("failed to begin transaction to suspend workflow %s: %w", waiterID, err)
+	}
+	defer tx.Rollback(ctx)
+
+	suspended, err := s.suspendWorkflowToDelayed(ctx, tx, waiterID, delayUntil)
+	if err != nil {
+		return false, err
+	}
+	if !suspended {
+		return false, nil
+	}
+
+	insertQuery := s.renderSQL(`INSERT INTO %sworkflow_waiters (waiter_workflow_uuid, awaited_workflow_uuid)
+		VALUES ($1, $2) ON CONFLICT DO NOTHING`, s.dialect.SchemaPrefix(s.schema))
+	if _, err := tx.Exec(ctx, insertQuery, waiterID, awaitedID); err != nil {
+		return false, fmt.Errorf("failed to register workflow waiter %s -> %s: %w", waiterID, awaitedID, err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("failed to commit suspension of workflow %s: %w", waiterID, err)
+	}
+	return true, nil
+}
+
+// wakeWorkflowWaiters wakes the workflows suspended on workflowID's result: their
+// delay_until is moved to now (the queue runner then promotes them to ENQUEUED) and the
+// waiter rows are removed. Called whenever a workflow reaches a terminal state.
+// Pass the caller's transaction to make the wake atomic with the status change; with a
+// nil runner the two statements run in their own transaction.
+func (s *sysDB) wakeWorkflowWaiters(ctx context.Context, runner Querier, workflowID string) error {
+	if runner == nil {
+		tx, err := s.pool.BeginTx(ctx, TxOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to begin transaction to wake waiters of workflow %s: %w", workflowID, err)
+		}
+		defer tx.Rollback(ctx)
+		if err := s.wakeWorkflowWaiters(ctx, tx, workflowID); err != nil {
+			return err
+		}
+		return tx.Commit(ctx)
+	}
+
+	schemaPrefix := s.dialect.SchemaPrefix(s.schema)
+	updateQuery := s.renderSQL(`UPDATE %sworkflow_status
+		SET delay_until_epoch_ms = $1, updated_at = $1
+		WHERE status = $2
+		  AND workflow_uuid IN (SELECT waiter_workflow_uuid FROM %sworkflow_waiters WHERE awaited_workflow_uuid = $3)`,
+		schemaPrefix, schemaPrefix)
+	if _, err := runner.Exec(ctx, updateQuery, time.Now().UnixMilli(), WorkflowStatusDelayed, workflowID); err != nil {
+		return fmt.Errorf("failed to wake waiters of workflow %s: %w", workflowID, err)
+	}
+
+	deleteQuery := s.renderSQL(`DELETE FROM %sworkflow_waiters WHERE awaited_workflow_uuid = $1`, schemaPrefix)
+	if _, err := runner.Exec(ctx, deleteQuery, workflowID); err != nil {
+		return fmt.Errorf("failed to delete waiters of workflow %s: %w", workflowID, err)
+	}
+	return nil
+}
+
+// wakeSuspendedWorkflow moves a DELAYED workflow's delay_until to now, so the queue
+// runner promotes and re-executes it on its next pass. Used to self-wake after a
+// suspension race (a message or result that landed before the suspension committed).
+func (s *sysDB) wakeSuspendedWorkflow(ctx context.Context, workflowID string) error {
+	query := s.renderSQL(`UPDATE %sworkflow_status
+		SET delay_until_epoch_ms = $1, updated_at = $1
+		WHERE workflow_uuid = $2
+		  AND status = $3`, s.dialect.SchemaPrefix(s.schema))
+	if _, err := s.pool.Exec(ctx, query, time.Now().UnixMilli(), workflowID, WorkflowStatusDelayed); err != nil {
+		return fmt.Errorf("failed to wake suspended workflow %s: %w", workflowID, err)
+	}
+	return nil
+}
+
+// hasUnconsumedNotification reports whether the workflow has an unconsumed message
+// pending on the given topic (the topic must already be normalized by the caller's
+// recv; an empty topic means the default topic).
+func (s *sysDB) hasUnconsumedNotification(ctx context.Context, destinationID string, topic string) (bool, error) {
+	if topic == "" {
+		topic = _DBOS_NULL_TOPIC
+	}
+	query := s.renderSQL(`SELECT EXISTS (SELECT 1 FROM %snotifications WHERE destination_uuid = $1 AND topic = $2 AND consumed = false)`, s.dialect.SchemaPrefix(s.schema))
+	var exists bool
+	if err := s.pool.QueryRow(ctx, query, destinationID, topic).Scan(&exists); err != nil {
+		return false, fmt.Errorf("failed to check pending notifications for workflow %s: %w", destinationID, err)
+	}
+	return exists, nil
+}
+
+// hasWorkflowEvent reports whether the target workflow has set an event under the
+// given key.
+func (s *sysDB) hasWorkflowEvent(ctx context.Context, targetWorkflowID string, key string) (bool, error) {
+	query := s.renderSQL(`SELECT EXISTS (SELECT 1 FROM %sworkflow_events WHERE workflow_uuid = $1 AND key = $2)`, s.dialect.SchemaPrefix(s.schema))
+	var exists bool
+	if err := s.pool.QueryRow(ctx, query, targetWorkflowID, key).Scan(&exists); err != nil {
+		return false, fmt.Errorf("failed to check event %s of workflow %s: %w", key, targetWorkflowID, err)
+	}
+	return exists, nil
+}
+
+// transitionDelayedWorkflows already exists upstream (identical); reused as-is.
