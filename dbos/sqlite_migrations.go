@@ -127,6 +127,12 @@ var sqliteMigration40SQL string
 //go:embed migrations/sqlite/1001_create_workflow_waiters.sql
 var sqliteMigration1001SQL string
 
+//go:embed migrations/sqlite/1002_create_workflow_gates.sql
+var sqliteMigration1002SQL string
+
+//go:embed migrations/sqlite/1003_create_workflow_read_audience.sql
+var sqliteMigration1003SQL string
+
 // buildSqliteMigrations returns the SQLite migration list. Versions mirror pg
 // numbering (matching Python's sqlite_migrations); pg migrations 10, 14, 20,
 // 38, and 39 have no SQLite counterpart and are omitted.
@@ -168,6 +174,8 @@ func buildSqliteMigrations() []migrationFile {
 		{version: 37, sql: sqliteMigration37SQL},
 		{version: 40, sql: sqliteMigration40SQL},
 		{version: 1001, sql: sqliteMigration1001SQL},
+		{version: 1002, sql: sqliteMigration1002SQL},
+		{version: 1003, sql: sqliteMigration1003SQL},
 	}
 }
 

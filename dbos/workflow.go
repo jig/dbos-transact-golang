@@ -2623,6 +2623,7 @@ type recvInput struct {
 	stepID           int           // Step ID for the recv
 	sleepStepID      int           // Step ID for the internal timeout sleep
 	suspendThreshold time.Duration // fork §1: when > 0 and no message arrives within it, return a suspension sentinel instead of waiting in-process
+	gate             *gateSpec     // fork §7: when set, this recv IS a gate: open before waiting, close on completion
 }
 
 // recvResult carries the received message along with its serialization format from the notifications table.
@@ -2635,6 +2636,7 @@ type recvResult struct {
 	delayUntil    time.Time // durable timeout deadline (set when suspend is)
 	stepID        int       // step IDs used, so a re-entry can reuse them
 	sleepStepID   int
+	deliveryID    string // fork §7: gate recv — audit row of the consumed delivery
 }
 
 func (c *dbosContext) Recv(_ DBOSContext, topic string, timeout time.Duration) (any, error) {

@@ -90,6 +90,16 @@ type systemDatabase interface {
 	wakeSuspendedWorkflow(ctx context.Context, workflowID string) error
 	hasUnconsumedNotification(ctx context.Context, destinationID string, topic string) (bool, error)
 	hasWorkflowEvent(ctx context.Context, targetWorkflowID string, key string) (bool, error)
+	// concrete returns the underlying *sysDB (nil for other implementations).
+	concrete() *sysDB
+	// Gates (fork; notes/DIVERGENCES.md §7).
+	deliverToGate(ctx context.Context, in DeliverInput, encodedPayload *string, serialization string) (GateOutcome, string, error)
+	ignoreDelivery(ctx context.Context, deliveryID string) error
+	addReadAudience(ctx context.Context, workflowID, org string, principals []GatePrincipal) error
+	readAllowed(ctx context.Context, workflowID, org, subject string, groups []string) (bool, error)
+	listOpenGatesFor(ctx context.Context, org, subject string, groups []string, limit int) ([]OpenGateRow, error)
+	listDeliveriesBy(ctx context.Context, org, subject string, limit int) ([]DeliveryRow, error)
+	listInitiatedBy(ctx context.Context, org, subject string, limit int) ([]string, error)
 	dequeueWorkflows(ctx context.Context, input dequeueWorkflowsInput) ([]dequeuedWorkflow, error)
 	clearQueueAssignment(ctx context.Context, workflowID string) (bool, error)
 	getQueuePartitions(ctx context.Context, queueName string) ([]string, error)
@@ -334,6 +344,12 @@ var migration40SQL string
 //go:embed migrations/1001_create_workflow_waiters.sql
 var migration1001SQL string
 
+//go:embed migrations/1002_create_workflow_gates.sql
+var migration1002SQL string
+
+//go:embed migrations/1003_create_workflow_read_audience.sql
+var migration1003SQL string
+
 type migrationFile struct {
 	version int64
 	sql     string
@@ -455,7 +471,9 @@ func buildMigrations(schema string, isCockroach bool) []migrationFile {
 		{version: 38, sql: migration38SQLProcessed},
 		{version: 39, sql: migration39SQLProcessed},
 		{version: 40, sql: fmt.Sprintf(migration40SQL, sanitizedSchema, sanitizedSchema)},
-		{version: 1001, sql: fmt.Sprintf(migration1001SQL, sanitizedSchema, sanitizedSchema)}, // fork: workflow_waiters (durable suspension)
+		{version: 1001, sql: fmt.Sprintf(migration1001SQL, sanitizedSchema, sanitizedSchema)}, // fork §1: workflow_waiters (durable suspension)
+		{version: 1002, sql: fmt.Sprintf(migration1002SQL, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema)}, // fork §7: workflow_gates
+		{version: 1003, sql: fmt.Sprintf(migration1003SQL, sanitizedSchema, sanitizedSchema, sanitizedSchema)},                                                                                                       // fork §7: workflow_read_audience
 	}
 }
 
@@ -3387,6 +3405,7 @@ type WorkflowSendInput struct {
 	tx             Tx
 	serialization  string
 	idempotencyKey string
+	messageUUID    *string // fork §7: explicit message_uuid override (gate delivery references it in the audit row)
 }
 
 // Send is a special type of step that sends a message to another workflow.
@@ -3410,6 +3429,9 @@ func (s *sysDB) send(ctx context.Context, input WorkflowSendInput) error {
 	messageUUID := uuid.NewString()
 	if input.idempotencyKey != "" {
 		messageUUID = fmt.Sprintf("%s::%s", input.idempotencyKey, input.DestinationID)
+	}
+	if input.messageUUID != nil { // fork §7: gate delivery pins an explicit message_uuid
+		messageUUID = *input.messageUUID
 	}
 	createdAtMs := time.Now().UnixMilli()
 	var err error
@@ -3476,6 +3498,14 @@ func (s *sysDB) recv(ctx context.Context, input recvInput) (*recvResult, error) 
 			recvErr = errors.New(*recordedResult.errStr)
 		}
 		return &recvResult{message: recordedResult.output, serialization: recordedResult.serialization}, recvErr
+	}
+
+	// fork §7: a gate recv opens (or re-opens) its gate before waiting. Idempotent
+	// on replay; a finished gate returns via the memoized branch above first.
+	if input.gate != nil {
+		if err := s.openGate(ctx, destinationID, stepID, *input.gate); err != nil {
+			return nil, fmt.Errorf("failed to open gate: %w", err)
+		}
 	}
 
 	// First check if there's already a receiver for this workflow/topic to avoid unnecessary database load
@@ -3591,11 +3621,12 @@ loop:
     UPDATE %snotifications
     SET consumed = true
     WHERE message_uuid = (SELECT message_uuid FROM oldest_entry)
-    RETURNING message, serialization`, s.dialect.SchemaPrefix(s.schema), s.dialect.SchemaPrefix(s.schema))
+    RETURNING message_uuid, message, serialization`, s.dialect.SchemaPrefix(s.schema), s.dialect.SchemaPrefix(s.schema))
 
 	var messageString *string
 	var msgSerialization *string
-	err = tx.QueryRow(ctx, query, destinationID, topic).Scan(&messageString, &msgSerialization)
+	var consumedMessageUUID *string // fork §7: gate recv references the consumed message in the audit row
+	err = tx.QueryRow(ctx, query, destinationID, topic).Scan(&consumedMessageUUID, &messageString, &msgSerialization)
 	if err != nil {
 		if err != pgx.ErrNoRows {
 			return nil, fmt.Errorf("failed to consume message: %w", err)
@@ -3634,12 +3665,23 @@ loop:
 		return nil, err
 	}
 
+	// fork §7: a gate recv closes its gate in the SAME transaction as the recv
+	// checkpoint (message consumed or timeout), so gate state can never diverge
+	// from the recv outcome.
+	var deliveryID string
+	if input.gate != nil {
+		deliveryID, err = s.closeGate(ctx, tx, destinationID, input.gate.Name, consumedMessageUUID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to close gate: %w", err)
+		}
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
 	// Return the message and its serialization format
-	return &recvResult{message: messageString, serialization: serialization}, timeoutErr
+	return &recvResult{message: messageString, serialization: serialization, deliveryID: deliveryID}, timeoutErr
 }
 
 type WorkflowSetEventInput struct {

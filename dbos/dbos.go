@@ -154,15 +154,25 @@ type DBOSContext interface {
 	Recv(_ DBOSContext, topic string, timeout time.Duration) (any, error)                                       // Receive a message sent to this workflow
 	SetEvent(_ DBOSContext, key string, message any, opts ...SetEventOption) error                              // Set a key-value event for this workflow
 	GetEvent(_ DBOSContext, targetWorkflowID string, key string, timeout time.Duration) (any, error)            // Get a key-value event from a target workflow
-	WriteStream(_ DBOSContext, key string, value any, opts ...WriteStreamOption) error                          // Write a value to a durable stream
-	CloseStream(_ DBOSContext, key string) error                                                                // Close a durable stream
-	ReadStream(_ DBOSContext, workflowID string, key string, opts ...ReadStreamOption) ([]any, bool, error)     // Read values from a durable stream (blocks until workflow inactive or stream closed
-	ReadStreamAsync(_ DBOSContext, workflowID string, key string) (<-chan StreamValue[any], error)              // Read values from a durable stream asynchronously
-	Sleep(_ DBOSContext, duration time.Duration) (time.Duration, error)                                         // Durable sleep that survives workflow recovery
-	Patch(_ DBOSContext, patchName string) (bool, error)                                                        // Check if workflow should use patched code
-	DeprecatePatch(_ DBOSContext, patchName string) error                                                       // Deprecate a patch
-	GetWorkflowID() (string, error)                                                                             // Get the current workflow ID (only available within workflows)
-	GetStepID() (int, error)                                                                                    // Get the current step ID (only available within workflows)
+
+	// Gates (fork; notes/DIVERGENCES.md §7).
+	GateRecv(_ DBOSContext, in GateRecvInput) (any, string, error)                                          // Gate-aware Recv: opens the gate, waits, closes transactionally
+	DeliverToGate(_ DBOSContext, in DeliverInput) (GateOutcome, string, error)                              // Conditional atomic delivery to an open gate
+	IgnoreDelivery(_ DBOSContext, deliveryID string) error                                                  // Mark a delivered audit row ignored (workflow policy)
+	AddReadAudience(_ DBOSContext, workflowID, org string, principals []GatePrincipal) error                // Widen an instance read audience (never narrows)
+	ReadAllowed(_ DBOSContext, workflowID, org, subject string, groups []string) (bool, error)              // May the caller see this instance? (read + gate audiences)
+	ListOpenGatesFor(_ DBOSContext, org, subject string, groups []string, limit int) ([]OpenGateRow, error) // Inbox: open gates awaiting the caller
+	ListDeliveriesBy(_ DBOSContext, org, subject string, limit int) ([]DeliveryRow, error)                  // Inbox: caller delivery attempts + outcomes
+	ListInitiatedBy(_ DBOSContext, org, subject string, limit int) ([]string, error)                        // Inbox: instances the caller started
+	WriteStream(_ DBOSContext, key string, value any, opts ...WriteStreamOption) error                      // Write a value to a durable stream
+	CloseStream(_ DBOSContext, key string) error                                                            // Close a durable stream
+	ReadStream(_ DBOSContext, workflowID string, key string, opts ...ReadStreamOption) ([]any, bool, error) // Read values from a durable stream (blocks until workflow inactive or stream closed
+	ReadStreamAsync(_ DBOSContext, workflowID string, key string) (<-chan StreamValue[any], error)          // Read values from a durable stream asynchronously
+	Sleep(_ DBOSContext, duration time.Duration) (time.Duration, error)                                     // Durable sleep that survives workflow recovery
+	Patch(_ DBOSContext, patchName string) (bool, error)                                                    // Check if workflow should use patched code
+	DeprecatePatch(_ DBOSContext, patchName string) error                                                   // Deprecate a patch
+	GetWorkflowID() (string, error)                                                                         // Get the current workflow ID (only available within workflows)
+	GetStepID() (int, error)                                                                                // Get the current step ID (only available within workflows)
 
 	// Workflow management
 	RetrieveWorkflow(_ DBOSContext, workflowID string) (WorkflowHandle[any], error)                                   // Get a handle to an existing workflow
