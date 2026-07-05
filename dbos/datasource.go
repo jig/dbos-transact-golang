@@ -114,7 +114,14 @@ func NewDataSource[E Engine](ctx DBOSContext, engine E, opts ...DataSourceOption
 			return nil, errors.New("data source engine (*sql.DB) is nil")
 		}
 		pool = newSQLPool(e)
+		// Fork §3: upstream assumes a *sql.DB is always SQLite, but Persist owns a
+		// Postgres pool via database/sql + lib/pq. Probe for Postgres — SQLite has
+		// no current_schema() function, so a successful call means Postgres — and
+		// pick the matching dialect ($N placeholders, information_schema, etc.).
 		dialect = sqliteDialect{}
+		if err := e.QueryRow(`SELECT current_schema()`).Scan(new(sql.NullString)); err == nil {
+			dialect = postgresDialect{}
+		}
 	}
 
 	ds := &DataSource{
