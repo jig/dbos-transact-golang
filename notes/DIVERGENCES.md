@@ -131,12 +131,17 @@ a dispatch counter) is deferred.
 
 ## 5. DBOSError code preservation across replay
 
-> **RE-FORK STATUS (2026-07): SUPERSEDED — upstream now preserves it natively.**
-> The base gob-encodes Go↔Go errors, preserving the concrete `*DBOSError` type
-> (and its `Code`) across replay, with upstream's own
-> `TestGoToGoErrorTypePreservation`. The fork's string-parsing approach
-> (`errorFromRecorded`, "DBOS Error <code>: …") was **NOT** re-applied. Section
-> kept for history.
+> **RE-FORK STATUS (2026-07): ONLY PARTLY superseded — `errorFromRecorded` is
+> still needed.** Upstream gob-encodes Go↔Go *workflow* errors, preserving the
+> concrete `*DBOSError` type/Code across replay (`TestGoToGoErrorTypePreservation`).
+> But `Recv`/`GetEvent`/`Sleep` record their *step* error as a plain
+> `err.Error()` string and rebuilt it with `errors.New` on replay, losing the type
+> — fluxos8's golden certificate replay caught a recorded recv `TimeoutError` that
+> the workflow branches on diverging to ERROR. So `errorFromRecorded`
+> ("DBOS Error <code|name>: …" → `*DBOSError`) is restored and used in those three
+> memoized step-error paths. Note: `DBOSError.Error()` now renders the code's
+> **name** (`%s`/`String()`), so `errorFromRecorded` accepts both the numeric
+> (old-fixture) and name (current) forms.
 
 A recorded step/workflow error is rebuilt as a `*DBOSError` with its original
 `Code` on replay, so `errors.As`/code checks behave identically after recovery.
@@ -203,10 +208,10 @@ end the collision permanently — drop & recreate makes this free.
 |---|---|---|
 | `.gitignore` (new) | Additive | ignores `dbos.lock` |
 | `README.md` (+176) | Additive | sections: durable sleep, plain-SQL Postgres, transactional steps |
-| `notes/durable-sleep.md` (new) | Additive | design note |
+| `notes/durable-sleep.md`, `notes/GATES-DESIGN.md` (new) | Additive | design notes |
 | `chaos_tests/CLAUDE.md` (+34) | Additive | session notes |
 | Test helpers | `utils_test.go`, `client_test.go`, `dbos_test.go`, `migration_test.go` | Hot (small) | backend switch (`DBOS_TEST_BACKEND=sqlite`), migration-version asserts |
-| `system_database_deadlock_test.go` (new) | Additive | init-deadlock regression |
+| Init-deadlock fix | `system_database.go` (release the CRDB-detection conn immediately, not via `defer`, before error paths that call `pool.Close()`) + `system_database_deadlock_test.go` | Additive/hot (small) | upstream still holds it via `defer` → NewDBOSContext hangs on a migration failure instead of returning the error |
 
 ---
 

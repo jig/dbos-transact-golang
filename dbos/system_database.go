@@ -842,8 +842,13 @@ func newSystemDatabase(ctx context.Context, inputs newSystemDatabaseInput) (syst
 		}
 		return nil, fmt.Errorf("failed to acquire connection to detect database type: %v", err)
 	}
-	defer conn.Release()
+	// Release the detection connection immediately. The subsequent error paths
+	// may call pool.Close(), which blocks until all acquired connections are
+	// released; holding this connection (e.g. via a deferred Release) would
+	// deadlock NewDBOSContext instead of returning the error (e.g. CREATE SCHEMA
+	// permission denied). Fork fix; upstream still holds it via defer.
 	isCockroach := isCockroachDB(conn.Conn())
+	conn.Release()
 	if isCockroach {
 		logger.Info("Detected CockroachDB")
 	}

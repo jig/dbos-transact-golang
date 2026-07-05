@@ -15,11 +15,23 @@ import (
 // error as a plain string, so upstream's gob type-preservation does not cover
 // them; this restores it. See notes/DIVERGENCES.md §5.
 func errorFromRecorded(s string) error {
-	if rest, ok := strings.CutPrefix(s, "DBOS Error "); ok {
-		if i := strings.Index(rest, ": "); i > 0 {
-			if code, err := strconv.Atoi(rest[:i]); err == nil {
-				return &DBOSError{Code: DBOSErrorCode(code), Message: rest[i+2:]}
-			}
+	rest, ok := strings.CutPrefix(s, "DBOS Error ")
+	if !ok {
+		return errors.New(s)
+	}
+	i := strings.Index(rest, ": ")
+	if i <= 0 {
+		return errors.New(s)
+	}
+	token, msg := rest[:i], rest[i+2:]
+	// DBOSError.Error() renders the code with %s, i.e. its String() name (e.g.
+	// "TimeoutError"); older recordings used the numeric code. Accept both.
+	if code, err := strconv.Atoi(token); err == nil {
+		return &DBOSError{Code: DBOSErrorCode(code), Message: msg}
+	}
+	for c := ConflictingIDError; c <= NoApplicationVersions; c++ {
+		if c.String() == token {
+			return &DBOSError{Code: c, Message: msg}
 		}
 	}
 	return errors.New(s)
