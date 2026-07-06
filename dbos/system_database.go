@@ -100,6 +100,7 @@ type systemDatabase interface {
 	readAllowed(ctx context.Context, workflowID, org, subject string, groups []string) (bool, error)
 	listOpenGatesFor(ctx context.Context, org, subject string, groups []string, limit int) ([]OpenGateRow, error)
 	listDeliveriesBy(ctx context.Context, org, subject string, limit int) ([]DeliveryRow, error)
+	listDeliveriesFor(ctx context.Context, workflowID string, limit int) ([]DeliveryRow, error)
 	listInitiatedBy(ctx context.Context, org, subject string, limit int) ([]string, error)
 	dequeueWorkflows(ctx context.Context, input dequeueWorkflowsInput) ([]dequeuedWorkflow, error)
 	clearQueueAssignment(ctx context.Context, workflowID string) (bool, error)

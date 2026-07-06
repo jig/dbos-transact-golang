@@ -82,6 +82,7 @@ type DeliveryRow struct {
 	DeliveryID string
 	WorkflowID string
 	Gate       string
+	BySubject  string // populated by the per-workflow audit query
 	Outcome    string
 	CreatedAt  time.Time
 }
@@ -97,6 +98,20 @@ func ListDeliveriesBy(ctx DBOSContext, org, subject string, limit int) ([]Delive
 func (c *dbosContext) ListDeliveriesBy(_ DBOSContext, org, subject string, limit int) ([]DeliveryRow, error) {
 	return retryWithResult(c, func() ([]DeliveryRow, error) {
 		return c.systemDB.listDeliveriesBy(c, org, subject, limit)
+	}, withRetrierLogger(c.logger))
+}
+
+// ListDeliveriesFor returns one instance's delivery audit, oldest first.
+func ListDeliveriesFor(ctx DBOSContext, workflowID string, limit int) ([]DeliveryRow, error) {
+	if ctx == nil {
+		return nil, errors.New("ctx cannot be nil")
+	}
+	return ctx.ListDeliveriesFor(ctx, workflowID, limit)
+}
+
+func (c *dbosContext) ListDeliveriesFor(_ DBOSContext, workflowID string, limit int) ([]DeliveryRow, error) {
+	return retryWithResult(c, func() ([]DeliveryRow, error) {
+		return c.systemDB.listDeliveriesFor(c, workflowID, limit)
 	}, withRetrierLogger(c.logger))
 }
 
@@ -235,6 +250,32 @@ func (s *sysDB) listDeliveriesBy(ctx context.Context, org, subject string, limit
 		var r DeliveryRow
 		var created int64
 		if err := rows.Scan(&r.DeliveryID, &r.WorkflowID, &r.Gate, &r.Outcome, &created); err != nil {
+			return nil, err
+		}
+		r.CreatedAt = time.UnixMilli(created).UTC()
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+func (s *sysDB) listDeliveriesFor(ctx context.Context, workflowID string, limit int) ([]DeliveryRow, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	q := s.renderSQL(`SELECT delivery_uuid, workflow_uuid, gate, by_subject, outcome, created_at_epoch_ms
+		FROM %sworkflow_gate_deliveries
+		WHERE workflow_uuid = $1
+		ORDER BY created_at_epoch_ms ASC LIMIT $2`, s.dialect.SchemaPrefix(s.schema))
+	rows, err := s.pool.Query(ctx, q, workflowID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list workflow deliveries: %w", err)
+	}
+	defer rows.Close()
+	var out []DeliveryRow
+	for rows.Next() {
+		var r DeliveryRow
+		var created int64
+		if err := rows.Scan(&r.DeliveryID, &r.WorkflowID, &r.Gate, &r.BySubject, &r.Outcome, &created); err != nil {
 			return nil, err
 		}
 		r.CreatedAt = time.UnixMilli(created).UTC()

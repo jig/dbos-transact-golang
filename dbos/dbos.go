@@ -163,6 +163,7 @@ type DBOSContext interface {
 	ReadAllowed(_ DBOSContext, workflowID, org, subject string, groups []string) (bool, error)              // May the caller see this instance? (read + gate audiences)
 	ListOpenGatesFor(_ DBOSContext, org, subject string, groups []string, limit int) ([]OpenGateRow, error) // Inbox: open gates awaiting the caller
 	ListDeliveriesBy(_ DBOSContext, org, subject string, limit int) ([]DeliveryRow, error)                  // Inbox: caller delivery attempts + outcomes
+	ListDeliveriesFor(_ DBOSContext, workflowID string, limit int) ([]DeliveryRow, error)                   // One instance's delivery audit
 	ListInitiatedBy(_ DBOSContext, org, subject string, limit int) ([]string, error)                        // Inbox: instances the caller started
 	WriteStream(_ DBOSContext, key string, value any, opts ...WriteStreamOption) error                      // Write a value to a durable stream
 	CloseStream(_ DBOSContext, key string) error                                                            // Close a durable stream
