@@ -61,6 +61,7 @@ type systemDatabase interface {
 	// Communication (special steps)
 	send(ctx context.Context, input WorkflowSendInput) error
 	recv(ctx context.Context, input recvInput) (*recvResult, error)
+	promoteApplicationVersion(ctx context.Context, versionName string, nowMs int64) error
 	setEvent(ctx context.Context, input WorkflowSetEventInput) error
 	getEvent(ctx context.Context, input getEventInput) (*getEventResult, error)
 
@@ -5315,6 +5316,28 @@ func (s *sysDB) createApplicationVersion(ctx context.Context, versionName string
 	nowMs := time.Now().UnixMilli()
 	if _, err := s.pool.Exec(ctx, query, uuid.New().String(), versionName, nowMs, nowMs); err != nil {
 		return fmt.Errorf("failed to create application version: %w", err)
+	}
+	return nil
+}
+
+// promoteApplicationVersion makes versionName the latest. A promotion must
+// WIN: getLatest orders by version_timestamp with millisecond resolution, so
+// a bare now() ties with (and can lose to) a version registered in the same
+// millisecond. Clamp to strictly greater than every other version's timestamp.
+func (s *sysDB) promoteApplicationVersion(ctx context.Context, versionName string, nowMs int64) error {
+	query := s.renderSQL(`
+		UPDATE %sapplication_versions
+		SET version_timestamp = (
+			SELECT MAX(ts) FROM (
+				SELECT $1 AS ts
+				UNION ALL
+				SELECT COALESCE(MAX(version_timestamp), 0) + 1 FROM %sapplication_versions WHERE version_name <> $2
+			) candidates
+		)
+		WHERE version_name = $2
+	`, s.dialect.SchemaPrefix(s.schema), s.dialect.SchemaPrefix(s.schema))
+	if _, err := s.pool.Exec(ctx, query, nowMs, versionName); err != nil {
+		return fmt.Errorf("failed to promote application version: %w", err)
 	}
 	return nil
 }

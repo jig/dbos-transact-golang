@@ -135,7 +135,7 @@ func NewDataSource[E Engine](ctx DBOSContext, engine E, opts ...DataSourceOption
 	// needs no durability table: RunAsTransaction collapses onto the single
 	// system transaction (runAsTxn), so skip dialect resolution and table
 	// creation entirely.
-	if sameEngine(ds.pool, c.systemDB.(*sysDB).pool) {
+	if sdb := c.systemDB.concrete(); sdb != nil && sameEngine(ds.pool, sdb.pool) {
 		ds.sameAsSystemDB = true
 		c.logger.Debug("Data source shares the system database; using single-transaction durability", "datasource", ds.name)
 		return ds, nil

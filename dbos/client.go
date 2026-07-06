@@ -330,7 +330,7 @@ func (c *client) Enqueue(queueName, workflowName string, input any, opts ...Enqu
 	returnExisting := params.deduplicationPolicy == DeduplicationPolicyReturnExisting
 
 	for {
-		tx, err := dbosCtx.systemDB.(*sysDB).pool.BeginTx(uncancellableCtx, TxOptions{})
+		tx, err := dbosCtx.systemDB.concrete().pool.BeginTx(uncancellableCtx, TxOptions{})
 		if err != nil {
 			return nil, newWorkflowExecutionError(workflowID, fmt.Errorf("failed to begin transaction: %v", err))
 		}
@@ -784,7 +784,7 @@ func (c *client) ApplySchedules(schedules []ClientScheduleInput) error {
 		return errors.New("invalid DBOS context")
 	}
 
-	tx, err := dbosCtx.systemDB.(*sysDB).pool.BeginTx(dbosCtx, TxOptions{})
+	tx, err := dbosCtx.systemDB.concrete().pool.BeginTx(dbosCtx, TxOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}

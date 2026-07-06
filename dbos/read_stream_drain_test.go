@@ -17,6 +17,10 @@ type fakeStreamDB struct {
 	reads int
 }
 
+// concrete: this facade embeds a nil systemDatabase, so the promoted method
+// would nil-panic; runtime code treats a nil *sysDB as "not the real engine".
+func (f *fakeStreamDB) concrete() *sysDB { return nil }
+
 func (f *fakeStreamDB) readStream(_ context.Context, _ readStreamDBInput) ([]streamEntry, bool, error) {
 	f.reads++
 	if f.reads == 1 {

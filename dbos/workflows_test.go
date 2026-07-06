@@ -4496,13 +4496,27 @@ func TestWorkflowTimeout(t *testing.T) {
 		res, err := RunAsStep(stepCtx, func(context context.Context) (string, error) {
 			return detachedStep(context, timeout*2)
 		})
-		require.NoError(t, err, "failed to run detached step")
-		assert.Equal(t, "detached-step-completed", res, "expected detached step result to be 'detached-step-completed'")
+		// Surface failures as workflow errors, never require/FailNow here: this
+		// closure runs on the workflow outcome goroutine, and FailNow's Goexit
+		// would skip the outcome-channel send — hanging the caller's GetResult
+		// (and the suite) instead of failing the test.
+		if err != nil {
+			return "", fmt.Errorf("detached step: %w", err)
+		}
+		if res != "detached-step-completed" {
+			return "", fmt.Errorf("unexpected detached step result %q", res)
+		}
 		return res, ctx.Err()
 	}
 	RegisterWorkflow(dbosCtx, detachedStepWorkflow)
 
 	t.Run("DetachedStepWorkflow", func(t *testing.T) {
+		// The timeout must fire while the (2x input) step runs, but late enough
+		// that the step has reliably STARTED first: if the durable deadline
+		// cancels the workflow in the database before the step passes
+		// checkOperationExecution, the step is refused with "workflow was
+		// cancelled" and the detached-step contract never comes into play
+		// (with 1ms it was a coin flip under load).
 		// Start a workflow that runs a detached (uncancelable) step.
 		// A detached step only ignores *context* cancellation; its start is still
 		// gated by checkOperationExecution, which refuses the step if the workflow
@@ -4547,7 +4561,7 @@ func TestWorkflowTimeout(t *testing.T) {
 
 	t.Run("ChildWorkflowTimesout", func(t *testing.T) {
 		// Start a parent workflow that runs a child workflow that waits indefinitely
-		cancelCtx, cancelFunc := WithTimeout(dbosCtx, 1*time.Millisecond)
+		cancelCtx, cancelFunc := WithTimeout(dbosCtx, 200*time.Millisecond)
 		defer cancelFunc() // Ensure we clean up the context
 
 		childWorkflowID := "child-wait-for-cancel-" + uuid.NewString()

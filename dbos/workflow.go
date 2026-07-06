@@ -1417,7 +1417,7 @@ func (c *dbosContext) RunWorkflow(_ DBOSContext, fn WorkflowFunc, input any, opt
 
 	// Init status and record child workflow relationship in a single transaction
 	insertWorkflowStatusTx := func() error {
-		tx, err := c.systemDB.(*sysDB).pool.BeginTx(uncancellableCtx, TxOptions{})
+		tx, err := c.systemDB.concrete().pool.BeginTx(uncancellableCtx, TxOptions{})
 		if err != nil {
 			return newWorkflowExecutionError(workflowID, fmt.Errorf("failed to begin transaction: %w", err))
 		}
@@ -2207,7 +2207,7 @@ func (c *dbosContext) runAsTxn(_ DBOSContext, fn TxnFunc, opts ...StepOption) (a
 			txOpts.IsoLevel = *prep.StepOpts.txIsoLevel
 		}
 		uncancellableCtx := WithoutCancel(c)
-		tx, err := c.systemDB.(*sysDB).pool.BeginTx(uncancellableCtx, txOpts)
+		tx, err := c.systemDB.concrete().pool.BeginTx(uncancellableCtx, txOpts)
 		if err != nil {
 			return nil, newStepExecutionError(prep.WorkflowID, prep.StepOpts.stepName, fmt.Errorf("failed to begin transaction: %w", err))
 		}
@@ -2226,7 +2226,7 @@ func (c *dbosContext) runAsTxn(_ DBOSContext, fn TxnFunc, opts ...StepOption) (a
 	stepState := prep.StepState
 	stepState.isWithinTransaction = true
 	stepOpts := prep.StepOpts
-	pool := c.systemDB.(*sysDB).pool
+	pool := c.systemDB.concrete().pool
 	stepCtx := WithValue(c, workflowStateKey, stepState)
 	stepStartTime := time.Now()
 
@@ -2682,7 +2682,7 @@ func (c *dbosContext) Recv(_ DBOSContext, topic string, timeout time.Duration) (
 		input.suspendThreshold = c.config.DurableSleepThreshold
 	}
 	recvRetryOpts := []retryOption{withRetrierLogger(c.logger)}
-	if sysDB, ok := c.systemDB.(*sysDB); ok && sysDB.isCockroachDB {
+	if sysDB := c.systemDB.concrete(); sysDB != nil && sysDB.isCockroachDB {
 		recvRetryOpts = append(recvRetryOpts, withRetryCondition(cockroachDialect{}.IsRetryableTransaction))
 	}
 	result, err := retryWithResult(c, func() (*recvResult, error) {
@@ -3074,7 +3074,7 @@ func (c *dbosContext) readStream(workflowID string, key string, snapshot bool, f
 		// remains the fallback: workflow completion fires no stream notification,
 		// and polling backends never signal (wakeCh stays nil there).
 		var wakeCh chan struct{}
-		if sysdb, ok := c.systemDB.(*sysDB); ok {
+		if sysdb := c.systemDB.concrete(); sysdb != nil {
 			payload := fmt.Sprintf("%s::%s", workflowID, key)
 			ch, _ := sysdb.streamsMap.LoadOrStore(payload, make(chan struct{}, 1))
 			wakeCh = ch.(chan struct{})
@@ -5240,7 +5240,7 @@ func (c *dbosContext) ApplySchedules(_ DBOSContext, schedules []ApplySchedulesRe
 	}
 
 	return retry(c, func() error {
-		tx, err := c.systemDB.(*sysDB).pool.BeginTx(c, TxOptions{})
+		tx, err := c.systemDB.concrete().pool.BeginTx(c, TxOptions{})
 		if err != nil {
 			return fmt.Errorf("failed to begin transaction: %w", err)
 		}
@@ -5641,7 +5641,7 @@ func (c *dbosContext) SetLatestApplicationVersion(_ DBOSContext, versionName str
 		return errors.New("version_name is required")
 	}
 	return retry(c, func() error {
-		return c.systemDB.updateApplicationVersionTimestamp(c, versionName, time.Now().UnixMilli())
+		return c.systemDB.promoteApplicationVersion(c, versionName, time.Now().UnixMilli())
 	}, withRetrierLogger(c.logger))
 }
 
