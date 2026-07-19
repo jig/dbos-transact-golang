@@ -6,7 +6,7 @@
 -- audit rows carrying an outcome (delivered / rejected-closed /
 -- rejected-audience / ignored).
 
-CREATE TABLE %s.workflow_gates (
+CREATE TABLE IF NOT EXISTS %s.workflow_gates (
     workflow_uuid       TEXT NOT NULL,
     gate                TEXT NOT NULL,
     org                 TEXT,
@@ -19,9 +19,9 @@ CREATE TABLE %s.workflow_gates (
     FOREIGN KEY (workflow_uuid) REFERENCES %s.workflow_status (workflow_uuid)
         ON UPDATE CASCADE ON DELETE CASCADE
 );
-CREATE INDEX idx_workflow_gates_open ON %s.workflow_gates (org) WHERE open;
+CREATE INDEX IF NOT EXISTS idx_workflow_gates_open ON %s.workflow_gates (org) WHERE open;
 
-CREATE TABLE %s.workflow_gate_audience (
+CREATE TABLE IF NOT EXISTS %s.workflow_gate_audience (
     workflow_uuid  TEXT NOT NULL,
     gate           TEXT NOT NULL,
     principal_type TEXT NOT NULL,
@@ -31,9 +31,9 @@ CREATE TABLE %s.workflow_gate_audience (
     FOREIGN KEY (workflow_uuid, gate) REFERENCES %s.workflow_gates (workflow_uuid, gate)
         ON UPDATE CASCADE ON DELETE CASCADE
 );
-CREATE INDEX idx_gate_audience_principal ON %s.workflow_gate_audience (org, principal_type, principal);
+CREATE INDEX IF NOT EXISTS idx_gate_audience_principal ON %s.workflow_gate_audience (org, principal_type, principal);
 
-CREATE TABLE %s.workflow_gate_deliveries (
+CREATE TABLE IF NOT EXISTS %s.workflow_gate_deliveries (
     delivery_uuid       TEXT PRIMARY KEY,
     workflow_uuid       TEXT NOT NULL,
     gate                TEXT NOT NULL,
@@ -47,4 +47,4 @@ CREATE TABLE %s.workflow_gate_deliveries (
     FOREIGN KEY (workflow_uuid) REFERENCES %s.workflow_status (workflow_uuid)
         ON UPDATE CASCADE ON DELETE CASCADE
 );
-CREATE INDEX idx_gate_deliveries_by ON %s.workflow_gate_deliveries (by_org, by_subject, created_at_epoch_ms);
+CREATE INDEX IF NOT EXISTS idx_gate_deliveries_by ON %s.workflow_gate_deliveries (by_org, by_subject, created_at_epoch_ms);

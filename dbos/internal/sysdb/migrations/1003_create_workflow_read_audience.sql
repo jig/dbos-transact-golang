@@ -4,7 +4,7 @@
 -- The read check is the union of these rows with the instance's gate-audience
 -- rows (whoever may act must be able to see).
 
-CREATE TABLE %s.workflow_read_audience (
+CREATE TABLE IF NOT EXISTS %s.workflow_read_audience (
     workflow_uuid  TEXT NOT NULL,
     principal_type TEXT NOT NULL,
     principal      TEXT NOT NULL,
@@ -13,4 +13,4 @@ CREATE TABLE %s.workflow_read_audience (
     FOREIGN KEY (workflow_uuid) REFERENCES %s.workflow_status (workflow_uuid)
         ON UPDATE CASCADE ON DELETE CASCADE
 );
-CREATE INDEX idx_read_audience_principal ON %s.workflow_read_audience (org, principal_type, principal);
+CREATE INDEX IF NOT EXISTS idx_read_audience_principal ON %s.workflow_read_audience (org, principal_type, principal);
