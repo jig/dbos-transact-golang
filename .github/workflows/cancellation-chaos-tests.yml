@@ -1,13 +1,12 @@
-name: Run Chaos Tests
+name: Run Cancellation Chaos Tests
 on:
     schedule:
-        # Runs every 3 hours on the hour
-        - cron: '0 */3 * * *'
+        # Runs every 3 hours on the half hour
+        - cron: '30 */3 * * *'
     push:
       branches:
         - main
     pull_request:
-      branches:
       types:
         - ready_for_review
         - opened
@@ -16,9 +15,9 @@ on:
     workflow_dispatch:
 
 jobs:
-  chaos-test:
+  cancellation-chaos-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
     - uses: actions/checkout@v5
       with:
@@ -33,11 +32,8 @@ jobs:
     - name: Download dependencies
       run: go mod download
 
-    - name: Install gotestsum
-      run: go install gotest.tools/gotestsum@latest
-
-    - name: Run chaos tests
-      run: go vet ./... && go test -v -race -timeout 60m -count=1 -skip 'TestCancellationChaos' ./...
+    - name: Run cancellation chaos tests
+      run: go vet ./... && go test -v -race -timeout 30m -count=1 -run 'TestCancellationChaos' ./...
       working-directory: ./chaos_tests
       env:
         PGPASSWORD: a!b@c$d()e*_,/:;=?@ff[]22

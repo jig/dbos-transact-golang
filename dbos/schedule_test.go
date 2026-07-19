@@ -1,9 +1,13 @@
 package dbos
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/jig/dbos-transact-golang/dbos/internal/models"
+	"github.com/jig/dbos-transact-golang/dbos/internal/sysdb"
 
 	"github.com/robfig/cron/v3"
 	"github.com/stretchr/testify/require"
@@ -139,7 +143,7 @@ func TestScheduleCRUD(t *testing.T) {
 				}
 			}
 			require.NotNil(t, found, "schedule %s should be listed", want)
-			require.Equal(t, _DBOS_INTERNAL_QUEUE_NAME, found.QueueName, "schedule %s should default to the internal queue", want)
+			require.Equal(t, models.InternalQueueName, found.QueueName, "schedule %s should default to the internal queue", want)
 		}
 
 		// Filter by status
@@ -298,6 +302,12 @@ func TestApplySchedules(t *testing.T) {
 		return err == nil && len(wfs) > 0
 	}, 5*time.Second, 100*time.Millisecond, "toKeep should enqueue on queueA before re-apply")
 
+	// Snapshot schedule_id: re-apply must update definition in place, not replace the row.
+	beforeKeep, err := GetSchedule(dbosCtx, toKeep)
+	require.NoError(t, err)
+	require.NotNil(t, beforeKeep)
+	keepScheduleID := beforeKeep.ScheduleID
+
 	// Round 2: pause one, delete one, re-apply the third to change its queue.
 	require.NoError(t, PauseSchedule(dbosCtx, toPause))
 	require.NoError(t, DeleteSchedule(dbosCtx, toDrop))
@@ -320,11 +330,12 @@ func TestApplySchedules(t *testing.T) {
 	require.Eventually(t, func() bool { return !hasEntry(toDrop) },
 		3*time.Second, 50*time.Millisecond, "reconciler should drop the cron entry for deleted %s", toDrop)
 
-	// Kept: still active, cron entry installed, and queue was updated to queueB.
+	// Kept: still active, same schedule_id, cron entry installed, queue updated to queueB.
 	kept, err := GetSchedule(dbosCtx, toKeep)
 	require.NoError(t, err)
 	require.NotNil(t, kept)
 	require.Equal(t, ScheduleStatusActive, kept.Status)
+	require.Equal(t, keepScheduleID, kept.ScheduleID, "upsert must preserve schedule_id on re-apply")
 	require.Equal(t, queueB.Name, kept.QueueName)
 	require.Eventually(t, func() bool { return hasEntry(toKeep) },
 		3*time.Second, 50*time.Millisecond, "re-applied toKeep should have a cron entry")
@@ -342,6 +353,225 @@ func TestApplySchedules(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, active, 1)
 	require.Equal(t, toKeep, active[0].ScheduleName)
+}
+
+// TestApplySchedulesConcurrent checks that concurrent ApplySchedules of the same
+// name are idempotent (upsert): one row, no error, and re-apply preserves schedule_id.
+func TestApplySchedulesConcurrent(t *testing.T) {
+	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true, schedulerPollingInterval: 100 * time.Millisecond})
+	defer dbosCtx.Shutdown(10 * time.Second)
+
+	RegisterWorkflow(dbosCtx, testWorkflowForSchedule)
+	require.NoError(t, dbosCtx.Launch())
+
+	const (
+		name       = "shared-schedule"
+		numWorkers = 8
+	)
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	errs := make(chan error, numWorkers)
+
+	for range numWorkers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			errs <- ApplySchedules(dbosCtx, []ApplySchedulesRequest{
+				{
+					ScheduleName: name,
+					WorkflowFn:   testWorkflowForSchedule,
+					Schedule:     "0 0 * * * *",
+					Context:      map[string]any{"region": "us"},
+				},
+			})
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+
+	schedules, err := ListSchedules(dbosCtx, WithScheduleNamePrefixes(name))
+	require.NoError(t, err)
+	require.Len(t, schedules, 1)
+	require.Equal(t, name, schedules[0].ScheduleName)
+	require.Equal(t, "0 0 * * * *", schedules[0].Schedule)
+	require.Equal(t, map[string]any{"region": "us"}, schedules[0].Context)
+	scheduleID := schedules[0].ScheduleID
+
+	// Re-applying updates definition in place and preserves schedule_id.
+	require.NoError(t, ApplySchedules(dbosCtx, []ApplySchedulesRequest{
+		{
+			ScheduleName: name,
+			WorkflowFn:   testWorkflowForSchedule,
+			Schedule:     "0 0 0 * * *",
+			Context:      map[string]any{"region": "eu"},
+		},
+	}))
+	schedules, err = ListSchedules(dbosCtx, WithScheduleNamePrefixes(name))
+	require.NoError(t, err)
+	require.Len(t, schedules, 1)
+	require.Equal(t, scheduleID, schedules[0].ScheduleID)
+	require.Equal(t, "0 0 0 * * *", schedules[0].Schedule)
+	require.Equal(t, map[string]any{"region": "eu"}, schedules[0].Context)
+
+	require.NoError(t, DeleteSchedule(dbosCtx, name))
+	schedules, err = ListSchedules(dbosCtx, WithScheduleNamePrefixes(name))
+	require.NoError(t, err)
+	require.Empty(t, schedules)
+}
+
+// TestApplySchedulesLiveUpdate verifies that re-applying a changed definition is
+// picked up by the reconciler (signature change → restart) and new context is used.
+func TestApplySchedulesLiveUpdate(t *testing.T) {
+	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true, schedulerPollingInterval: 100 * time.Millisecond})
+	defer dbosCtx.Shutdown(10 * time.Second)
+
+	resetLiveUpdateVersionCounts()
+	RegisterWorkflow(dbosCtx, testLiveUpdateScheduledWorkflow)
+	require.NoError(t, dbosCtx.Launch())
+
+	const name = "live-update"
+	require.NoError(t, ApplySchedules(dbosCtx, []ApplySchedulesRequest{
+		{
+			ScheduleName: name,
+			WorkflowFn:   testLiveUpdateScheduledWorkflow,
+			Schedule:     "*/1 * * * * *",
+			Context:      map[string]any{"version": 1},
+		},
+	}))
+	t.Cleanup(func() { _ = DeleteSchedule(dbosCtx, name) })
+
+	before, err := GetSchedule(dbosCtx, name)
+	require.NoError(t, err)
+	require.NotNil(t, before)
+
+	require.Eventually(t, func() bool {
+		return liveUpdateVersionCount(1) >= 1
+	}, 10*time.Second, 100*time.Millisecond, "schedule should fire with context version 1")
+
+	require.NoError(t, ApplySchedules(dbosCtx, []ApplySchedulesRequest{
+		{
+			ScheduleName: name,
+			WorkflowFn:   testLiveUpdateScheduledWorkflow,
+			Schedule:     "*/1 * * * * *",
+			Context:      map[string]any{"version": 2},
+		},
+	}))
+
+	after, err := GetSchedule(dbosCtx, name)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	require.Equal(t, before.ScheduleID, after.ScheduleID, "live update must preserve schedule_id")
+
+	// Reconciler should restart the entry and fire with the new context.
+	// Version 2 fires can only come from the re-applied definition.
+	require.Eventually(t, func() bool {
+		return liveUpdateVersionCount(2) >= 2
+	}, 10*time.Second, 100*time.Millisecond, "re-applied schedule should fire with context version 2")
+}
+
+// TestApplySchedulesPreservesRuntimeState checks that re-apply updates definition
+// fields without clobbering status or last_fired_at.
+func TestApplySchedulesPreservesRuntimeState(t *testing.T) {
+	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true, schedulerPollingInterval: 100 * time.Millisecond})
+	defer dbosCtx.Shutdown(10 * time.Second)
+
+	RegisterWorkflow(dbosCtx, testWorkflowForSchedule)
+	// No Launch needed: this test only exercises the DB upsert path.
+	c := dbosCtx.(*dbosContext)
+
+	const name = "state-keep"
+	require.NoError(t, ApplySchedules(dbosCtx, []ApplySchedulesRequest{
+		{
+			ScheduleName: name,
+			WorkflowFn:   testWorkflowForSchedule,
+			Schedule:     "0 0 0 * * *", // rare fire
+			Context:      map[string]any{"version": 1},
+		},
+	}))
+	t.Cleanup(func() { _ = DeleteSchedule(dbosCtx, name) })
+
+	require.NoError(t, PauseSchedule(dbosCtx, name))
+	lastFired := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	require.NoError(t, c.systemDB.UpdateScheduleLastFiredAt(c, name, lastFired))
+
+	require.NoError(t, ApplySchedules(dbosCtx, []ApplySchedulesRequest{
+		{
+			ScheduleName: name,
+			WorkflowFn:   testWorkflowForSchedule,
+			Schedule:     "0 0 0 * * *",
+			Context:      map[string]any{"version": 2},
+		},
+	}))
+
+	sched, err := GetSchedule(dbosCtx, name)
+	require.NoError(t, err)
+	require.NotNil(t, sched)
+	require.Equal(t, ScheduleStatusPaused, sched.Status, "status must be preserved")
+	require.NotNil(t, sched.LastFiredAt)
+	require.True(t, sched.LastFiredAt.Equal(lastFired), "last_fired_at must be preserved, got %v", sched.LastFiredAt)
+	require.Equal(t, map[string]any{"version": float64(2)}, sched.Context, "definition context must still update")
+}
+
+// TestCalculateScheduleSignature ensures definition fields affect the signature
+// and identity/lifecycle/runtime fields do not.
+func TestCalculateScheduleSignature(t *testing.T) {
+	c := &dbosContext{}
+	base := WorkflowSchedule{
+		ScheduleID:        "id-1",
+		ScheduleName:      "sig",
+		WorkflowName:      "wf",
+		WorkflowClassName: "",
+		Schedule:          "* * * * *",
+		Status:            ScheduleStatusActive,
+		Context:           "ctx",
+		LastFiredAt:       nil,
+		AutomaticBackfill: false,
+		CronTimezone:      "",
+		QueueName:         "",
+	}
+	sig := c.calculateSignature(base)
+
+	// Identity / lifecycle / runtime fields must NOT change the signature.
+	lastFired := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	unchanged := []WorkflowSchedule{
+		{ScheduleID: "id-2", ScheduleName: base.ScheduleName, WorkflowName: base.WorkflowName, Schedule: base.Schedule, Status: base.Status, Context: base.Context},
+		{ScheduleID: base.ScheduleID, ScheduleName: "other-name", WorkflowName: base.WorkflowName, Schedule: base.Schedule, Status: base.Status, Context: base.Context},
+		{ScheduleID: base.ScheduleID, ScheduleName: base.ScheduleName, WorkflowName: base.WorkflowName, Schedule: base.Schedule, Status: ScheduleStatusPaused, Context: base.Context},
+		{ScheduleID: base.ScheduleID, ScheduleName: base.ScheduleName, WorkflowName: base.WorkflowName, Schedule: base.Schedule, Status: base.Status, Context: base.Context, LastFiredAt: &lastFired},
+		{ScheduleID: base.ScheduleID, ScheduleName: base.ScheduleName, WorkflowName: base.WorkflowName, Schedule: base.Schedule, Status: base.Status, Context: base.Context, AutomaticBackfill: true},
+	}
+	for i, s := range unchanged {
+		got := c.calculateSignature(s)
+		require.Equal(t, sig, got, "case %d should not change signature", i)
+	}
+
+	// Structurally equal map contexts must produce equal signatures
+	// (encoding/json marshals map keys in sorted order).
+	mapA := base
+	mapA.Context = map[string]any{"a": float64(1), "b": "x"}
+	mapB := base
+	mapB.Context = map[string]any{"b": "x", "a": float64(1)}
+	require.Equal(t, c.calculateSignature(mapA), c.calculateSignature(mapB))
+
+	// Definition fields MUST change the signature.
+	changed := []WorkflowSchedule{
+		{WorkflowName: "wf2", Schedule: base.Schedule, Context: base.Context},
+		{WorkflowName: base.WorkflowName, WorkflowClassName: "SomeClass", Schedule: base.Schedule, Context: base.Context},
+		{WorkflowName: base.WorkflowName, Schedule: "0 * * * *", Context: base.Context},
+		{WorkflowName: base.WorkflowName, Schedule: base.Schedule, Context: "ctx2"},
+		{WorkflowName: base.WorkflowName, Schedule: base.Schedule, Context: base.Context, CronTimezone: "America/Los_Angeles"},
+		{WorkflowName: base.WorkflowName, Schedule: base.Schedule, Context: base.Context, QueueName: "q"},
+	}
+	for i, s := range changed {
+		got := c.calculateSignature(s)
+		require.NotEqual(t, sig, got, "case %d should change signature", i)
+	}
 }
 
 func TestApplySchedulesInvalidSignature(t *testing.T) {
@@ -488,7 +718,7 @@ func TestBackfillScheduleRecovery(t *testing.T) {
 	start := time.Now().Add(-5 * time.Second).Truncate(time.Second)
 	end := time.Now()
 	c := dbosCtx.(*dbosContext)
-	ids, err := c.systemDB.backfillSchedule(c, backfillScheduleDBInput{
+	ids, err := c.systemDB.BackfillSchedule(c, sysdb.BackfillScheduleDBInput{
 		ScheduleName: scheduleName,
 		Schedule:     "*/1 * * * * *",
 		StartTime:    start,
@@ -572,6 +802,47 @@ func TestTriggerSchedule(t *testing.T) {
 	require.Equal(t, ctxValue, got.Context, "Context should match the schedule's configured context")
 	require.False(t, got.ScheduledTime.Before(beforeTrigger.Add(-time.Second)), "ScheduledTime should be at or after the trigger call")
 	require.False(t, got.ScheduledTime.After(afterTrigger.Add(time.Second)), "ScheduledTime should be at or before the trigger call returns")
+
+	// A second schedule sharing the same workflow function: ScheduleName is what
+	// distinguishes their runs, since both have the same workflow name.
+	err = CreateSchedule(dbosCtx, testCapturingScheduledWorkflow, CreateScheduleRequest{
+		ScheduleName: "trigger-schedule-b",
+		Schedule:     "0 0 * * * *",
+	}, WithScheduleContext(ctxValue))
+	require.NoError(t, err)
+	handleB, err := TriggerSchedule(dbosCtx, "trigger-schedule-b")
+	require.NoError(t, err)
+	_, err = handleB.GetResult()
+	require.NoError(t, err)
+
+	// Filter by a single schedule name: contains that schedule's run, tagged with
+	// its name, and excludes the other schedule's run. (Assert on membership, not
+	// exact counts, so a cron tick firing mid-test cannot flake the assertions.)
+	runsA, err := ListWorkflows(dbosCtx, WithFilterScheduleName("trigger-schedule"))
+	require.NoError(t, err)
+	idsA := make(map[string]bool, len(runsA))
+	for _, wf := range runsA {
+		require.Equal(t, "trigger-schedule", wf.ScheduleName)
+		idsA[wf.ID] = true
+	}
+	require.True(t, idsA[workflowID], "triggered run should match its schedule name filter")
+	require.False(t, idsA[handleB.GetWorkflowID()], "other schedule's run must not match")
+
+	// Filter by a list of schedule names matches runs from both.
+	runsBoth, err := ListWorkflows(dbosCtx, WithFilterScheduleName("trigger-schedule", "trigger-schedule-b"))
+	require.NoError(t, err)
+	idsBoth := make(map[string]bool, len(runsBoth))
+	for _, wf := range runsBoth {
+		require.Contains(t, []string{"trigger-schedule", "trigger-schedule-b"}, wf.ScheduleName)
+		idsBoth[wf.ID] = true
+	}
+	require.True(t, idsBoth[workflowID])
+	require.True(t, idsBoth[handleB.GetWorkflowID()])
+
+	// A schedule name that produced no runs returns nothing.
+	neverFired, err := ListWorkflows(dbosCtx, WithFilterScheduleName("never-fired"))
+	require.NoError(t, err)
+	require.Empty(t, neverFired)
 }
 
 func TestScheduleWithOptions(t *testing.T) {
@@ -608,6 +879,36 @@ func testWorkflowForScheduleCustomName(ctx DBOSContext, input ScheduledWorkflowI
 }
 
 var scheduledInputCapture sync.Map
+
+// liveUpdateVersionCounts counts fires of testLiveUpdateScheduledWorkflow by the
+// "version" value in the schedule context.
+var (
+	liveUpdateMu            sync.Mutex
+	liveUpdateVersionCounts = map[float64]int{}
+)
+
+func resetLiveUpdateVersionCounts() {
+	liveUpdateMu.Lock()
+	liveUpdateVersionCounts = map[float64]int{}
+	liveUpdateMu.Unlock()
+}
+
+func liveUpdateVersionCount(version float64) int {
+	liveUpdateMu.Lock()
+	defer liveUpdateMu.Unlock()
+	return liveUpdateVersionCounts[version]
+}
+
+func testLiveUpdateScheduledWorkflow(ctx DBOSContext, input ScheduledWorkflowInput) (any, error) {
+	if m, ok := input.Context.(map[string]any); ok {
+		if v, ok := m["version"].(float64); ok {
+			liveUpdateMu.Lock()
+			liveUpdateVersionCounts[v]++
+			liveUpdateMu.Unlock()
+		}
+	}
+	return "completed", nil
+}
 
 func testCapturingScheduledWorkflow(ctx DBOSContext, input ScheduledWorkflowInput) (any, error) {
 	wfID, _ := GetWorkflowID(ctx)
@@ -786,4 +1087,94 @@ func TestScheduleCronTimezone(t *testing.T) {
 	require.Equal(t, 2025, next.Year())
 	require.Equal(t, time.January, next.Month())
 	require.Equal(t, 15, next.Day())
+}
+
+func TestScheduleNameSurvivesExportImport(t *testing.T) {
+	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true, schedulerPollingInterval: 100 * time.Millisecond})
+	defer dbosCtx.Shutdown(10 * time.Second)
+
+	RegisterWorkflow(dbosCtx, testWorkflowForSchedule)
+	require.NoError(t, dbosCtx.Launch())
+
+	require.NoError(t, CreateSchedule(dbosCtx, testWorkflowForSchedule, CreateScheduleRequest{
+		ScheduleName: "export-test",
+		Schedule:     "0 0 0 * * *", // daily, won't fire during the test
+	}))
+	t.Cleanup(func() { _ = DeleteSchedule(dbosCtx, "export-test") })
+
+	handle, err := TriggerSchedule(dbosCtx, "export-test")
+	require.NoError(t, err)
+	_, err = handle.GetResult()
+	require.NoError(t, err)
+	workflowID := handle.GetWorkflowID()
+
+	original, err := ListWorkflows(dbosCtx, WithWorkflowIDs([]string{workflowID}))
+	require.NoError(t, err)
+	require.Len(t, original, 1)
+	require.Equal(t, "export-test", original[0].ScheduleName)
+
+	// Export, delete, then reimport: schedule_name must survive the round-trip.
+	sdb := dbosCtx.(*dbosContext).systemDB.(*sysdb.SysDB)
+	exported, err := sdb.ExportWorkflow(dbosCtx, workflowID, true)
+	require.NoError(t, err)
+	require.NoError(t, DeleteWorkflows(dbosCtx, []string{workflowID}))
+	gone, err := ListWorkflows(dbosCtx, WithWorkflowIDs([]string{workflowID}))
+	require.NoError(t, err)
+	require.Empty(t, gone)
+
+	require.NoError(t, sdb.ImportWorkflow(dbosCtx, exported))
+	imported, err := ListWorkflows(dbosCtx, WithWorkflowIDs([]string{workflowID}))
+	require.NoError(t, err)
+	require.Len(t, imported, 1)
+	require.Equal(t, "export-test", imported[0].ScheduleName)
+
+	// The reimported run is still found by the schedule name filter.
+	byName, err := ListWorkflows(dbosCtx, WithFilterScheduleName("export-test"))
+	require.NoError(t, err)
+	require.Len(t, byName, 1)
+	require.Equal(t, workflowID, byName[0].ID)
+}
+
+// A schedule can fire on an executor that does not have the target workflow
+// registered: the tick enqueues by name and name resolution happens at dequeue
+// time on a worker that has the function.
+func TestScheduleFiresWithoutLocalRegistration(t *testing.T) {
+	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true, schedulerPollingInterval: 100 * time.Millisecond})
+	defer dbosCtx.Shutdown(10 * time.Second)
+	require.NoError(t, dbosCtx.Launch())
+
+	client, err := NewClient(context.Background(), ClientConfig{DatabaseURL: backendDatabaseURL(t)})
+	require.NoError(t, err)
+	t.Cleanup(func() { client.Shutdown(30 * time.Second) })
+
+	const scheduleName = "unregistered-workflow-schedule"
+	const workflowName = "workflowRegisteredOnAnotherWorker"
+	const queueName = "queue-listened-elsewhere"
+	require.NoError(t, client.CreateSchedule(ClientScheduleInput{
+		ScheduleName: scheduleName,
+		WorkflowName: workflowName,
+		Schedule:     "*/1 * * * * *",
+		QueueName:    queueName,
+	}))
+	t.Cleanup(func() { _ = client.DeleteSchedule(scheduleName) })
+
+	var enqueued WorkflowStatus
+	require.Eventually(t, func() bool {
+		wfs, err := ListWorkflows(dbosCtx, WithWorkflowIDPrefix("sched-"+scheduleName+"-"))
+		if err != nil || len(wfs) == 0 {
+			return false
+		}
+		enqueued = wfs[0]
+		return true
+	}, 15*time.Second, 100*time.Millisecond, "tick should enqueue even though the workflow is not registered locally")
+
+	require.Equal(t, workflowName, enqueued.Name)
+	require.Equal(t, queueName, enqueued.QueueName)
+	require.Equal(t, scheduleName, enqueued.ScheduleName)
+	require.Equal(t, WorkflowStatusEnqueued, enqueued.Status)
+
+	sched, err := client.GetSchedule(scheduleName)
+	require.NoError(t, err)
+	require.NotNil(t, sched)
+	require.NotNil(t, sched.LastFiredAt, "last_fired_at should be updated after the tick")
 }

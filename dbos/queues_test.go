@@ -14,6 +14,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jig/dbos-transact-golang/dbos/internal/models"
+	"github.com/jig/dbos-transact-golang/dbos/internal/sysdb"
+
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -988,9 +991,9 @@ func TestVersionlessDequeueRequiresLatestVersion(t *testing.T) {
 
 	// Register a newer application version and make it the latest, so this worker is no
 	// longer running the latest version (simulating a rolling deploy).
-	sysdb := serverCtx.(*dbosContext).systemDB.(*sysDB)
-	require.NoError(t, sysdb.createApplicationVersion(context.Background(), "versionless-newer"))
-	require.NoError(t, sysdb.updateApplicationVersionTimestamp(context.Background(), "versionless-newer", time.Now().Add(time.Hour).UnixMilli()))
+	sysdb := serverCtx.(*dbosContext).systemDB.(*sysdb.SysDB)
+	require.NoError(t, sysdb.CreateApplicationVersion(context.Background(), "versionless-newer"))
+	require.NoError(t, sysdb.UpdateApplicationVersionTimestamp(context.Background(), "versionless-newer", time.Now().Add(time.Hour).UnixMilli()))
 
 	// Enqueue a version-less workflow: an empty application version is persisted as NULL.
 	versionlessHandle, err := Enqueue[string, string](client, queue.Name, "VersionlessWorkflow", "versionless",
@@ -1016,7 +1019,7 @@ func TestVersionlessDequeueRequiresLatestVersion(t *testing.T) {
 		"version-less workflow must stay ENQUEUED while this worker is not the latest version")
 
 	// Promote this worker's version back to the latest.
-	require.NoError(t, sysdb.updateApplicationVersionTimestamp(context.Background(), currentVersion, time.Now().Add(2*time.Hour).UnixMilli()))
+	require.NoError(t, sysdb.UpdateApplicationVersionTimestamp(context.Background(), currentVersion, time.Now().Add(2*time.Hour).UnixMilli()))
 
 	// Now that this worker is the latest again, the version-less workflow is dequeued and completes.
 	versionlessResult, err := versionlessHandle.GetResult()
@@ -1053,8 +1056,8 @@ func TestWorkerConcurrency(t *testing.T) {
 
 	// Helper function to check the status of workflows in the queue
 	checkWorkflowStatus := func(t *testing.T, expectedPendingPerExecutor, expectedEnqueued int) {
-		workflows, err := dbosCtx1.(*dbosContext).systemDB.listWorkflows(context.Background(), listWorkflowsDBInput{
-			queueName: []string{workerConcurrencyQueue.Name},
+		workflows, err := dbosCtx1.(*dbosContext).systemDB.ListWorkflows(context.Background(), sysdb.ListWorkflowsDBInput{
+			QueueName: []string{workerConcurrencyQueue.Name},
 		})
 		require.NoError(t, err, "failed to list workflows")
 
@@ -1388,8 +1391,11 @@ func TestQueueTimeouts(t *testing.T) {
 	})
 
 	t.Run("EnqueueWorkflowThatEnqueuesADetachedWorkflow", func(t *testing.T) {
-		// Start a workflow that enqueues another workflow that is not cancelable
-		timeout := 100 * time.Millisecond
+		// Start a workflow that enqueues another workflow that is not cancelable.
+		// The timeout must be long enough for the parent to enqueue the child and
+		// start its getResult step (both DB roundtrips) before the deadline fires,
+		// or the getResult pre-check sees the parent CANCELLED and errors.
+		timeout := 1 * time.Second
 		cancelCtx, cancelFunc := WithTimeout(dbosCtx, timeout)
 		defer cancelFunc() // Ensure we clean up the context
 
@@ -1698,7 +1704,7 @@ func TestPartitionedQueues(t *testing.T) {
 		var dbosErr *DBOSError
 		require.ErrorAs(t, err, &dbosErr, "expected error to be of type *DBOSError, got %T", err)
 
-		// Verify the error is wrapped by newWorkflowExecutionError with WorkflowExecutionError code
+		// Verify the error is wrapped by models.NewWorkflowExecutionError with WorkflowExecutionError code
 		assert.True(t, errors.Is(err, &DBOSError{Code: WorkflowExecutionError}), "expected error to be WorkflowExecutionError")
 
 		// Verify the unwrapped error contains the validation message
@@ -1733,7 +1739,7 @@ func TestPartitionedQueues(t *testing.T) {
 		var dbosErr *DBOSError
 		require.ErrorAs(t, err, &dbosErr, "expected error to be of type *DBOSError, got %T", err)
 
-		// Verify the error is wrapped by newWorkflowExecutionError with WorkflowExecutionError code
+		// Verify the error is wrapped by models.NewWorkflowExecutionError with WorkflowExecutionError code
 		assert.True(t, errors.Is(err, &DBOSError{Code: WorkflowExecutionError}), "expected error to be WorkflowExecutionError")
 
 		// Verify the unwrapped error contains the validation message
@@ -1837,7 +1843,7 @@ func TestQueuePollingIntervals(t *testing.T) {
 
 		queue, err := registerWFQ(ctx, "polling-default-queue")
 		require.NoError(t, err)
-		require.Equal(t, _DEFAULT_BASE_POLLING_INTERVAL, queue.basePollingInterval)
+		require.Equal(t, models.DefaultBasePollingInterval, queue.basePollingInterval)
 		// maxPollingInterval is not persisted: the DB-backed handle leaves it unset
 		// and the queue worker derives the backoff ceiling from the base at runtime.
 		require.Zero(t, queue.maxPollingInterval)
@@ -1987,7 +1993,7 @@ func TestListenQueues(t *testing.T) {
 		// Verify the forked workflow was on the internal queue
 		forkStatus, err := forkHandle.GetStatus()
 		require.NoError(t, err, "failed to get status of forked workflow")
-		assert.Equal(t, _DBOS_INTERNAL_QUEUE_NAME, forkStatus.QueueName, "expected forked workflow to be on internal queue")
+		assert.Equal(t, models.InternalQueueName, forkStatus.QueueName, "expected forked workflow to be on internal queue")
 
 	})
 
@@ -2423,9 +2429,9 @@ func TestDatabaseBackedQueues(t *testing.T) {
 		require.Equal(t, 7, *got.GlobalConcurrency)
 
 		// ...but not once a newer application version is the latest (rolling deploy).
-		sysdb := dbosCtx.(*dbosContext).systemDB.(*sysDB)
-		require.NoError(t, sysdb.createApplicationVersion(context.Background(), "v-newer"))
-		require.NoError(t, sysdb.updateApplicationVersionTimestamp(context.Background(), "v-newer", time.Now().Add(time.Hour).UnixMilli()))
+		sysdb := dbosCtx.(*dbosContext).systemDB.(*sysdb.SysDB)
+		require.NoError(t, sysdb.CreateApplicationVersion(context.Background(), "v-newer"))
+		require.NoError(t, sysdb.UpdateApplicationVersionTimestamp(context.Background(), "v-newer", time.Now().Add(time.Hour).UnixMilli()))
 		_, err = registerWFQ(dbosCtx, "conflict-q", WithGlobalConcurrency(1000))
 		require.NoError(t, err)
 		got, err = retrieveWFQ(dbosCtx, "conflict-q")
@@ -2462,9 +2468,9 @@ func TestDatabaseBackedQueues(t *testing.T) {
 	t.Run("RejectsCollisionWithInMemoryQueue", func(t *testing.T) {
 		// The internal queue is an in-memory queue; registering a database-backed
 		// queue with the same name must be rejected, and nothing persisted.
-		_, err := registerWFQ(dbosCtx, _DBOS_INTERNAL_QUEUE_NAME)
+		_, err := registerWFQ(dbosCtx, models.InternalQueueName)
 		require.Error(t, err)
-		got, err := retrieveWFQ(dbosCtx, _DBOS_INTERNAL_QUEUE_NAME)
+		got, err := retrieveWFQ(dbosCtx, models.InternalQueueName)
 		require.NoError(t, err)
 		require.Nil(t, got)
 	})

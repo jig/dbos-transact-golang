@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jig/dbos-transact-golang/dbos/internal/models"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -95,7 +97,7 @@ func TestDurableSleepSuspension(t *testing.T) {
 
 		// The workflow must suspend to DELAYED and be parked on the internal queue
 		status := waitForStatus(t, handle, WorkflowStatusDelayed, 5*time.Second)
-		assert.Equal(t, _DBOS_INTERNAL_QUEUE_NAME, status.QueueName, "direct-run workflow should be parked on the internal queue")
+		assert.Equal(t, models.InternalQueueName, status.QueueName, "direct-run workflow should be parked on the internal queue")
 		tolerance := 200 * time.Millisecond
 		assert.True(t, status.DelayUntil.After(tBefore.Add(2*time.Second).Add(-tolerance)),
 			"delay_until should be around tBefore + sleep duration (delay_until=%v)", status.DelayUntil)
@@ -269,7 +271,7 @@ func TestDurableResultSuspension(t *testing.T) {
 
 		// The child suspends on its Sleep; the suspension must cascade to the parent
 		status := waitForStatus(t, handle, WorkflowStatusDelayed, 5*time.Second)
-		assert.Equal(t, _DBOS_INTERNAL_QUEUE_NAME, status.QueueName)
+		assert.Equal(t, models.InternalQueueName, status.QueueName)
 
 		result, err := handle.GetResult(WithHandleTimeout(60*time.Second), WithHandlePollingInterval(100*time.Millisecond))
 		require.NoError(t, err, "failed to get parent result")
@@ -405,7 +407,7 @@ func TestDurableRecvSuspension(t *testing.T) {
 
 		// With a 30s timeout and a 200ms threshold, the receiver must suspend
 		status := waitForStatus(t, handle, WorkflowStatusDelayed, 5*time.Second)
-		assert.Equal(t, _DBOS_INTERNAL_QUEUE_NAME, status.QueueName)
+		assert.Equal(t, models.InternalQueueName, status.QueueName)
 
 		tSend := time.Now()
 		require.NoError(t, Send(dbosCtx, handle.GetWorkflowID(), "hello", "signal"))

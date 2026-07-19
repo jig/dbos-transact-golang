@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jig/dbos-transact-golang/dbos/internal/sysdb"
+
 	"github.com/stretchr/testify/require"
 )
 
@@ -31,8 +33,8 @@ func TestApplicationVersions(t *testing.T) {
 
 		c := dbosCtx.(*dbosContext)
 		// Re-registering the same version must not create a duplicate row.
-		require.NoError(t, c.systemDB.createApplicationVersion(c, c.applicationVersion))
-		require.NoError(t, c.systemDB.createApplicationVersion(c, c.applicationVersion))
+		require.NoError(t, c.systemDB.CreateApplicationVersion(c, c.applicationVersion))
+		require.NoError(t, c.systemDB.CreateApplicationVersion(c, c.applicationVersion))
 
 		versions, err := ListApplicationVersions(dbosCtx)
 		require.NoError(t, err)
@@ -45,8 +47,8 @@ func TestApplicationVersions(t *testing.T) {
 
 		c := dbosCtx.(*dbosContext)
 		// Insert an older version directly so it sorts before "current".
-		require.NoError(t, c.systemDB.createApplicationVersion(c, "older-version"))
-		require.NoError(t, c.systemDB.updateApplicationVersionTimestamp(c, "older-version", time.Now().Add(-time.Hour).UnixMilli()))
+		require.NoError(t, c.systemDB.CreateApplicationVersion(c, "older-version"))
+		require.NoError(t, c.systemDB.UpdateApplicationVersionTimestamp(c, "older-version", time.Now().Add(-time.Hour).UnixMilli()))
 
 		latest, err := GetLatestApplicationVersion(dbosCtx)
 		require.NoError(t, err)
@@ -70,8 +72,8 @@ func TestApplicationVersions(t *testing.T) {
 		// Launch registers the current version; clear the table to simulate empty state.
 		require.NoError(t, dbosCtx.Launch())
 		c := dbosCtx.(*dbosContext)
-		s := c.systemDB.(*sysDB)
-		_, err := s.pool.Exec(c, s.renderSQL("DELETE FROM %sapplication_versions", s.dialect.SchemaPrefix(s.schema)))
+		s := c.systemDB.(*sysdb.SysDB)
+		_, err := s.Pool().Exec(c, s.RenderSQL("DELETE FROM %sapplication_versions", s.Dialect().SchemaPrefix(s.Schema())))
 		require.NoError(t, err)
 
 		_, err = GetLatestApplicationVersion(dbosCtx)

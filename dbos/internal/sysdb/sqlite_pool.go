@@ -1,4 +1,4 @@
-package dbos
+package sysdb
 
 import (
 	"context"
@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -21,7 +20,7 @@ import (
 //     (foreign_keys, journal_mode=WAL, synchronous=NORMAL, busy_timeout) so
 //     write-heavy workloads behave well.
 
-// sqliteDSN extracts the modernc-compatible DSN from a DBOS-style sqlite URL.
+// SqliteDSN extracts the modernc-compatible DSN from a DBOS-style sqlite URL.
 //
 // Examples (input → DSN):
 //
@@ -34,7 +33,7 @@ import (
 //
 // SQLite has no host concept, so a URL with a non-empty authority (e.g.
 // sqlite://server/path) is rejected.
-func sqliteDSN(raw string) (string, error) {
+func SqliteDSN(raw string) (string, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return "", fmt.Errorf("invalid sqlite URL %q: %v", raw, err)
@@ -64,11 +63,11 @@ func sqliteDSN(raw string) (string, error) {
 	return dsn, nil
 }
 
-// openSQLitePool opens a *sql.DB backed by modernc.org/sqlite, ensures the
+// OpenSQLitePool opens a *sql.DB backed by modernc.org/sqlite, ensures the
 // parent directory of file-backed databases exists, applies recommended
 // PRAGMAs, and returns the pool. The caller owns Close.
-func openSQLitePool(ctx context.Context, databaseURL string) (*sql.DB, error) {
-	dsn, err := sqliteDSN(databaseURL)
+func OpenSQLitePool(ctx context.Context, databaseURL string) (*sql.DB, error) {
+	dsn, err := SqliteDSN(databaseURL)
 	if err != nil {
 		return nil, err
 	}
@@ -123,12 +122,13 @@ func openSQLitePool(ctx context.Context, databaseURL string) (*sql.DB, error) {
 // owns its lifecycle and PRAGMA configuration); otherwise the function opens
 // a fresh pool from databaseURL and applies default PRAGMAs.
 // Either way it runs SQLite migrations and returns a sysDB.
-func newSqliteSystemDatabase(
+func newSqliteSystemDatabase(encodeScheduledInput func(context.Context, time.Time, any) (*string, string, error),
+
 	ctx context.Context,
 	databaseURL, databaseSchema string,
 	customDB *sql.DB,
 	logger *slog.Logger,
-) (systemDatabase, error) {
+) (SystemDatabase, error) {
 	var (
 		db    *sql.DB
 		owned bool
@@ -138,7 +138,7 @@ func newSqliteSystemDatabase(
 		db = customDB
 	} else {
 		logger.Info("Connecting to SQLite system database", "database_url", databaseURL)
-		opened, err := openSQLitePool(ctx, databaseURL)
+		opened, err := OpenSQLitePool(ctx, databaseURL)
 		if err != nil {
 			return nil, err
 		}
@@ -153,9 +153,9 @@ func newSqliteSystemDatabase(
 			logger.Warn("Failed to close sqlite database during cleanup", "error", err)
 		}
 	}
-	if err := retry(ctx, func() error {
-		return runSqliteMigrations(ctx, db, logger)
-	}, withRetrierLogger(logger)); err != nil {
+	if err := Retry(ctx, func() error {
+		return RunSqliteMigrations(ctx, db, logger)
+	}, WithRetrierLogger(logger)); err != nil {
 		closeIfOwned()
 		return nil, fmt.Errorf("failed to run sqlite migrations: %v", err)
 	}
@@ -163,17 +163,16 @@ func newSqliteSystemDatabase(
 		closeIfOwned()
 		return nil, fmt.Errorf("failed to ping sqlite database: %v", err)
 	}
-	return &sysDB{
-		pool:                          newSQLPool(db),
-		dialect:                       sqliteDialect{},
-		workflowNotificationsMap:      &sync.Map{},
-		workflowNotificationRepollMap: &sync.Map{},
-		workflowEventsMap:             &sync.Map{},
-		workflowEventsRepollMap:       &sync.Map{},
-		streamsMap:                    &sync.Map{},
-		notificationLoopDone:          make(chan struct{}),
-		logger:                        logger.With("service", "system_database"),
-		schema:                        databaseSchema,
+	return &SysDB{
+		pool:                 NewSQLPool(db),
+		dialect:              SqliteDialect{},
+		RecvNotifier:         newNotifyRegistry(),
+		EventNotifier:        newNotifyRegistry(),
+		streamNotifier:       newNotifyRegistry(),
+		notificationLoopDone: make(chan struct{}),
+		logger:               logger.With("service", "system_database"),
+		schema:               databaseSchema,
+		encodeScheduledInput: encodeScheduledInput,
 	}, nil
 }
 

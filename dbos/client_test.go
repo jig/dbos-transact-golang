@@ -13,6 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jig/dbos-transact-golang/dbos/internal/models"
+	"github.com/jig/dbos-transact-golang/dbos/internal/sysdb"
+
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -32,6 +35,9 @@ func TestClientEnqueue(t *testing.T) {
 	// Create a partitioned queue for partition key test
 	// Must be created before Launch()
 	partitionedQueue := NewWorkflowQueue(serverCtx, "client-partitioned-queue", WithPartitionQueue())
+
+	// Concurrency-1 queue to hold a workflow ENQUEUED past its timeout (timeout clock test)
+	timeoutClockQueue := NewWorkflowQueue(serverCtx, "client-timeout-clock-queue", WithGlobalConcurrency(1))
 
 	// Track execution order for priority test
 	var executionOrder []string
@@ -59,6 +65,23 @@ func TestClientEnqueue(t *testing.T) {
 		}
 	}
 	RegisterWorkflow(serverCtx, blockingWorkflow, WithWorkflowName("BlockingWorkflow"))
+
+	// Workflow that blocks until released via channel (for timeout clock test)
+	blockerRelease := make(chan struct{})
+	signalBlockingWorkflow := func(ctx DBOSContext, _ string) (string, error) {
+		select {
+		case <-blockerRelease:
+			return "released", nil
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	RegisterWorkflow(serverCtx, signalBlockingWorkflow, WithWorkflowName("SignalBlockingWorkflow"))
+
+	quickWorkflow := func(ctx DBOSContext, input string) (string, error) {
+		return "quick: " + input, nil
+	}
+	RegisterWorkflow(serverCtx, quickWorkflow, WithWorkflowName("QuickWorkflow"))
 
 	// Register a workflow that records its execution order (for priority test)
 	priorityWorkflow := func(ctx DBOSContext, input string) (string, error) {
@@ -188,6 +211,50 @@ func TestClientEnqueue(t *testing.T) {
 		require.NoError(t, err)
 
 		assert.Equal(t, WorkflowStatusCancelled, status.Status)
+	})
+
+	t.Run("EnqueueTimeoutClockStartsAtDequeue", func(t *testing.T) {
+		// Occupy the concurrency-1 queue so the timed workflow stays ENQUEUED past its timeout
+		blockerHandle, err := Enqueue[string, string](client, timeoutClockQueue.Name, "SignalBlockingWorkflow", "blocker")
+		require.NoError(t, err)
+		require.Eventually(t, func() bool {
+			status, err := blockerHandle.GetStatus()
+			return err == nil && status.Status == WorkflowStatusPending
+		}, 10*time.Second, 50*time.Millisecond, "blocker workflow never started")
+
+		timeout := 500 * time.Millisecond
+		enqueueTime := time.Now()
+		handle, err := Enqueue[string, string](client, timeoutClockQueue.Name, "QuickWorkflow", "timed-input",
+			WithEnqueueTimeout(timeout))
+		require.NoError(t, err)
+
+		// While ENQUEUED the timeout must be persisted but the deadline must not be set:
+		// the clock only starts at dequeue
+		status, err := handle.GetStatus()
+		require.NoError(t, err)
+		require.Equal(t, WorkflowStatusEnqueued, status.Status)
+		assert.Equal(t, timeout, status.Timeout)
+		assert.True(t, status.Deadline.IsZero(), "deadline should not be set while the workflow is queued, got %v", status.Deadline)
+
+		// Keep it queued for well over its timeout, then release the blocker
+		time.Sleep(3 * timeout)
+		close(blockerRelease)
+		_, err = blockerHandle.GetResult()
+		require.NoError(t, err)
+
+		// The workflow spent longer than its timeout in the queue, yet must complete
+		// because the deadline is computed at dequeue time
+		result, err := handle.GetResult()
+		require.NoError(t, err, "workflow should not time out while waiting in the queue")
+		assert.Equal(t, "quick: timed-input", result)
+
+		status, err = handle.GetStatus()
+		require.NoError(t, err)
+		require.Equal(t, WorkflowStatusSuccess, status.Status)
+		assert.True(t, status.Deadline.After(enqueueTime.Add(3*timeout)),
+			"deadline %v should be computed at dequeue, after %v", status.Deadline, enqueueTime.Add(3*timeout))
+
+		assert.True(t, queueEntriesAreCleanedUp(serverCtx), "expected queue entries to be cleaned up")
 	})
 
 	t.Run("EnqueueWithPriority", func(t *testing.T) {
@@ -564,7 +631,7 @@ func TestCancelResume(t *testing.T) {
 		assert.Equal(t, WorkflowStatusSuccess, finalStatus.Status, "expected final workflow status to be SUCCESS")
 
 		// After resume, the queue name should change to the internal queue name
-		assert.Equal(t, _DBOS_INTERNAL_QUEUE_NAME, finalStatus.QueueName, "expected queue name to be %s", _DBOS_INTERNAL_QUEUE_NAME)
+		assert.Equal(t, models.InternalQueueName, finalStatus.QueueName, "expected queue name to be %s", models.InternalQueueName)
 
 		// Resume the workflow again - should not run again
 		resumeAgainHandle, err := client.ResumeWorkflow(workflowID)
@@ -593,8 +660,17 @@ func TestCancelResume(t *testing.T) {
 			WithEnqueueApplicationVersion(serverCtx.GetApplicationVersion()))
 		require.NoError(t, err, "failed to enqueue timeout blocking workflow")
 
-		// Wait 500ms (well before the timeout expires)
-		time.Sleep(500 * time.Millisecond)
+		// The deadline is not set at enqueue: it is computed at dequeue.
+		// Wait for the workflow to be dequeued and get its deadline.
+		var originalDeadline time.Time
+		require.Eventually(t, func() bool {
+			status, err := handle.GetStatus()
+			if err != nil {
+				return false
+			}
+			originalDeadline = status.Deadline
+			return status.Status == WorkflowStatusPending && !status.Deadline.IsZero()
+		}, 10*time.Second, 50*time.Millisecond, "workflow was never dequeued with a deadline")
 
 		// Cancel the workflow before timeout expires
 		err = client.CancelWorkflow(workflowID)
@@ -606,9 +682,6 @@ func TestCancelResume(t *testing.T) {
 
 		assert.Equal(t, WorkflowStatusCancelled, cancelStatus.Status, "expected workflow status to be CANCELLED")
 
-		// Record the original deadline before resume
-		originalDeadline := cancelStatus.Deadline
-
 		// Resume the workflow
 		resumeHandle, err := client.ResumeWorkflow(workflowID)
 		require.NoError(t, err, "failed to resume workflow")
@@ -618,8 +691,10 @@ func TestCancelResume(t *testing.T) {
 		resumeStatus, err := resumeHandle.GetStatus()
 		require.NoError(t, err, "failed to get workflow status after resume")
 
-		// Verify the deadline was reset (should be different from original)
-		assert.False(t, resumeStatus.Deadline.Equal(originalDeadline), "expected deadline to be reset after resume, but it remained the same: %v", originalDeadline)
+		// Resume clears the deadline; it is recomputed at the next dequeue. Depending
+		// on timing we observe either the cleared deadline or a fresh, later one.
+		assert.True(t, resumeStatus.Deadline.IsZero() || resumeStatus.Deadline.After(originalDeadline),
+			"expected deadline to be reset after resume, but got %v (original %v)", resumeStatus.Deadline, originalDeadline)
 
 		// Wait for the workflow to complete
 		_, err = resumeHandle.GetResult()
@@ -906,12 +981,12 @@ func TestForkWorkflow(t *testing.T) {
 			// Get database pool from serverCtx to query workflow_events_history
 			dbosCtx, ok := serverCtx.(*dbosContext)
 			require.True(t, ok, "expected dbosContext")
-			sysDB, ok := dbosCtx.systemDB.(*sysDB)
+			sysDB, ok := dbosCtx.systemDB.(*sysdb.SysDB)
 			require.True(t, ok, "expected sysDB")
 
 			// Query all events from workflow_events_history
-			query := sysDB.renderSQL(`SELECT function_id, key, value FROM %sworkflow_events_history WHERE workflow_uuid = $1 ORDER BY function_id, key`, sysDB.dialect.SchemaPrefix(sysDB.schema))
-			rows, err := sysDB.pool.Query(context.Background(), query, forkedWorkflowID)
+			query := sysDB.RenderSQL(`SELECT function_id, key, value FROM %sworkflow_events_history WHERE workflow_uuid = $1 ORDER BY function_id, key`, sysDB.Dialect().SchemaPrefix(sysDB.Schema()))
+			rows, err := sysDB.Pool().Query(context.Background(), query, forkedWorkflowID)
 			require.NoError(t, err, "failed to query workflow_events_history for forked workflow at step %d", startStep)
 			defer rows.Close()
 
@@ -1096,10 +1171,22 @@ func TestListWorkflows(t *testing.T) {
 		// Record start time for filtering tests
 		testStartTime := time.Now()
 
+		// Boundary between the test-batch-* and test-other-* workflows, observed
+		// rather than derived from the sleep cadence below: enqueue latency (notably
+		// on CockroachDB) makes wall-clock arithmetic unreliable.
+		var firstHalfTime time.Time
+
 		// Start 10 workflows at 100ms intervals with different patterns
 		for i := range 10 {
 			var workflowID string
 			var handle WorkflowHandle[string]
+
+			if i == 5 {
+				firstHalfTime = time.Now()
+				// created_at is stored at millisecond resolution and WithEndTime is
+				// inclusive: keep test-other-5's stamp out of the boundary's tick.
+				time.Sleep(5 * time.Millisecond)
+			}
 
 			if i < 5 {
 				// First 5 workflows: use prefix "test-batch-" and succeed
@@ -1221,8 +1308,7 @@ func TestListWorkflows(t *testing.T) {
 			assert.Equal(t, WorkflowStatusError, wf.Status, "workflow %s has unexpected status", wf.ID)
 		}
 
-		// Test 6: Filter by time range - first 5 workflows (start to start+500ms)
-		firstHalfTime := testStartTime.Add(500 * time.Millisecond)
+		// Test 6: Filter by time range - the 5 test-batch-* workflows
 		firstHalfWorkflows, err := client.ListWorkflows(
 			WithWorkflowIDPrefix("test-"),
 			WithEndTime(firstHalfTime))
@@ -1624,9 +1710,9 @@ func TestDebouncerClient(t *testing.T) {
 	serverCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
 
 	// Set internal queue polling interval to 10ms for faster tests
-	internalQueue := serverCtx.(*dbosContext).queueRunner.workflowQueueRegistry[_DBOS_INTERNAL_QUEUE_NAME]
+	internalQueue := serverCtx.(*dbosContext).queueRunner.workflowQueueRegistry[models.InternalQueueName]
 	internalQueue.basePollingInterval = 10 * time.Millisecond
-	serverCtx.(*dbosContext).queueRunner.workflowQueueRegistry[_DBOS_INTERNAL_QUEUE_NAME] = internalQueue
+	serverCtx.(*dbosContext).queueRunner.workflowQueueRegistry[models.InternalQueueName] = internalQueue
 
 	// Register test workflow with a custom name
 	debounceTestWorkflow := func(ctx DBOSContext, input string) (string, error) {
@@ -1674,11 +1760,11 @@ func TestDebouncerClient(t *testing.T) {
 		// CockroachDB has longer notification latency due to polling. Only pg
 		// backends expose a *pgxpool.Pool we can sniff; sqlite is never CRDB.
 		isCockroach := false
-		if pgxPool := PgxPool(serverCtx.(*dbosContext).systemDB.(*sysDB).pool); pgxPool != nil {
+		if pgxPool := PgxPool(serverCtx.(*dbosContext).systemDB.Pool()); pgxPool != nil {
 			conn, err := pgxPool.Acquire(serverCtx)
 			require.NoError(t, err)
 			defer conn.Release()
-			isCockroach = isCockroachDB(conn.Conn())
+			isCockroach = sysdb.IsCockroachDB(conn.Conn())
 		}
 
 		var delay time.Duration
@@ -1827,9 +1913,9 @@ func TestDebouncerClientConfiguredInstance(t *testing.T) {
 	serverCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
 
 	// Set internal queue polling interval to 10ms for faster tests
-	internalQueue := serverCtx.(*dbosContext).queueRunner.workflowQueueRegistry[_DBOS_INTERNAL_QUEUE_NAME]
+	internalQueue := serverCtx.(*dbosContext).queueRunner.workflowQueueRegistry[models.InternalQueueName]
 	internalQueue.basePollingInterval = 10 * time.Millisecond
-	serverCtx.(*dbosContext).queueRunner.workflowQueueRegistry[_DBOS_INTERNAL_QUEUE_NAME] = internalQueue
+	serverCtx.(*dbosContext).queueRunner.workflowQueueRegistry[models.InternalQueueName] = internalQueue
 
 	// Two configured instances of the same workflow method, sharing a custom name
 	slackNotifier := &configuredNotifier{channel: "slack"}
@@ -2147,7 +2233,7 @@ func TestClientSchedules(t *testing.T) {
 		const nameA = "client-apply-a"
 		const nameB = "client-apply-b"
 		require.NoError(t, c.ApplySchedules([]ClientScheduleInput{
-			{ScheduleName: nameA, WorkflowName: workflowFQN, Schedule: "0 0 * * * *"},
+			{ScheduleName: nameA, WorkflowName: workflowFQN, Schedule: "0 0 * * * *", Context: map[string]any{"region": "us"}},
 			{ScheduleName: nameB, WorkflowName: workflowFQN, WorkflowClassName: "MyClass", Schedule: "0 0 * * * *"},
 		}))
 		t.Cleanup(func() {
@@ -2158,12 +2244,25 @@ func TestClientSchedules(t *testing.T) {
 		a, err := c.GetSchedule(nameA)
 		require.NoError(t, err)
 		require.NotNil(t, a)
-		require.Equal(t, _DBOS_INTERNAL_QUEUE_NAME, a.QueueName, "QueueName should default to the internal queue")
+		require.Equal(t, models.InternalQueueName, a.QueueName, "QueueName should default to the internal queue")
+		require.Equal(t, map[string]any{"region": "us"}, a.Context)
+		scheduleIDA := a.ScheduleID
 
 		b, err := c.GetSchedule(nameB)
 		require.NoError(t, err)
 		require.NotNil(t, b)
 		require.Equal(t, "MyClass", b.WorkflowClassName)
+
+		// Re-apply updates definition in place and preserves schedule_id.
+		require.NoError(t, c.ApplySchedules([]ClientScheduleInput{
+			{ScheduleName: nameA, WorkflowName: workflowFQN, Schedule: "0 0 0 * * *", Context: map[string]any{"region": "eu"}},
+		}))
+		a, err = c.GetSchedule(nameA)
+		require.NoError(t, err)
+		require.NotNil(t, a)
+		require.Equal(t, scheduleIDA, a.ScheduleID, "client upsert must preserve schedule_id")
+		require.Equal(t, "0 0 0 * * *", a.Schedule)
+		require.Equal(t, map[string]any{"region": "eu"}, a.Context)
 	})
 
 	t.Run("BackfillSchedule", func(t *testing.T) {
@@ -2265,8 +2364,8 @@ func TestClientApplicationVersions(t *testing.T) {
 
 		// Seed an older version directly so it sorts before the current one.
 		sysDB := serverCtx.(*dbosContext).systemDB
-		require.NoError(t, sysDB.createApplicationVersion(serverCtx, "older-version"))
-		require.NoError(t, sysDB.updateApplicationVersionTimestamp(serverCtx, "older-version", time.Now().Add(-time.Hour).UnixMilli()))
+		require.NoError(t, sysDB.CreateApplicationVersion(serverCtx, "older-version"))
+		require.NoError(t, sysDB.UpdateApplicationVersionTimestamp(serverCtx, "older-version", time.Now().Add(-time.Hour).UnixMilli()))
 
 		latest, err := c.GetLatestApplicationVersion()
 		require.NoError(t, err)
@@ -2292,8 +2391,8 @@ func TestClientApplicationVersions(t *testing.T) {
 		require.NoError(t, err)
 		t.Cleanup(func() { c.Shutdown(30 * time.Second) })
 		// Launch registers the current version; clear table to simulate empty state.
-		s := serverCtx.(*dbosContext).systemDB.(*sysDB)
-		_, err = s.pool.Exec(serverCtx, s.renderSQL("DELETE FROM %sapplication_versions", s.dialect.SchemaPrefix(s.schema)))
+		s := serverCtx.(*dbosContext).systemDB.(*sysdb.SysDB)
+		_, err = s.Pool().Exec(serverCtx, s.RenderSQL("DELETE FROM %sapplication_versions", s.Dialect().SchemaPrefix(s.Schema())))
 		require.NoError(t, err)
 
 		_, err = c.GetLatestApplicationVersion()
@@ -2354,10 +2453,10 @@ func TestClientCustomSqliteDB(t *testing.T) {
 	require.True(t, ok)
 	dbosCtx, ok := clientImpl.dbosCtx.(*dbosContext)
 	require.True(t, ok)
-	sysDB, ok := dbosCtx.systemDB.(*sysDB)
+	sysDB, ok := dbosCtx.systemDB.(*sysdb.SysDB)
 	require.True(t, ok)
-	assert.Same(t, clientDB, SQLDB(sysDB.pool), "client should use the caller's sqlite *sql.DB")
-	require.Equal(t, DialectSQLite, sysDB.dialect.Name())
+	assert.Same(t, clientDB, SQLDB(sysDB.Pool()), "client should use the caller's sqlite *sql.DB")
+	require.Equal(t, DialectSQLite, sysDB.Dialect().Name())
 
 	handle, err := Enqueue[wfInput, string](c, queue.Name, "CustomSqliteClientWorkflow",
 		wfInput{Input: "hello"},
@@ -2400,10 +2499,10 @@ func TestClientCustomPool(t *testing.T) {
 	require.True(t, ok)
 	dbosCtx, ok := clientImpl.dbosCtx.(*dbosContext)
 	require.True(t, ok)
-	sysDB, ok := dbosCtx.systemDB.(*sysDB)
+	sysDB, ok := dbosCtx.systemDB.(*sysdb.SysDB)
 	require.True(t, ok)
-	assert.Same(t, clientPool, PgxPool(sysDB.pool), "client should use the caller's *pgxpool.Pool")
-	require.Contains(t, []DialectName{DialectPostgres, DialectCockroach}, sysDB.dialect.Name())
+	assert.Same(t, clientPool, PgxPool(sysDB.Pool()), "client should use the caller's *pgxpool.Pool")
+	require.Contains(t, []DialectName{DialectPostgres, DialectCockroach}, sysDB.Dialect().Name())
 
 	handle, err := Enqueue[wfInput, string](c, queue.Name, "CustomPoolClientWorkflow",
 		wfInput{Input: "hello"},
@@ -2450,4 +2549,276 @@ func TestClientSend(t *testing.T) {
 		require.Contains(t, result, "c-a")
 		require.Contains(t, result, "c-b")
 	})
+}
+
+// TestClientGetEvent verifies ClientGetEvent decodes an event value into the
+// requested type using the serialization recorded with the event.
+func TestClientGetEvent(t *testing.T) {
+	serverCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
+	queue := NewWorkflowQueue(serverCtx, "client-getevent-queue")
+
+	type eventPayload struct {
+		Label string
+		Count int
+	}
+
+	eventWorkflow := func(ctx DBOSContext, _ string) (string, error) {
+		if err := SetEvent(ctx, "struct-key", eventPayload{Label: "ready", Count: 7}); err != nil {
+			return "", err
+		}
+		if err := SetEvent(ctx, "string-key", "hello-event"); err != nil {
+			return "", err
+		}
+		return "done", nil
+	}
+	RegisterWorkflow(serverCtx, eventWorkflow, WithWorkflowName("EventWorkflow"))
+
+	require.NoError(t, Launch(serverCtx))
+
+	client, err := NewClient(context.Background(), ClientConfig{DatabaseURL: backendDatabaseURL(t)})
+	require.NoError(t, err)
+	t.Cleanup(func() { client.Shutdown(30 * time.Second) })
+
+	workflowID := "client-getevent-wf"
+	handle, err := Enqueue[string, string](client, queue.Name, "EventWorkflow", "",
+		WithEnqueueWorkflowID(workflowID),
+		WithEnqueueApplicationVersion(serverCtx.GetApplicationVersion()))
+	require.NoError(t, err)
+	_, err = handle.GetResult()
+	require.NoError(t, err)
+
+	t.Run("DecodesStructEvent", func(t *testing.T) {
+		val, err := ClientGetEvent[eventPayload](client, workflowID, "struct-key", 5*time.Second)
+		require.NoError(t, err)
+		require.Equal(t, eventPayload{Label: "ready", Count: 7}, val)
+	})
+
+	t.Run("DecodesStringEvent", func(t *testing.T) {
+		val, err := ClientGetEvent[string](client, workflowID, "string-key", 5*time.Second)
+		require.NoError(t, err)
+		require.Equal(t, "hello-event", val)
+	})
+
+	t.Run("NilClient", func(t *testing.T) {
+		_, err := ClientGetEvent[string](nil, workflowID, "string-key", time.Second)
+		require.Error(t, err)
+	})
+
+	require.True(t, queueEntriesAreCleanedUp(serverCtx), "expected queue entries to be cleaned up after get event test")
+}
+
+// TestClientTypedHandles verifies the typed handle helpers (ClientRetrieveWorkflow,
+// ClientForkWorkflow, ClientResumeWorkflow, ClientResumeWorkflows) return handles
+// whose GetResult decodes the workflow output into the requested type.
+func TestClientTypedHandles(t *testing.T) {
+	serverCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
+	queue := NewWorkflowQueue(serverCtx, "client-typed-handles-queue")
+
+	type sumResult struct {
+		Sum int
+	}
+
+	sumWorkflow := func(ctx DBOSContext, n int) (sumResult, error) {
+		return RunAsStep(ctx, func(context.Context) (sumResult, error) {
+			return sumResult{Sum: n * 2}, nil
+		})
+	}
+	RegisterWorkflow(serverCtx, sumWorkflow, WithWorkflowName("SumWorkflow"))
+
+	require.NoError(t, Launch(serverCtx))
+
+	client, err := NewClient(context.Background(), ClientConfig{DatabaseURL: backendDatabaseURL(t)})
+	require.NoError(t, err)
+	t.Cleanup(func() { client.Shutdown(30 * time.Second) })
+
+	appVersion := WithEnqueueApplicationVersion(serverCtx.GetApplicationVersion())
+
+	t.Run("RetrieveWorkflowTyped", func(t *testing.T) {
+		workflowID := "client-retrieve-typed"
+		_, err := Enqueue[int, sumResult](client, queue.Name, "SumWorkflow", 21, WithEnqueueWorkflowID(workflowID), appVersion)
+		require.NoError(t, err)
+
+		handle, err := ClientRetrieveWorkflow[sumResult](client, workflowID)
+		require.NoError(t, err)
+		res, err := handle.GetResult()
+		require.NoError(t, err)
+		require.Equal(t, sumResult{Sum: 42}, res)
+	})
+
+	t.Run("ForkWorkflowTyped", func(t *testing.T) {
+		workflowID := "client-fork-typed"
+		h, err := Enqueue[int, sumResult](client, queue.Name, "SumWorkflow", 5, WithEnqueueWorkflowID(workflowID), appVersion)
+		require.NoError(t, err)
+		_, err = h.GetResult()
+		require.NoError(t, err)
+
+		forkedHandle, err := ClientForkWorkflow[sumResult](client, ForkWorkflowInput{OriginalWorkflowID: workflowID, StartStep: 0})
+		require.NoError(t, err)
+		res, err := forkedHandle.GetResult()
+		require.NoError(t, err)
+		require.Equal(t, sumResult{Sum: 10}, res)
+	})
+
+	t.Run("ResumeWorkflowTyped", func(t *testing.T) {
+		workflowID := "client-resume-typed"
+		h, err := Enqueue[int, sumResult](client, queue.Name, "SumWorkflow", 8, WithEnqueueWorkflowID(workflowID), appVersion)
+		require.NoError(t, err)
+		_, err = h.GetResult()
+		require.NoError(t, err)
+
+		// Resuming a completed workflow returns a typed handle to the existing result.
+		resumeHandle, err := ClientResumeWorkflow[sumResult](client, workflowID)
+		require.NoError(t, err)
+		res, err := resumeHandle.GetResult()
+		require.NoError(t, err)
+		require.Equal(t, sumResult{Sum: 16}, res)
+	})
+
+	t.Run("ResumeWorkflowsTyped", func(t *testing.T) {
+		ids := make([]string, 0, 2)
+		for i := range 2 {
+			workflowID := fmt.Sprintf("client-resume-multi-%d", i)
+			h, err := Enqueue[int, sumResult](client, queue.Name, "SumWorkflow", i+1, WithEnqueueWorkflowID(workflowID), appVersion)
+			require.NoError(t, err)
+			_, err = h.GetResult()
+			require.NoError(t, err)
+			ids = append(ids, workflowID)
+		}
+
+		handles, err := ClientResumeWorkflows[sumResult](client, ids)
+		require.NoError(t, err)
+		require.Len(t, handles, 2)
+		// ResumeWorkflows does not guarantee handle order matches input order,
+		// so verify each result against its own workflow ID.
+		expected := map[string]sumResult{
+			"client-resume-multi-0": {Sum: 2},
+			"client-resume-multi-1": {Sum: 4},
+		}
+		for _, h := range handles {
+			res, err := h.GetResult()
+			require.NoError(t, err)
+			require.Equal(t, expected[h.GetWorkflowID()], res)
+		}
+	})
+
+	t.Run("NilClient", func(t *testing.T) {
+		_, err := ClientRetrieveWorkflow[sumResult](nil, "any")
+		require.Error(t, err)
+	})
+
+	require.True(t, queueEntriesAreCleanedUp(serverCtx), "expected queue entries to be cleaned up after typed handles test")
+}
+
+// TestClientListAndSteps verifies ListWorkflows and GetWorkflowSteps
+// do NOT load/decode input/output by default, and decode them when explicitly
+// asked via the load options.
+func TestClientListAndSteps(t *testing.T) {
+	serverCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
+	queue := NewWorkflowQueue(serverCtx, "client-list-steps-queue")
+
+	type wfInput struct {
+		Name string
+	}
+	type wfOutput struct {
+		Greeting string
+	}
+
+	listStepsWorkflow := func(ctx DBOSContext, input wfInput) (wfOutput, error) {
+		out, err := RunAsStep(ctx, func(context.Context) (wfOutput, error) {
+			return wfOutput{Greeting: "hi"}, nil
+		}, WithStepName("GreetStep"))
+		if err != nil {
+			return wfOutput{}, err
+		}
+		out.Greeting = out.Greeting + " " + input.Name
+		return out, nil
+	}
+	RegisterWorkflow(serverCtx, listStepsWorkflow, WithWorkflowName("ListStepsWorkflow"))
+
+	require.NoError(t, Launch(serverCtx))
+
+	client, err := NewClient(context.Background(), ClientConfig{DatabaseURL: backendDatabaseURL(t)})
+	require.NoError(t, err)
+	t.Cleanup(func() { client.Shutdown(30 * time.Second) })
+
+	workflowID := "client-list-steps-wf"
+	handle, err := Enqueue[wfInput, wfOutput](client, queue.Name, "ListStepsWorkflow", wfInput{Name: "max"},
+		WithEnqueueWorkflowID(workflowID),
+		WithEnqueueApplicationVersion(serverCtx.GetApplicationVersion()))
+	require.NoError(t, err)
+	_, err = handle.GetResult()
+	require.NoError(t, err)
+
+	t.Run("ListWorkflowsNoDecodeByDefault", func(t *testing.T) {
+		workflows, err := client.ListWorkflows(WithWorkflowIDs([]string{workflowID}))
+		require.NoError(t, err)
+		require.Len(t, workflows, 1)
+		assert.Nil(t, workflows[0].Input, "input must not be loaded by default")
+		assert.Nil(t, workflows[0].Output, "output must not be loaded by default")
+	})
+
+	t.Run("ListWorkflowsLoadsWhenRequested", func(t *testing.T) {
+		workflows, err := client.ListWorkflows(WithWorkflowIDs([]string{workflowID}), WithLoadInput(true), WithLoadOutput(true))
+		require.NoError(t, err)
+		require.Len(t, workflows, 1)
+
+		// With no serializer configured, payloads come back as raw JSON strings
+		// (cross-language friendly), not Go-decoded values.
+		input, ok := workflows[0].Input.(string)
+		require.True(t, ok, "expected loaded input to be a string, got %T", workflows[0].Input)
+		assert.JSONEq(t, `{"Name":"max"}`, input)
+
+		output, ok := workflows[0].Output.(string)
+		require.True(t, ok, "expected loaded output to be a string, got %T", workflows[0].Output)
+		assert.JSONEq(t, `{"Greeting":"hi max"}`, output)
+	})
+
+	t.Run("GetWorkflowStepsNoDecodeByDefault", func(t *testing.T) {
+		steps, err := client.GetWorkflowSteps(workflowID)
+		require.NoError(t, err)
+		require.Len(t, steps, 1)
+		assert.Equal(t, "GreetStep", steps[0].StepName)
+		assert.Nil(t, steps[0].Output, "step output must not be loaded by default")
+	})
+
+	t.Run("GetWorkflowStepsLoadsWhenRequested", func(t *testing.T) {
+		steps, err := client.GetWorkflowSteps(workflowID, WithStepsLoadOutput(true))
+		require.NoError(t, err)
+		require.Len(t, steps, 1)
+		output, ok := steps[0].Output.(string)
+		require.True(t, ok, "expected loaded step output to be a string, got %T", steps[0].Output)
+		assert.JSONEq(t, `{"Greeting":"hi"}`, output)
+	})
+
+	require.True(t, queueEntriesAreCleanedUp(serverCtx), "expected queue entries to be cleaned up after list/steps test")
+}
+
+// TestClientTriggerScheduleTyped verifies ClientTriggerSchedule returns a typed
+// handle whose GetResult decodes the triggered workflow's output.
+func TestClientTriggerScheduleTyped(t *testing.T) {
+	serverCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
+	RegisterWorkflow(serverCtx, testWorkflowForSchedule)
+	require.NoError(t, Launch(serverCtx))
+
+	c, err := NewClient(context.Background(), ClientConfig{DatabaseURL: backendDatabaseURL(t)})
+	require.NoError(t, err)
+	t.Cleanup(func() { c.Shutdown(30 * time.Second) })
+
+	const workflowFQN = "github.com/jig/dbos-transact-golang/dbos.testWorkflowForSchedule"
+	const name = "client-trigger-typed"
+	require.NoError(t, c.CreateSchedule(ClientScheduleInput{
+		ScheduleName: name,
+		WorkflowName: workflowFQN,
+		Schedule:     "0 0 * * * *",
+	}))
+	t.Cleanup(func() { _ = c.DeleteSchedule(name) })
+
+	handle, err := ClientTriggerSchedule[string](c, name)
+	require.NoError(t, err)
+	require.NotNil(t, handle)
+	require.Contains(t, handle.GetWorkflowID(), name)
+
+	result, err := handle.GetResult()
+	require.NoError(t, err)
+	require.Equal(t, "completed", result)
 }

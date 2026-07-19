@@ -18,6 +18,34 @@ touched, the change **type**, the rationale, and notes/risks for re-applying.
 - **Upstream baseline (this re-fork):** `91f7bb0` — "Use listen/notify for streams
   (#372)", the point this `refork` branch starts from. It already includes
   datasources (#358), preemptible sleep (#366), child cancellation (#359), etc.
+- **2026-07-19 merge of upstream #373–#395 (`d5c96f3`, v1.0.0-rc.1 p1):** upstream
+  moved internals into `dbos/internal/models` and `dbos/internal/sysdb` (#390) and
+  re-designed the notification subscription system around per-waiter channels and
+  a `NotificationWaiter` (#382), with recv/getEvent/sleep re-implemented in
+  `workflow.go` over `runAsTxn` checkpoints. Fork status after the merge:
+  - §1 durable suspension: re-hooked into the new `Recv`/`GetEvent` wait phase
+    (wait up to the threshold, then `suspendForRecv`/`suspendForEvent`) and into
+    the new checkpoint-based `Sleep`; sysDB helpers are exported methods on
+    `sysdb.SysDB` and on the `SystemDatabase` interface.
+  - §2 plain-SQL: unchanged (poller loop kept; `PostgresDialect.SupportsListenNotify`
+    returns false; PL/pgSQL migrations 10/14/20/38/39 stay neutralized; upstream
+    migration 41 adopted; fork migrations remain 1001–1003).
+  - §4 leave-PENDING: re-implemented inside `workflowCancelFunction` — upstream
+    now durably cancels on any context cancellation; the Shutdown sentinel cause
+    skips the durable cancel, resets `recovery_attempts`, and the outcome write is
+    skipped by upstream's own cancelled-run path. A **user** cancellation now
+    finalises as CANCELLED (upstream semantics), no longer ERROR.
+  - §5: SUPERSEDED for new histories (all step errors now round-trip gob-encoded);
+    `models.ErrorFromRecorded` remains only as `deserializeWorkflowError`'s
+    fallback for legacy plain-string recordings.
+  - §6: SUPERSEDED — upstream reserves step IDs at the caller by design; the
+    `concrete()` seam is gone (`Pool()`/`Dialect()` are on the interface) and
+    `retry_step_ids_test.go` was deleted.
+  - §7 gates: SQL side moved to `dbos/internal/sysdb/gates.go` (exported methods,
+    on the interface); `GateRecv` shares `recvWithGate` with `Recv`, closing the
+    gate inside the same `runAsTxn` transaction as the recv checkpoint via
+    `ConsumeMessageWithUUID` + `CloseGate`. Read-audience copy on fork is batched
+    into upstream's bulk `ForkWorkflows`.
 - **Module renamed:** `go.mod` is `module github.com/jig/dbos-transact-golang`
   (renamed from `dbos-inc/...` across all imports). Consumers (fluxos8) import the
   `jig/...` path; the `go.work` `use ../dbos-transact-golang` picks up this tree.

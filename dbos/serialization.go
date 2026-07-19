@@ -8,7 +8,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"reflect"
+	"time"
+
+	"github.com/jig/dbos-transact-golang/dbos/internal/models"
 )
 
 const (
@@ -335,8 +339,14 @@ func (e *PortableWorkflowError) Error() string {
 func init() {
 	// Register the DBOS error types so they can be gob-encoded with their concrete
 	// type preserved on the Go <-> Go error path (see serializeWorkflowError).
-	gob.Register(&DBOSError{})
+	// DBOSError must keep the wire name from when it was defined in this package:
+	// stored errors were encoded under it, and decode looks types up by name.
+	gob.RegisterName("*dbos.DBOSError", &DBOSError{})
 	gob.Register(&PortableWorkflowError{})
+	gob.Register(time.Time{})
+	// Register the scheduled workflow input so gob-serialized schedule firings
+	// round-trip without users having to register it themselves.
+	gob.Register(ScheduledWorkflowInput{})
 }
 
 // serializeWorkflowError encodes an error for DB storage.
@@ -345,7 +355,7 @@ func init() {
 //   - All other (Go <-> Go) workflows gob-encode the error so its concrete Go type
 //     (e.g. *DBOSError) is preserved and reconstructed as-is on decode. Errors whose type
 //     cannot be gob-encoded (e.g. errors.New/fmt.Errorf) fall back to their plain string.
-func serializeWorkflowError(err error, serialization string) string {
+func serializeWorkflowError(logger *slog.Logger, err error, serialization string) string {
 	if err == nil {
 		return ""
 	}
@@ -354,6 +364,9 @@ func serializeWorkflowError(err error, serialization string) string {
 		// Types that cannot be gob-encoded (e.g. errors.New/fmt.Errorf) fall back to their string.
 		if encoded, gobErr := NewGobSerializer().Encode(err); gobErr == nil && encoded != nil {
 			return *encoded
+		} else if logger != nil {
+			logger.Warn("workflow error type cannot be gob-encoded; persisting its message only: errors.Is/errors.As will not match this error when read back from the database",
+				"error_type", fmt.Sprintf("%T", err), "error", err, "encode_error", gobErr)
 		}
 		return err.Error()
 	}
@@ -393,5 +406,7 @@ func deserializeWorkflowError(errStr *string) error {
 	if err := json.Unmarshal([]byte(*errStr), &pe); err == nil && (pe.Name != "" || pe.Message != "") {
 		return &pe
 	}
-	return errors.New(*errStr)
+	// Fork §5: a legacy plain-string recording ("DBOS Error <code|name>: ...")
+	// is rebuilt as a *DBOSError so errors.As/code checks survive replay.
+	return models.ErrorFromRecorded(*errStr)
 }

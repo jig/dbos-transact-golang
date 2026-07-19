@@ -6,6 +6,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jig/dbos-transact-golang/dbos/internal/models"
+	"github.com/jig/dbos-transact-golang/dbos/internal/sysdb"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -56,9 +59,9 @@ func TestDebouncer(t *testing.T) {
 	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
 
 	// Set internal queue polling interval to 100ms
-	internalQueue := dbosCtx.(*dbosContext).queueRunner.workflowQueueRegistry[_DBOS_INTERNAL_QUEUE_NAME]
+	internalQueue := dbosCtx.(*dbosContext).queueRunner.workflowQueueRegistry[models.InternalQueueName]
 	internalQueue.basePollingInterval = 10 * time.Millisecond
-	dbosCtx.(*dbosContext).queueRunner.workflowQueueRegistry[_DBOS_INTERNAL_QUEUE_NAME] = internalQueue
+	dbosCtx.(*dbosContext).queueRunner.workflowQueueRegistry[models.InternalQueueName] = internalQueue
 
 	// Register test workflows
 	RegisterWorkflow(dbosCtx, debounceTestWorkflow)
@@ -113,7 +116,7 @@ func TestDebouncer(t *testing.T) {
 
 		// also verify the start time step is present in the internal debouncer workflow
 		// First find it: it should be the only workflow in the internal queue
-		workflows, err := ListWorkflows(dbosCtx, WithQueueName(_DBOS_INTERNAL_QUEUE_NAME))
+		workflows, err := ListWorkflows(dbosCtx, WithQueueName(models.InternalQueueName))
 		require.NoError(t, err, "failed to list workflows")
 		require.Len(t, workflows, 1, "should have exactly one workflow in the internal queue")
 		// Now find the step in the workflow
@@ -263,24 +266,20 @@ func TestDebouncer(t *testing.T) {
 
 		// Find the internal debouncer workflow by querying operation_outputs table
 		// The debouncer workflow is the one that has a step with child_workflow_id set to handle1's workflow ID
-		sysDBInstance, ok := dbosCtxInstance.systemDB.(*sysDB)
+		sysDBInstance, ok := dbosCtxInstance.systemDB.(*sysdb.SysDB)
 		require.True(t, ok, "expected sysDB instance")
 
-		query := sysDBInstance.renderSQL(`SELECT workflow_uuid FROM %soperation_outputs WHERE child_workflow_id = $1 LIMIT 1`, sysDBInstance.dialect.SchemaPrefix(sysDBInstance.schema))
+		query := sysDBInstance.RenderSQL(`SELECT workflow_uuid FROM %soperation_outputs WHERE child_workflow_id = $1 LIMIT 1`, sysDBInstance.Dialect().SchemaPrefix(sysDBInstance.Schema()))
 		var debouncerWorkflowID string
-		err = sysDBInstance.pool.QueryRow(context.Background(), query, handle1.GetWorkflowID()).Scan(&debouncerWorkflowID)
+		err = sysDBInstance.Pool().QueryRow(context.Background(), query, handle1.GetWorkflowID()).Scan(&debouncerWorkflowID)
 		require.NoError(t, err, "failed to find debouncer workflow in operation_outputs")
 		require.NotEmpty(t, debouncerWorkflowID, "debouncer workflow ID should not be empty")
 
-		err = dbosCtxInstance.systemDB.updateWorkflowOutcome(context.Background(), updateWorkflowOutcomeDBInput{
-			workflowID: debouncerWorkflowID,
-			status:     WorkflowStatusPending,
-			output:     nil,
-			tx:         nil,
-		})
-		require.NoError(t, err, "failed to update workflow status to PENDING")
+		// updateWorkflowOutcome refuses to overwrite terminal rows, so reset the
+		// completed debouncer workflow with the raw-SQL test helper instead.
+		setWorkflowStatusPending(t, dbosCtx, debouncerWorkflowID)
 
-		cleared, err := dbosCtxInstance.systemDB.clearQueueAssignment(context.Background(), debouncerWorkflowID)
+		cleared, err := dbosCtxInstance.systemDB.ClearQueueAssignment(context.Background(), debouncerWorkflowID)
 		require.NoError(t, err, "failed to clear queue assignment")
 		require.True(t, cleared, "should have cleared queue assignment")
 
@@ -398,9 +397,9 @@ func TestDebouncerWorkflowOptions(t *testing.T) {
 func TestDebouncerConfiguredInstance(t *testing.T) {
 	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
 
-	internalQueue := dbosCtx.(*dbosContext).queueRunner.workflowQueueRegistry[_DBOS_INTERNAL_QUEUE_NAME]
+	internalQueue := dbosCtx.(*dbosContext).queueRunner.workflowQueueRegistry[models.InternalQueueName]
 	internalQueue.basePollingInterval = 10 * time.Millisecond
-	dbosCtx.(*dbosContext).queueRunner.workflowQueueRegistry[_DBOS_INTERNAL_QUEUE_NAME] = internalQueue
+	dbosCtx.(*dbosContext).queueRunner.workflowQueueRegistry[models.InternalQueueName] = internalQueue
 
 	slack := &configuredNotifier{channel: "slack"}
 	email := &configuredNotifier{channel: "email"}

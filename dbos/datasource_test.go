@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jig/dbos-transact-golang/dbos/internal/sysdb"
+
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
@@ -36,14 +38,14 @@ func openUserBackend(t *testing.T) *userBackend {
 		db, err := sql.Open("sqlite", path)
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = db.Close() })
-		return &userBackend{pool: newSQLPool(db), dialect: sqliteDialect{}, schema: _DEFAULT_SYSTEM_DB_SCHEMA}
+		return &userBackend{pool: sysdb.NewSQLPool(db), dialect: sysdb.SqliteDialect{}, schema: _DEFAULT_SYSTEM_DB_SCHEMA}
 	}
 	cfg, err := pgxpool.ParseConfig(backendDatabaseURL(t))
 	require.NoError(t, err)
 	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
-	return &userBackend{pool: newPgxPool(pool), dialect: postgresDialect{}, schema: _DEFAULT_SYSTEM_DB_SCHEMA}
+	return &userBackend{pool: sysdb.NewPgxPool(pool), dialect: sysdb.PostgresDialect{}, schema: _DEFAULT_SYSTEM_DB_SCHEMA}
 }
 
 // register creates a data source over this backend's engine, naming it via
@@ -453,6 +455,75 @@ func TestRunAsTransaction(t *testing.T) {
 		require.Equal(t, 1, ub.countRows(t, fmt.Sprintf(`SELECT count(*) FROM %s`, ub.completionTable())))
 	})
 
+	t.Run("CancelledTransactionNotCheckpointed", func(t *testing.T) {
+		// A transaction interrupted by workflow cancellation must not checkpoint
+		// its cancellation error — in the user DB or the system DB — so resume
+		// re-executes it instead of replaying the error.
+		ctx := setupDBOS(t, setupDBOSOptions{dropDB: true})
+		ub := openUserBackend(t)
+		ds := ub.register(t, ctx, "app")
+
+		var attempts atomic.Int32
+		started := NewEvent()
+		wf := func(dctx DBOSContext, _ string) (string, error) {
+			return RunAsTransaction(dctx, ds, func(c context.Context, tx Tx) (string, error) {
+				if attempts.Add(1) == 1 {
+					started.Set()
+					<-c.Done()
+					return "", c.Err()
+				}
+				if _, err := tx.Exec(c, ub.rw(`INSERT INTO kv (k, v) VALUES ($1, $2)`), "k1", "v1"); err != nil {
+					return "", err
+				}
+				return "completed", nil
+			})
+		}
+		RegisterWorkflow(ctx, wf)
+		require.NoError(t, Launch(ctx))
+		ub.createAppTable(t)
+
+		cancelCtx, cancelFunc := WithCancel(ctx)
+		defer cancelFunc()
+		wfID := uuid.NewString()
+		handle, err := RunWorkflow(cancelCtx, wf, "", WithWorkflowID(wfID))
+		require.NoError(t, err)
+
+		started.Wait()
+		cancelFunc()
+
+		_, err = handle.GetResult()
+		require.Error(t, err, "expected error from cancelled workflow")
+		require.True(t, errors.Is(err, &DBOSError{Code: WorkflowCancelled}), "expected WorkflowCancelled error, got: %v", err)
+
+		require.Eventually(t, func() bool {
+			status, err := handle.GetStatus()
+			require.NoError(t, err)
+			return status.Status == WorkflowStatusCancelled
+		}, 5*time.Second, 100*time.Millisecond, "workflow did not reach cancelled status in time")
+
+		// Neither database recorded the interrupted transaction.
+		steps, err := GetWorkflowSteps(ctx, wfID)
+		require.NoError(t, err)
+		require.Len(t, steps, 0, "transaction interrupted by cancellation must not be checkpointed in the system DB")
+		require.Equal(t, 0, ub.countRows(t,
+			fmt.Sprintf(`SELECT count(*) FROM %s WHERE workflow_id = $1`, ub.completionTable()), wfID),
+			"transaction interrupted by cancellation must not be recorded in the user DB")
+
+		resumedHandle, err := ResumeWorkflow[string](ctx, wfID)
+		require.NoError(t, err)
+		res, err := resumedHandle.GetResult()
+		require.NoError(t, err, "resumed workflow should complete successfully")
+		require.Equal(t, "completed", res)
+		require.EqualValues(t, 2, attempts.Load(), "expected the transaction to re-execute on resume")
+
+		require.Equal(t, "v1", ub.queryString(t, `SELECT v FROM kv WHERE k = 'k1'`))
+		require.Equal(t, 1, ub.countRows(t,
+			fmt.Sprintf(`SELECT count(*) FROM %s WHERE workflow_id = $1`, ub.completionTable()), wfID))
+		steps, err = GetWorkflowSteps(ctx, wfID)
+		require.NoError(t, err)
+		require.Len(t, steps, 1, "expected the re-executed transaction to be checkpointed")
+	})
+
 	t.Run("Layer1ReplayOnRecovery", func(t *testing.T) {
 		ctx := setupDBOS(t, setupDBOSOptions{dropDB: true})
 		ub := openUserBackend(t)
@@ -516,11 +587,11 @@ func TestRunAsTransaction(t *testing.T) {
 		// Simulate a crash between txn1 (user commit) and txn2 (system
 		// checkpoint): drop the operation_outputs row but keep the
 		// transaction_completion row.
-		sys := ctx.(*dbosContext).systemDB.(*sysDB)
-		delQ := sys.dialect.RewriteQuery(fmt.Sprintf(
+		sys := ctx.(*dbosContext).systemDB.(*sysdb.SysDB)
+		delQ := sys.Dialect().RewriteQuery(fmt.Sprintf(
 			`DELETE FROM %soperation_outputs WHERE workflow_uuid = $1 AND function_id = $2`,
-			sys.dialect.SchemaPrefix(sys.schema)))
-		_, err = sys.pool.Exec(context.Background(), delQ, wfID, 0)
+			sys.Dialect().SchemaPrefix(sys.Schema())))
+		_, err = sys.Pool().Exec(context.Background(), delQ, wfID, 0)
 		require.NoError(t, err)
 		require.Equal(t, 1, ub.countRows(t,
 			fmt.Sprintf(`SELECT count(*) FROM %s WHERE workflow_id = $1 AND step_id = 0`, ub.completionTable()), wfID))
@@ -808,10 +879,10 @@ func setupSharedDBOS(t *testing.T) (DBOSContext, *DataSource, *userBackend) {
 		// WAL, immediate txlock) so the data source's DDL/writes coexist with the
 		// system DB's background loops on one *sql.DB without SQLITE_BUSY.
 		path := filepath.Join(t.TempDir(), "shared.db")
-		db, err := openSQLitePool(context.Background(), "sqlite:"+path)
+		db, err := sysdb.OpenSQLitePool(context.Background(), "sqlite:"+path)
 		require.NoError(t, err)
 		config = Config{AppName: "test-app", SqliteSystemDB: db}
-		ub = &userBackend{pool: newSQLPool(db), dialect: sqliteDialect{}, schema: _DEFAULT_SYSTEM_DB_SCHEMA}
+		ub = &userBackend{pool: sysdb.NewSQLPool(db), dialect: sysdb.SqliteDialect{}, schema: _DEFAULT_SYSTEM_DB_SCHEMA}
 	} else {
 		url := getDatabaseURL()
 		resetTestDatabase(t, url)
@@ -820,7 +891,7 @@ func setupSharedDBOS(t *testing.T) (DBOSContext, *DataSource, *userBackend) {
 		pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
 		require.NoError(t, err)
 		config = Config{AppName: "test-app", SystemDBPool: pool}
-		ub = &userBackend{pool: newPgxPool(pool), dialect: postgresDialect{}, schema: _DEFAULT_SYSTEM_DB_SCHEMA}
+		ub = &userBackend{pool: sysdb.NewPgxPool(pool), dialect: sysdb.PostgresDialect{}, schema: _DEFAULT_SYSTEM_DB_SCHEMA}
 	}
 
 	ctx, err := NewDBOSContext(context.Background(), config)

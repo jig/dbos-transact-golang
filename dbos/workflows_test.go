@@ -1,10 +1,13 @@
 package dbos
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"reflect"
 	"runtime"
 	"strings"
@@ -12,6 +15,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/jig/dbos-transact-golang/dbos/internal/models"
+	"github.com/jig/dbos-transact-golang/dbos/internal/sysdb"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -790,18 +796,28 @@ type faultTx struct {
 }
 
 func (t *faultTx) QueryRow(ctx context.Context, query string, args ...any) Row {
-	if strings.Contains(query, "operation_outputs") &&
-		len(args) > 0 && args[0] == t.p.target &&
+	target, _ := t.p.target.Load().(string)
+	if target != "" && strings.Contains(query, "operation_outputs") &&
+		len(args) > 0 && args[0] == any(target) &&
 		t.p.fired.CompareAndSwap(false, true) {
 		return errRow{errors.New("conn closed")} // retryable per postgresDialect.IsRetryable
 	}
 	return t.Tx.QueryRow(ctx, query, args...)
 }
 
+// faultPool is installed over sysDB.Pool() before Launch — while no goroutine
+// reads the field — and stays for the whole test, so arming it later doesn't
+// race pool readers such as the queue runner. Disarmed (empty target) it is a
+// transparent pass-through.
 type faultPool struct {
 	Pool
-	target string       // workflow ID whose operation_outputs read should fault
-	fired  *atomic.Bool // ensures the fault triggers at most once
+	target atomic.Value // string: workflow ID whose operation_outputs read should fault; "" disarms
+	fired  atomic.Bool  // ensures the fault triggers at most once per arm
+}
+
+func (p *faultPool) arm(workflowID string) {
+	p.fired.Store(false)
+	p.target.Store(workflowID)
 }
 
 func (p *faultPool) BeginTx(ctx context.Context, opts TxOptions) (Tx, error) {
@@ -823,6 +839,7 @@ func sleepStepIDDriftWorkflow(ctx DBOSContext, _ string) (string, error) {
 
 func TestSteps(t *testing.T) {
 	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
+	stepsDatabaseURL := backendDatabaseURL(t)
 
 	// Create workflows with executor
 	RegisterWorkflow(dbosCtx, stepWithinAStepWorkflow)
@@ -862,6 +879,14 @@ func TestSteps(t *testing.T) {
 		})
 	}
 	RegisterWorkflow(dbosCtx, wrongCtxWorkflow, WithWorkflowName("wrongCtxWorkflow"))
+
+	// Single-step workflow for the RecordOperationResultIdempotency subtest.
+	recordOpResultWf := func(ctx DBOSContext, _ string) (string, error) {
+		return RunAsStep(ctx, func(_ context.Context) (string, error) {
+			return "step-output", nil
+		})
+	}
+	RegisterWorkflow(dbosCtx, recordOpResultWf, WithWorkflowName("recordOpResultWf"))
 
 	// Define user-defined types for testing serialization
 	type StepInput struct {
@@ -938,6 +963,129 @@ func TestSteps(t *testing.T) {
 	RegisterWorkflow(dbosCtx, userObjectWorkflow)
 
 	RegisterWorkflow(dbosCtx, sleepStepIDDriftWorkflow)
+
+	var interruptedStepAttempts atomic.Int64
+	interruptedStepStarted := NewEvent()
+	interruptibleStepWorkflow := func(ctx DBOSContext, _ string) (string, error) {
+		return RunAsStep(ctx, func(ctx context.Context) (string, error) {
+			if interruptedStepAttempts.Add(1) == 1 {
+				interruptedStepStarted.Set()
+				<-ctx.Done()
+				return "", ctx.Err()
+			}
+			return "completed", nil
+		})
+	}
+	RegisterWorkflow(dbosCtx, interruptibleStepWorkflow)
+
+	// Child that accepts preemption: the first attempt blocks until cancelled,
+	// later attempts complete.
+	var awaitedChildExecutions atomic.Int64
+	awaitedChildStarted := NewEvent()
+	awaitedChildWorkflow := func(ctx DBOSContext, _ string) (string, error) {
+		if awaitedChildExecutions.Add(1) == 1 {
+			awaitedChildStarted.Set()
+			<-ctx.Done()
+			return "", ctx.Err()
+		}
+		return "child-result", nil
+	}
+	RegisterWorkflow(dbosCtx, awaitedChildWorkflow)
+
+	awaitingParentWorkflow := func(ctx DBOSContext, _ string) (string, error) {
+		childHandle, err := RunWorkflow(ctx, awaitedChildWorkflow, "")
+		if err != nil {
+			return "", err
+		}
+		return childHandle.GetResult()
+	}
+	RegisterWorkflow(dbosCtx, awaitingParentWorkflow)
+
+	// Child that ignores cancellation and completes once released.
+	var stubbornChildExecutions atomic.Int64
+	stubbornChildStarted := NewEvent()
+	stubbornChildRelease := make(chan struct{})
+	stubbornChildWorkflow := func(ctx DBOSContext, _ string) (string, error) {
+		stubbornChildExecutions.Add(1)
+		stubbornChildStarted.Set()
+		<-stubbornChildRelease
+		return "child-result", nil
+	}
+	RegisterWorkflow(dbosCtx, stubbornChildWorkflow)
+
+	stubbornParentWorkflow := func(ctx DBOSContext, _ string) (string, error) {
+		childHandle, err := RunWorkflow(ctx, stubbornChildWorkflow, "")
+		if err != nil {
+			return "", err
+		}
+		res, err := childHandle.GetResult()
+		if err != nil {
+			return "", err
+		}
+		return RunAsStep(ctx, func(stepCtx context.Context) (string, error) {
+			if stepCtx.Err() != nil {
+				return "", stepCtx.Err()
+			}
+			return res + "-done", nil
+		})
+	}
+	RegisterWorkflow(dbosCtx, stubbornParentWorkflow)
+
+	// Child cancelled via the API while the parent stays healthy: blocks until
+	// released, then observes its cancellation at the next step boundary.
+	var apiCancelledChildID string
+	apiCancelChildStarted := NewEvent()
+	apiCancelChildRelease := make(chan struct{})
+	apiCancelChildWorkflow := func(ctx DBOSContext, _ string) (string, error) {
+		id, err := GetWorkflowID(ctx)
+		if err != nil {
+			return "", err
+		}
+		apiCancelledChildID = id
+		apiCancelChildStarted.Set()
+		<-apiCancelChildRelease
+		return RunAsStep(ctx, func(context.Context) (string, error) {
+			return "child-result", nil
+		})
+	}
+	RegisterWorkflow(dbosCtx, apiCancelChildWorkflow)
+
+	apiCancelParentWorkflow := func(ctx DBOSContext, _ string) (string, error) {
+		childHandle, err := RunWorkflow(ctx, apiCancelChildWorkflow, "")
+		if err != nil {
+			return "", err
+		}
+		return childHandle.GetResult()
+	}
+	RegisterWorkflow(dbosCtx, apiCancelParentWorkflow)
+
+	// Two live executions of the same workflow race to checkpoint this step:
+	// each blocks until released; the one released second loses the checkpoint
+	// race. Used by ConflictingRunDisarmsDurableCancel.
+	var conflictCancelExecs atomic.Int64
+	conflictCancelFirstStarted := NewEvent()
+	conflictCancelSecondStarted := NewEvent()
+	conflictCancelReleaseFirst := make(chan struct{})
+	conflictCancelReleaseSecond := make(chan struct{})
+	conflictCancelWorkflow := func(ctx DBOSContext, _ string) (string, error) {
+		return RunAsStep(ctx, func(context.Context) (string, error) {
+			if conflictCancelExecs.Add(1) == 1 {
+				conflictCancelFirstStarted.Set()
+				<-conflictCancelReleaseFirst
+			} else {
+				conflictCancelSecondStarted.Set()
+				<-conflictCancelReleaseSecond
+			}
+			return "ok", nil
+		})
+	}
+	RegisterWorkflow(dbosCtx, conflictCancelWorkflow, WithWorkflowName("conflict-cancel-workflow"))
+
+	// Installed before Launch so no goroutine reads sysDB.Pool() concurrently
+	// with the swap; armed on demand by StepIDNotReallocatedOnDBRetry.
+	sysDB := dbosCtx.(*dbosContext).systemDB.(*sysdb.SysDB)
+	stepsFaultPool := &faultPool{Pool: sysDB.Pool()}
+	sysDB.SetPool(stepsFaultPool)
 
 	err := Launch(dbosCtx)
 	require.NoError(t, err, "failed to launch DBOS")
@@ -1042,7 +1190,7 @@ func TestSteps(t *testing.T) {
 		// Verify the wrapping contract itself (not just the formatted message):
 		// the error must match the MaxStepRetriesExceeded code via errors.Is, and
 		// the underlying step errors must remain reachable through Unwrap. This
-		// last check fails if newMaxStepRetriesExceededError stops setting wrappedErr.
+		// last check fails if models.NewMaxStepRetriesExceededError stops setting wrappedErr.
 		assert.True(t, errors.Is(err, &DBOSError{Code: MaxStepRetriesExceeded}), "expected errors.Is to match MaxStepRetriesExceeded code")
 		assert.True(t, errors.Is(err, errStepRetrySentinel), "expected underlying step error to be reachable via errors.Is (Unwrap chain)")
 
@@ -1182,21 +1330,15 @@ func TestSteps(t *testing.T) {
 	t.Run("StepIDNotReallocatedOnDBRetry", func(t *testing.T) {
 		wfID := "step-id-drift-test"
 
-		s := dbosCtx.(*dbosContext).systemDB.(*sysDB)
-		orig := s.pool
-		var fired atomic.Bool
-		s.pool = &faultPool{Pool: orig, target: wfID, fired: &fired}
-		// The listener captured the real pool at Launch and no longer reads the
-		// field; the workflow goroutine is joined via GetResult before we restore,
-		// so this swap is race-free.
-		defer func() { s.pool = orig }()
+		stepsFaultPool.arm(wfID)
+		defer stepsFaultPool.arm("")
 
 		handle, err := RunWorkflow(dbosCtx, sleepStepIDDriftWorkflow, "", WithWorkflowID(wfID))
 		require.NoError(t, err)
 		result, err := handle.GetResult()
 		require.NoError(t, err)
 		require.Equal(t, "ok", result)
-		require.True(t, fired.Load(), "fault injection never triggered; the test did not exercise a retry")
+		require.True(t, stepsFaultPool.fired.Load(), "fault injection never triggered; the test did not exercise a retry")
 
 		steps, err := GetWorkflowSteps(dbosCtx, wfID)
 		require.NoError(t, err)
@@ -1204,6 +1346,452 @@ func TestSteps(t *testing.T) {
 		require.Equal(t, "DBOS.sleep", steps[0].StepName)
 		require.Equal(t, 0, steps[0].StepID,
 			"step ID was reallocated by the DB-layer retry: nextStepID() must be called outside the retried closure")
+	})
+
+	t.Run("CancelledStepNotCheckpointed", func(t *testing.T) {
+		// A step interrupted by workflow cancellation must not checkpoint its
+		// cancellation error, so resume re-executes it instead of replaying the error.
+		cancelCtx, cancelFunc := WithTimeout(dbosCtx, 5*time.Hour)
+		defer cancelFunc()
+		handle, err := RunWorkflow(cancelCtx, interruptibleStepWorkflow, "")
+		require.NoError(t, err, "failed to start workflow")
+
+		interruptedStepStarted.Wait()
+		cancelFunc()
+
+		_, err = handle.GetResult()
+		require.Error(t, err, "expected error from cancelled workflow")
+		require.True(t, errors.Is(err, &DBOSError{Code: WorkflowCancelled}), "expected WorkflowCancelled error, got: %v", err)
+		require.True(t, errors.Is(err, context.Canceled), "expected wrapped context.Canceled, got: %v", err)
+
+		require.Eventually(t, func() bool {
+			status, err := handle.GetStatus()
+			require.NoError(t, err, "failed to get workflow status")
+			return status.Status == WorkflowStatusCancelled
+		}, 5*time.Second, 100*time.Millisecond, "workflow did not reach cancelled status in time")
+
+		steps, err := GetWorkflowSteps(dbosCtx, handle.GetWorkflowID())
+		require.NoError(t, err, "failed to get workflow steps")
+		require.Len(t, steps, 0, "step interrupted by cancellation must not be recorded")
+
+		resumedHandle, err := ResumeWorkflow[string](dbosCtx, handle.GetWorkflowID())
+		require.NoError(t, err, "failed to resume workflow")
+		result, err := resumedHandle.GetResult()
+		require.NoError(t, err, "resumed workflow should complete successfully")
+		require.Equal(t, "completed", result)
+		require.EqualValues(t, 2, interruptedStepAttempts.Load(), "expected the step to re-execute on resume")
+
+		steps, err = GetWorkflowSteps(dbosCtx, handle.GetWorkflowID())
+		require.NoError(t, err, "failed to get workflow steps after resume")
+		require.Len(t, steps, 1, "expected the re-executed step to be recorded")
+	})
+
+	t.Run("CancelledParentCancelsChild", func(t *testing.T) {
+		// Cancelling the parent durably cancels the child too: a cancelled run
+		// never writes its outcome, even if its function ignores cancellation and
+		// returns successfully. The parent checkpoints the child's cancellation
+		// via getResult; resuming the parent replays it deterministically.
+		cancelCtx, cancelFunc := WithCancel(dbosCtx)
+		defer cancelFunc()
+		handle, err := RunWorkflow(cancelCtx, stubbornParentWorkflow, "")
+		require.NoError(t, err, "failed to start parent workflow")
+
+		stubbornChildStarted.Wait()
+		cancelFunc()
+		close(stubbornChildRelease)
+
+		_, err = handle.GetResult()
+		require.Error(t, err, "expected error from cancelled parent")
+		require.True(t, errors.Is(err, &DBOSError{Code: AwaitedWorkflowCancelled}), "expected AwaitedWorkflowCancelled, got: %v", err)
+
+		require.Eventually(t, func() bool {
+			status, err := handle.GetStatus()
+			require.NoError(t, err, "failed to get workflow status")
+			return status.Status == WorkflowStatusCancelled
+		}, 5*time.Second, 100*time.Millisecond, "parent did not reach cancelled status in time")
+
+		steps, err := GetWorkflowSteps(dbosCtx, handle.GetWorkflowID())
+		require.NoError(t, err, "failed to get workflow steps")
+		require.Len(t, steps, 2, "expected child spawn and getResult recorded")
+		childID := steps[0].ChildWorkflowID
+		require.NotEmpty(t, childID, "expected the first step to be the child spawn")
+		require.Equal(t, "DBOS.getResult", steps[1].StepName)
+		require.NotNil(t, steps[1].Error, "the child's cancellation must be checkpointed")
+
+		childHandle, err := RetrieveWorkflow[string](dbosCtx, childID)
+		require.NoError(t, err, "failed to retrieve child workflow")
+		childStatus, err := childHandle.GetStatus()
+		require.NoError(t, err, "failed to get child workflow status")
+		require.Equal(t, WorkflowStatusCancelled, childStatus.Status, "child cannot outlive the parent's cancellation")
+
+		// The checkpointed child cancellation is a terminal outcome for the
+		// parent: resuming replays it.
+		resumedHandle, err := ResumeWorkflow[string](dbosCtx, handle.GetWorkflowID())
+		require.NoError(t, err, "failed to resume parent workflow")
+		_, err = resumedHandle.GetResult()
+		require.Error(t, err, "resumed parent must replay the checkpointed child cancellation")
+		require.True(t, errors.Is(err, &DBOSError{Code: AwaitedWorkflowCancelled}), "expected AwaitedWorkflowCancelled on replay, got: %v", err)
+		require.EqualValues(t, 1, stubbornChildExecutions.Load(), "child must not re-execute on parent resume")
+
+		status, err := resumedHandle.GetStatus()
+		require.NoError(t, err, "failed to get resumed workflow status")
+		require.Equal(t, WorkflowStatusError, status.Status, "replayed child cancellation is a terminal error outcome")
+	})
+
+	t.Run("PreemptedChildCancellationNotCheckpointed", func(t *testing.T) {
+		// Parent cancelled while awaiting a child that accepts preemption: the
+		// child's cancellation error passes through getResult and must not be
+		// checkpointed, so the parent resumes at the await. After resuming the
+		// child, resuming the parent re-awaits and gets the child's real outcome.
+		cancelCtx, cancelFunc := WithCancel(dbosCtx)
+		defer cancelFunc()
+		handle, err := RunWorkflow(cancelCtx, awaitingParentWorkflow, "")
+		require.NoError(t, err, "failed to start parent workflow")
+
+		awaitedChildStarted.Wait()
+		cancelFunc()
+
+		_, err = handle.GetResult()
+		require.Error(t, err, "expected error from cancelled parent")
+		// The durable cancel lands in the DB as soon as the context is cancelled,
+		// so the parent is interrupted either by the delivered child cancellation
+		// or by observing its own CANCELLED status at the step boundary.
+		require.True(t, errors.Is(err, &DBOSError{Code: WorkflowCancelled}), "expected WorkflowCancelled error, got: %v", err)
+
+		require.Eventually(t, func() bool {
+			status, err := handle.GetStatus()
+			require.NoError(t, err, "failed to get workflow status")
+			return status.Status == WorkflowStatusCancelled
+		}, 5*time.Second, 100*time.Millisecond, "parent did not reach cancelled status in time")
+
+		steps, err := GetWorkflowSteps(dbosCtx, handle.GetWorkflowID())
+		require.NoError(t, err, "failed to get workflow steps")
+		require.Len(t, steps, 1, "only the child spawn must be recorded, not the preempted await")
+		childID := steps[0].ChildWorkflowID
+		require.NotEmpty(t, childID, "expected the recorded step to be the child spawn")
+
+		childHandle, err := RetrieveWorkflow[string](dbosCtx, childID)
+		require.NoError(t, err, "failed to retrieve child workflow")
+		require.Eventually(t, func() bool {
+			status, err := childHandle.GetStatus()
+			require.NoError(t, err, "failed to get child workflow status")
+			return status.Status == WorkflowStatusCancelled
+		}, 5*time.Second, 100*time.Millisecond, "child did not reach cancelled status in time")
+
+		// Resume the child, then the parent: the re-executed await must return
+		// the child's real outcome.
+		resumedChild, err := ResumeWorkflow[string](dbosCtx, childID)
+		require.NoError(t, err, "failed to resume child workflow")
+		childResult, err := resumedChild.GetResult()
+		require.NoError(t, err, "resumed child should complete")
+		require.Equal(t, "child-result", childResult)
+
+		resumedHandle, err := ResumeWorkflow[string](dbosCtx, handle.GetWorkflowID())
+		require.NoError(t, err, "failed to resume parent workflow")
+		result, err := resumedHandle.GetResult()
+		require.NoError(t, err, "resumed parent should complete with the child's outcome")
+		require.Equal(t, "child-result", result)
+		require.EqualValues(t, 2, awaitedChildExecutions.Load(), "child executes once per attempt, never replays past outcomes")
+
+		steps, err = GetWorkflowSteps(dbosCtx, handle.GetWorkflowID())
+		require.NoError(t, err, "failed to get workflow steps after resume")
+		require.Len(t, steps, 2, "expected spawn and the re-executed getResult after resume")
+		require.Equal(t, "DBOS.getResult", steps[1].StepName)
+		require.Nil(t, steps[1].Error)
+	})
+
+	t.Run("CancelledChildOutcomeCheckpointed", func(t *testing.T) {
+		// The child is cancelled via the API while the parent stays healthy: the
+		// child's cancellation is a terminal outcome for the parent, recorded
+		// durably by getResult so replay is deterministic (like the other SDKs).
+		handle, err := RunWorkflow(dbosCtx, apiCancelParentWorkflow, "")
+		require.NoError(t, err, "failed to start parent workflow")
+
+		apiCancelChildStarted.Wait()
+		require.NoError(t, CancelWorkflow(dbosCtx, apiCancelledChildID), "failed to cancel child workflow")
+		close(apiCancelChildRelease)
+
+		_, err = handle.GetResult()
+		require.Error(t, err, "expected error from parent awaiting a cancelled child")
+		require.True(t, errors.Is(err, &DBOSError{Code: AwaitedWorkflowCancelled}), "expected AwaitedWorkflowCancelled error, got: %v", err)
+
+		status, err := handle.GetStatus()
+		require.NoError(t, err, "failed to get parent workflow status")
+		require.Equal(t, WorkflowStatusError, status.Status, "healthy parent observing a cancelled child ends in ERROR")
+
+		childHandle, err := RetrieveWorkflow[string](dbosCtx, apiCancelledChildID)
+		require.NoError(t, err, "failed to retrieve child workflow")
+		childStatus, err := childHandle.GetStatus()
+		require.NoError(t, err, "failed to get child workflow status")
+		require.Equal(t, WorkflowStatusCancelled, childStatus.Status, "expected child workflow to be cancelled")
+
+		steps, err := GetWorkflowSteps(dbosCtx, handle.GetWorkflowID())
+		require.NoError(t, err, "failed to get workflow steps")
+		require.Len(t, steps, 2, "expected the child spawn and the recorded getResult")
+		require.Equal(t, "DBOS.getResult", steps[1].StepName)
+		require.Error(t, steps[1].Error, "the child's cancellation must be durably recorded")
+		require.True(t, errors.Is(steps[1].Error, &DBOSError{Code: AwaitedWorkflowCancelled}), "expected recorded AwaitedWorkflowCancelled error, got: %v", steps[1].Error)
+	})
+
+	t.Run("ConflictingRunDisarmsDurableCancel", func(t *testing.T) {
+		// When two live executions of the same workflow ID race to checkpoint a
+		// step, the loser's function returns ConflictingIDError and its
+		// RunWorkflow goroutine awaits the winner's result. Losing the conflict
+		// disproves ownership, so the branch must disarm the durable-cancel
+		// AfterFunc right there: a later cancellation of the context the caller
+		// used for the losing dispatch (the routine `defer cancelFunc()`
+		// pattern) must not durably cancel the owning — or a future resumed —
+		// run. The disarm cannot wait for the branch to settle: the loss is
+		// observable through polling handles while the loser is still awaiting.
+		//
+		// The losing execution needs a real second executor: a single
+		// in-process guard cannot double-run a workflow (same construction as
+		// TestRecvStepConflict). No leak check: its lifetime overlaps dbosCtx's.
+		// Pin executor B to the parent's database: sqlite URLs are per-test, so a
+		// subtest's setupDBOS would otherwise get a fresh DB with nothing to recover.
+		ctxB := setupDBOS(t, setupDBOSOptions{dropDB: false, checkLeaks: false, databaseURL: stepsDatabaseURL})
+		RegisterWorkflow(ctxB, conflictCancelWorkflow, WithWorkflowName("conflict-cancel-workflow"))
+		// Register the parking queue on executor B but don't listen to it (and
+		// never register it on the main executor), so the later resume leaves
+		// the workflow durably ENQUEUED — making a spurious cancel observable.
+		const parkedQueue = "conflict-cancel-parked-queue"
+		_, err := RegisterQueue(ctxB, parkedQueue)
+		require.NoError(t, err, "failed to register parking queue")
+		ListenQueues(ctxB, WorkflowQueue{Name: "conflict-cancel-unused-queue"})
+		require.NoError(t, Launch(ctxB), "failed to launch executor B")
+
+		wfID := uuid.NewString()
+
+		// Execution 1 on the main executor: enters the step and blocks.
+		handleA, err := RunWorkflow(dbosCtx, conflictCancelWorkflow, "", WithWorkflowID(wfID))
+		require.NoError(t, err, "failed to start workflow")
+		conflictCancelFirstStarted.Wait()
+
+		// Execution 2 on executor B, dispatched under a user-cancellable
+		// context. Recovery dispatch is the sanctioned way to get a genuinely
+		// concurrent second execution (a direct RunWorkflow attaches to the
+		// owner's run instead).
+		cancelCtx, cancelFunc := WithCancel(ctxB)
+		defer cancelFunc()
+		recovered, err := recoverPendingWorkflows(cancelCtx.(*dbosContext), []string{"local"})
+		require.NoError(t, err, "failed to recover the workflow on executor B")
+		require.Len(t, recovered, 1, "expected exactly one pending workflow to recover")
+		require.Equal(t, wfID, recovered[0].GetWorkflowID())
+		conflictCancelSecondStarted.Wait()
+
+		// Cancel the workflow durably, then let execution 1 finish: its
+		// in-flight step checkpoints and the run ends cancelled.
+		require.NoError(t, CancelWorkflow(dbosCtx, wfID), "failed to cancel workflow")
+		close(conflictCancelReleaseFirst)
+		_, _ = handleA.GetResult()
+
+		// Let execution 2 finish: its step-0 checkpoint hits the unique
+		// violation and its goroutine takes the conflict-await branch.
+		close(conflictCancelReleaseSecond)
+		_, err = recovered[0].GetResult()
+		require.Error(t, err, "the losing execution must observe the cancelled outcome")
+		require.True(t, errors.Is(err, &DBOSError{Code: AwaitedWorkflowCancelled}) || errors.Is(err, &DBOSError{Code: WorkflowCancelled}),
+			"expected a cancellation error from the losing execution, got: %v", err)
+		require.EqualValues(t, 2, conflictCancelExecs.Load(), "both executions must have genuinely run the step body")
+
+		// Resume the workflow onto the unlistened queue: it is durably
+		// ENQUEUED, non-terminal again.
+		resumedHandle, err := ResumeWorkflow[string](ctxB, wfID, WithResumeQueue(parkedQueue))
+		require.NoError(t, err, "failed to resume workflow")
+		status, err := resumedHandle.GetStatus()
+		require.NoError(t, err, "failed to get resumed workflow status")
+		require.Equal(t, WorkflowStatusEnqueued, status.Status, "precondition: resumed workflow is ENQUEUED")
+
+		// Cancel the context used for the conflicting dispatch. That run lost
+		// the conflict and never owned this workflow: the resumed row must not
+		// be touched. A still-armed AfterFunc would durably cancel it within
+		// milliseconds.
+		cancelFunc()
+
+		// Poll synchronously rather than with require.Never: testify runs each
+		// tick in a goroutine and returns at the timeout without awaiting an
+		// in-flight tick, so a straggler GetStatus can race the subtest's
+		// ctxB shutdown in t.Cleanup and fail with "context canceled".
+		for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+			status, err := resumedHandle.GetStatus()
+			require.NoError(t, err, "failed to get workflow status")
+			require.NotEqual(t, WorkflowStatusCancelled, status.Status,
+				"cancelling the stale conflicting-dispatch context must not durably cancel the resumed workflow")
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		// Drain: start listening to the parking queue so the resumed workflow
+		// completes (replaying the checkpointed step), which also lets the
+		// loser's conflict-await goroutine finish before executor B shuts down.
+		ListenQueues(ctxB, WorkflowQueue{Name: parkedQueue})
+		result, err := resumedHandle.GetResult()
+		require.NoError(t, err, "resumed workflow should complete")
+		require.Equal(t, "ok", result)
+	})
+
+	t.Run("RecordOperationResultIdempotency", func(t *testing.T) {
+		handle, err := RunWorkflow(dbosCtx, recordOpResultWf, "")
+		require.NoError(t, err, "failed to start workflow")
+		res, err := handle.GetResult()
+		require.NoError(t, err, "failed to get workflow result")
+		require.Equal(t, "step-output", res)
+
+		wfID := handle.GetWorkflowID()
+		sysDB, ok := dbosCtx.(*dbosContext).systemDB.(*sysdb.SysDB)
+		require.True(t, ok, "expected sysDB instance")
+		ctx := context.Background()
+
+		// Read the step-0 checkpoint exactly as recorded, so the test can replay a
+		// byte-identical write (the lost-commit-ack retry) without depending on
+		// name-resolution or serialization details.
+		var recordedName string
+		var recordedOutput *string
+		var recordedSerialization *string
+		var recordedStartedAtMs, recordedCompletedAtMs int64
+		q := sysDB.RenderSQL(`SELECT function_name, output, serialization, started_at_epoch_ms, completed_at_epoch_ms
+			FROM %soperation_outputs WHERE workflow_uuid = $1 AND function_id = 0`, sysDB.Dialect().SchemaPrefix(sysDB.Schema()))
+		require.NoError(t, sysDB.Pool().QueryRow(ctx, q, wfID).Scan(
+			&recordedName, &recordedOutput, &recordedSerialization, &recordedStartedAtMs, &recordedCompletedAtMs))
+		require.NotNil(t, recordedOutput)
+		require.NotNil(t, recordedSerialization)
+
+		t.Run("IdenticalRetrySucceeds", func(t *testing.T) {
+			// Same content and timestamps as the recorded row: this is our own write
+			// re-run after a lost commit ack, and must be a no-op success.
+			err := sysDB.RecordOperationResult(ctx, sysdb.RecordOperationResultDBInput{
+				WorkflowID:    wfID,
+				StepID:        0,
+				StepName:      recordedName,
+				Output:        recordedOutput,
+				StartedAt:     time.UnixMilli(recordedStartedAtMs),
+				CompletedAt:   time.UnixMilli(recordedCompletedAtMs),
+				Serialization: *recordedSerialization,
+			})
+			require.NoError(t, err, "replaying our own committed write must succeed")
+		})
+
+		t.Run("DifferentWriteIsConflict", func(t *testing.T) {
+			// Same step, different content/timestamps: a concurrent execution
+			// checkpointed first; the caller must park via ConflictingIDError.
+			differentPayload := "different-payload"
+			err := sysDB.RecordOperationResult(ctx, sysdb.RecordOperationResultDBInput{
+				WorkflowID:    wfID,
+				StepID:        0,
+				StepName:      recordedName,
+				Output:        &differentPayload,
+				StartedAt:     time.Now(),
+				CompletedAt:   time.Now(),
+				Serialization: *recordedSerialization,
+			})
+			require.Error(t, err, "a different write at a recorded step must be a conflict")
+			var dbosErr *DBOSError
+			require.ErrorAs(t, err, &dbosErr)
+			require.Equal(t, ConflictingIDError, dbosErr.Code)
+		})
+
+		t.Run("FreshRecordSucceeds", func(t *testing.T) {
+			payload := "fresh-payload"
+			err := sysDB.RecordOperationResult(ctx, sysdb.RecordOperationResultDBInput{
+				WorkflowID:    wfID,
+				StepID:        99,
+				StepName:      "someStep",
+				Output:        &payload,
+				StartedAt:     time.Now(),
+				CompletedAt:   time.Now(),
+				Serialization: "json",
+			})
+			require.NoError(t, err)
+		})
+
+		t.Run("MismatchedNameIsNonDeterminismError", func(t *testing.T) {
+			err := sysDB.RecordOperationResult(ctx, sysdb.RecordOperationResultDBInput{
+				WorkflowID:    wfID,
+				StepID:        0,
+				StepName:      recordedName + "-different",
+				StartedAt:     time.Now(),
+				CompletedAt:   time.Now(),
+				Serialization: "json",
+			})
+			require.Error(t, err, "a different step name at a recorded step must be a non-determinism error")
+			var dbosErr *DBOSError
+			require.ErrorAs(t, err, &dbosErr)
+			require.Equal(t, UnexpectedStep, dbosErr.Code)
+			require.Equal(t, recordedName+"-different", dbosErr.ExpectedName)
+			require.Equal(t, recordedName, dbosErr.RecordedName)
+		})
+	})
+
+	t.Run("StepOptionsRetryIntervalDefaults", func(t *testing.T) {
+		tests := []struct {
+			name         string
+			baseInterval time.Duration
+			maxInterval  time.Duration
+			wantBase     time.Duration
+			wantMax      time.Duration
+			wantWarning  bool
+		}{
+			{
+				name:     "both implicit",
+				wantBase: _DEFAULT_STEP_BASE_INTERVAL,
+				wantMax:  _DEFAULT_STEP_MAX_INTERVAL,
+			},
+			{
+				name:         "explicit base below implicit max",
+				baseInterval: time.Second,
+				wantBase:     time.Second,
+				wantMax:      _DEFAULT_STEP_MAX_INTERVAL,
+			},
+			{
+				name:         "explicit base equals implicit max",
+				baseInterval: _DEFAULT_STEP_MAX_INTERVAL,
+				wantBase:     _DEFAULT_STEP_MAX_INTERVAL,
+				wantMax:      _DEFAULT_STEP_MAX_INTERVAL,
+			},
+			{
+				name:         "explicit base exceeds implicit max",
+				baseInterval: 2 * _DEFAULT_STEP_MAX_INTERVAL,
+				wantBase:     2 * _DEFAULT_STEP_MAX_INTERVAL,
+				wantMax:      2 * _DEFAULT_STEP_MAX_INTERVAL,
+				wantWarning:  true,
+			},
+			{
+				name:        "implicit base and explicit max",
+				maxInterval: time.Second,
+				wantBase:    _DEFAULT_STEP_BASE_INTERVAL,
+				wantMax:     time.Second,
+			},
+			{
+				name:         "explicit max below explicit base remains explicit",
+				baseInterval: 2 * time.Second,
+				maxInterval:  time.Second,
+				wantBase:     2 * time.Second,
+				wantMax:      time.Second,
+			},
+			{
+				name:         "explicit max above explicit base",
+				baseInterval: 2 * _DEFAULT_STEP_MAX_INTERVAL,
+				maxInterval:  3 * _DEFAULT_STEP_MAX_INTERVAL,
+				wantBase:     2 * _DEFAULT_STEP_MAX_INTERVAL,
+				wantMax:      3 * _DEFAULT_STEP_MAX_INTERVAL,
+			},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				var logOutput bytes.Buffer
+				logger := slog.New(slog.NewTextHandler(&logOutput, nil))
+				opts := stepOptions{
+					baseInterval: tt.baseInterval,
+					maxInterval:  tt.maxInterval,
+				}
+
+				opts.setDefaults(logger)
+
+				require.Equal(t, tt.wantBase, opts.baseInterval)
+				require.Equal(t, tt.wantMax, opts.maxInterval)
+				require.Equal(t, tt.wantWarning, strings.Contains(logOutput.String(), "increasing max interval"))
+			})
+		}
 	})
 }
 
@@ -1339,8 +1927,12 @@ func TestSelect(t *testing.T) {
 
 	selectBlockStartEvent := NewEvent()
 	selectBlockEvent := NewEvent()
+	selectGoStepStarted := NewEvent()
 	selectCancelWorkflow := func(dbosCtx DBOSContext, input string) (string, error) {
 		ch1, err := Go(dbosCtx, func(ctx context.Context) (string, error) {
+			// Signal the step body has started (its checkpoint lookup passed), so
+			// the test can cancel without racing the durable cancel against it.
+			selectGoStepStarted.Set()
 			selectBlockEvent.Wait()
 			return "result", nil
 		})
@@ -1418,6 +2010,12 @@ func TestSelect(t *testing.T) {
 		// Wait for the workflow to reach the Select call (step has started and set the event)
 		selectBlockStartEvent.Wait()
 		selectBlockStartEvent.Clear()
+		// Wait for the Go step body to start: once it runs, its outcome is delivered
+		// and checkpointed even though the workflow is cancelled. Cancelling earlier
+		// would race the durable cancel against the step's checkpoint lookup, which
+		// can refuse to start the step at all (a valid outcome, but not this test's).
+		selectGoStepStarted.Wait()
+		selectGoStepStarted.Clear()
 
 		// Cancel the context manually
 		cancelFunc(nil)
@@ -1427,29 +2025,29 @@ func TestSelect(t *testing.T) {
 		require.Error(t, err, "expected error from cancelled workflow")
 		assert.Equal(t, "", result, "expected zero value string when cancelled")
 
-		// Verify the error is a cancellation error
-		assert.True(t, errors.Is(err, context.Canceled), "expected context.Canceled error, got: %v", err)
+		// Verify the error is a cancellation error. The durable cancel lands in the
+		// DB as soon as the context is cancelled, so Select is interrupted either
+		// mid-wait (wrapping context.Canceled) or at its step boundary by observing
+		// the CANCELLED status; both wrap WorkflowCancelled.
+		assert.True(t, errors.Is(err, &DBOSError{Code: WorkflowCancelled}), "expected WorkflowCancelled error, got: %v", err)
 
 		// Set the event to unblock the goroutine (cleanup)
 		selectBlockEvent.Set()
 
-		// Verify workflow status is error (Select returns an error when the context is cancelled)
+		// Verify workflow status is cancelled (the workflow was interrupted by context cancellation)
 		status, err := handle.GetStatus()
 		require.NoError(t, err, "failed to get workflow status")
-		assert.Equal(t, WorkflowStatusError, status.Status, "expected workflow status to be WorkflowStatusError")
+		assert.Equal(t, WorkflowStatusCancelled, status.Status, "expected workflow status to be WorkflowStatusCancelled")
 
-		// Verify DBOS.select step is present at index 1 (after Go step at index 0)
-		// There is a race condition here, so we need to wait for the steps to be recorded
+		// The cancelled Select step must not be checkpointed (it would replay its
+		// cancellation error on resume); only the Go step, unblocked above, records.
 		require.Eventually(t, func() bool {
 			steps, err := GetWorkflowSteps(dbosCtx, handle.GetWorkflowID())
 			if err != nil {
 				return false
 			}
-			if len(steps) != 2 {
-				return false
-			}
-			return steps[1].StepName == "DBOS.select" && steps[1].StepID == 1
-		}, 5*time.Second, 100*time.Millisecond, "expected 2 steps (Go + Select) with DBOS.select at index 1")
+			return len(steps) == 1 && steps[0].StepID == 0
+		}, 5*time.Second, 100*time.Millisecond, "expected only the Go step to be recorded")
 	})
 
 	t.Run("Select idempotency", func(t *testing.T) {
@@ -2058,24 +2656,24 @@ func TestChildWorkflow(t *testing.T) {
 		require.NoError(t, err)
 
 		// Verify events, streams, notifications, and steps exist via direct DB query
-		sysDB := dbosCtx.(*dbosContext).systemDB.(*sysDB)
-		schemaPrefix := sysDB.dialect.SchemaPrefix(sysDB.schema)
+		sysDB := dbosCtx.(*dbosContext).systemDB.(*sysdb.SysDB)
+		schemaPrefix := sysDB.Dialect().SchemaPrefix(sysDB.Schema())
 
 		var eventCount, streamCount, notifCount, stepCount int
-		err = sysDB.pool.QueryRow(dbosCtx,
-			sysDB.renderSQL(`SELECT COUNT(*) FROM %sworkflow_events WHERE workflow_uuid = $1`, schemaPrefix),
+		err = sysDB.Pool().QueryRow(dbosCtx,
+			sysDB.RenderSQL(`SELECT COUNT(*) FROM %sworkflow_events WHERE workflow_uuid = $1`, schemaPrefix),
 			wfID).Scan(&eventCount)
 		require.NoError(t, err)
 		require.Greater(t, eventCount, 0, "expected events to exist before deletion")
 
-		err = sysDB.pool.QueryRow(dbosCtx,
-			sysDB.renderSQL(`SELECT COUNT(*) FROM %sstreams WHERE workflow_uuid = $1`, schemaPrefix),
+		err = sysDB.Pool().QueryRow(dbosCtx,
+			sysDB.RenderSQL(`SELECT COUNT(*) FROM %sstreams WHERE workflow_uuid = $1`, schemaPrefix),
 			wfID).Scan(&streamCount)
 		require.NoError(t, err)
 		require.Greater(t, streamCount, 0, "expected stream entries to exist before deletion")
 
-		err = sysDB.pool.QueryRow(dbosCtx,
-			sysDB.renderSQL(`SELECT COUNT(*) FROM %snotifications WHERE destination_uuid = $1`, schemaPrefix),
+		err = sysDB.Pool().QueryRow(dbosCtx,
+			sysDB.RenderSQL(`SELECT COUNT(*) FROM %snotifications WHERE destination_uuid = $1`, schemaPrefix),
 			wfID).Scan(&notifCount)
 		require.NoError(t, err)
 		require.Greater(t, notifCount, 0, "expected notifications to exist before deletion")
@@ -2088,8 +2686,8 @@ func TestChildWorkflow(t *testing.T) {
 		// so we just check the floor.
 		require.GreaterOrEqual(t, len(steps), 4, "expected at least 4 steps: SetEvent, WriteStream, CloseStream, Recv")
 
-		err = sysDB.pool.QueryRow(dbosCtx,
-			sysDB.renderSQL(`SELECT COUNT(*) FROM %soperation_outputs WHERE workflow_uuid = $1`, schemaPrefix),
+		err = sysDB.Pool().QueryRow(dbosCtx,
+			sysDB.RenderSQL(`SELECT COUNT(*) FROM %soperation_outputs WHERE workflow_uuid = $1`, schemaPrefix),
 			wfID).Scan(&stepCount)
 		require.NoError(t, err)
 		require.Greater(t, stepCount, 0, "expected operation_outputs to exist before deletion")
@@ -2099,26 +2697,26 @@ func TestChildWorkflow(t *testing.T) {
 		require.NoError(t, err)
 
 		// Verify all related data was cascade-deleted
-		err = sysDB.pool.QueryRow(dbosCtx,
-			sysDB.renderSQL(`SELECT COUNT(*) FROM %sworkflow_events WHERE workflow_uuid = $1`, schemaPrefix),
+		err = sysDB.Pool().QueryRow(dbosCtx,
+			sysDB.RenderSQL(`SELECT COUNT(*) FROM %sworkflow_events WHERE workflow_uuid = $1`, schemaPrefix),
 			wfID).Scan(&eventCount)
 		require.NoError(t, err)
 		require.Equal(t, 0, eventCount, "expected events to be cascade-deleted")
 
-		err = sysDB.pool.QueryRow(dbosCtx,
-			sysDB.renderSQL(`SELECT COUNT(*) FROM %sstreams WHERE workflow_uuid = $1`, schemaPrefix),
+		err = sysDB.Pool().QueryRow(dbosCtx,
+			sysDB.RenderSQL(`SELECT COUNT(*) FROM %sstreams WHERE workflow_uuid = $1`, schemaPrefix),
 			wfID).Scan(&streamCount)
 		require.NoError(t, err)
 		require.Equal(t, 0, streamCount, "expected stream entries to be cascade-deleted")
 
-		err = sysDB.pool.QueryRow(dbosCtx,
-			sysDB.renderSQL(`SELECT COUNT(*) FROM %snotifications WHERE destination_uuid = $1`, schemaPrefix),
+		err = sysDB.Pool().QueryRow(dbosCtx,
+			sysDB.RenderSQL(`SELECT COUNT(*) FROM %snotifications WHERE destination_uuid = $1`, schemaPrefix),
 			wfID).Scan(&notifCount)
 		require.NoError(t, err)
 		require.Equal(t, 0, notifCount, "expected notifications to be cascade-deleted")
 
-		err = sysDB.pool.QueryRow(dbosCtx,
-			sysDB.renderSQL(`SELECT COUNT(*) FROM %soperation_outputs WHERE workflow_uuid = $1`, schemaPrefix),
+		err = sysDB.Pool().QueryRow(dbosCtx,
+			sysDB.RenderSQL(`SELECT COUNT(*) FROM %soperation_outputs WHERE workflow_uuid = $1`, schemaPrefix),
 			wfID).Scan(&stepCount)
 		require.NoError(t, err)
 		require.Equal(t, 0, stepCount, "expected operation_outputs to be cascade-deleted")
@@ -2249,26 +2847,26 @@ func TestChildWorkflowDeterminismCheck(t *testing.T) {
 	parentID := parentHandle.GetWorkflowID()
 	expectedChildID := fmt.Sprintf("%s-0", parentID)
 
-	sysDB, ok := dbosCtx.(*dbosContext).systemDB.(*sysDB)
+	sysDB, ok := dbosCtx.(*dbosContext).systemDB.(*sysdb.SysDB)
 	require.True(t, ok, "expected sysDB instance")
 	ctx := context.Background()
 
 	// Read the name recorded for the child workflow at step 0 directly from the
 	// table, so the test does not depend on the function-name resolution rules.
 	var recordedName string
-	nameQuery := sysDB.renderSQL(`SELECT function_name FROM %soperation_outputs WHERE workflow_uuid = $1 AND function_id = 0`, sysDB.dialect.SchemaPrefix(sysDB.schema))
-	require.NoError(t, sysDB.pool.QueryRow(ctx, nameQuery, parentID).Scan(&recordedName))
+	nameQuery := sysDB.RenderSQL(`SELECT function_name FROM %soperation_outputs WHERE workflow_uuid = $1 AND function_id = 0`, sysDB.Dialect().SchemaPrefix(sysDB.Schema()))
+	require.NoError(t, sysDB.Pool().QueryRow(ctx, nameQuery, parentID).Scan(&recordedName))
 	require.NotEmpty(t, recordedName, "child workflow should have a recorded function name")
 
 	t.Run("MatchingNameReturnsChildID", func(t *testing.T) {
-		childID, err := sysDB.checkChildWorkflow(ctx, parentID, 0, recordedName)
+		childID, err := sysDB.CheckChildWorkflow(ctx, parentID, 0, recordedName)
 		require.NoError(t, err, "matching child workflow name must not error")
 		require.NotNil(t, childID, "expected a recorded child workflow ID")
 		require.Equal(t, expectedChildID, *childID)
 	})
 
 	t.Run("MismatchedNameIsNonDeterminismError", func(t *testing.T) {
-		childID, err := sysDB.checkChildWorkflow(ctx, parentID, 0, recordedName+"-different")
+		childID, err := sysDB.CheckChildWorkflow(ctx, parentID, 0, recordedName+"-different")
 		require.Error(t, err, "a different child workflow name must be a non-determinism error")
 		require.Nil(t, childID, "no child ID should be returned on a determinism error")
 
@@ -2282,9 +2880,54 @@ func TestChildWorkflowDeterminismCheck(t *testing.T) {
 	})
 
 	t.Run("UnrecordedStepReturnsNil", func(t *testing.T) {
-		childID, err := sysDB.checkChildWorkflow(ctx, parentID, 99, recordedName)
+		childID, err := sysDB.CheckChildWorkflow(ctx, parentID, 99, recordedName)
 		require.NoError(t, err, "an unrecorded step must not error")
 		require.Nil(t, childID, "an unrecorded step must return a nil child ID")
+	})
+
+	t.Run("RecordSameChildIsIdempotent", func(t *testing.T) {
+		err := sysDB.RecordChildWorkflow(ctx, sysdb.RecordChildWorkflowDBInput{
+			ParentWorkflowID: parentID,
+			ChildWorkflowID:  expectedChildID,
+			StepID:           0,
+			StepName:         recordedName,
+		})
+		require.NoError(t, err, "re-recording the same child at the same step must succeed")
+	})
+
+	t.Run("RecordSameChildInTxDoesNotAbortTx", func(t *testing.T) {
+		tx, err := sysDB.Pool().BeginTx(ctx, sysdb.TxOptions{})
+		require.NoError(t, err)
+		defer tx.Rollback(ctx)
+		err = sysDB.RecordChildWorkflow(ctx, sysdb.RecordChildWorkflowDBInput{
+			ParentWorkflowID: parentID,
+			ChildWorkflowID:  expectedChildID,
+			StepID:           0,
+			StepName:         recordedName,
+			Tx:               tx,
+		})
+		require.NoError(t, err, "re-recording the same child within a tx must succeed")
+		// The tx must still be usable after the conflict.
+		var one int
+		require.NoError(t, tx.QueryRow(ctx, "SELECT 1").Scan(&one))
+		require.NoError(t, tx.Commit(ctx))
+	})
+
+	t.Run("RecordDifferentChildIsNonDeterminismError", func(t *testing.T) {
+		err := sysDB.RecordChildWorkflow(ctx, sysdb.RecordChildWorkflowDBInput{
+			ParentWorkflowID: parentID,
+			ChildWorkflowID:  expectedChildID + "-different",
+			StepID:           0,
+			StepName:         recordedName,
+		})
+		require.Error(t, err, "a different child at the same step must be a non-determinism error")
+		var dbosErr *DBOSError
+		require.ErrorAs(t, err, &dbosErr)
+		require.Equal(t, UnexpectedStep, dbosErr.Code)
+		require.Equal(t, parentID, dbosErr.WorkflowID)
+		require.Equal(t, 0, dbosErr.StepID)
+		require.Equal(t, expectedChildID+"-different", dbosErr.ExpectedName)
+		require.Equal(t, expectedChildID, dbosErr.RecordedName)
 	})
 }
 
@@ -2390,6 +3033,15 @@ func TestWorkflowRecovery(t *testing.T) {
 
 	var recoveryCounters []int64
 
+	// A child that fails while still returning a value: the parent's getResult
+	// checkpoint must carry both so replay matches the live execution.
+	var recoveryChildExecutions atomic.Int64
+	recoveryChildWorkflow := func(dbosCtx DBOSContext, index int) (int64, error) {
+		recoveryChildExecutions.Add(1)
+		return 42, errors.New("child failure")
+	}
+	RegisterWorkflow(dbosCtx, recoveryChildWorkflow, WithWorkflowName("recovery-child-workflow"))
+
 	recoveryWorkflow := func(dbosCtx DBOSContext, index int) (int64, error) {
 		// First step - increments the counter
 		_, err := RunAsStep(dbosCtx, func(ctx context.Context) (int64, error) {
@@ -2408,10 +3060,33 @@ func TestWorkflowRecovery(t *testing.T) {
 			return 0, err
 		}
 
+		childHandle, err := RunWorkflow(dbosCtx, recoveryChildWorkflow, index)
+		if err != nil {
+			return 0, err
+		}
+		childRes, childErr := childHandle.GetResult()
+		if childErr == nil {
+			return 0, errors.New("expected the child failure to be returned")
+		}
+		if childRes != 42 {
+			return 0, fmt.Errorf("child value lost alongside its error: got %d", childRes)
+		}
+
 		return recoveryCounters[index], nil
 	}
 
 	RegisterWorkflow(dbosCtx, recoveryWorkflow)
+
+	blockingStart := NewEvent()
+	blockingEvent := NewEvent()
+	blockingWorkflow := func(dbosCtx DBOSContext, input string) (string, error) {
+		return RunAsStep(dbosCtx, func(ctx context.Context) (string, error) {
+			blockingStart.Set()
+			blockingEvent.Wait()
+			return input, nil
+		})
+	}
+	RegisterWorkflow(dbosCtx, blockingWorkflow, WithWorkflowName("blocking-recovery-workflow"))
 
 	err := Launch(dbosCtx)
 	require.NoError(t, err, "failed to launch DBOS")
@@ -2420,6 +3095,7 @@ func TestWorkflowRecovery(t *testing.T) {
 		const numWorkflows = 5
 
 		recoveryCounters = make([]int64, numWorkflows)
+		recoveryChildExecutions.Store(0)
 
 		// Start all workflows and let them run to completion
 		handles := make([]WorkflowHandle[int64], numWorkflows)
@@ -2432,6 +3108,7 @@ func TestWorkflowRecovery(t *testing.T) {
 			_, err := handles[i].GetResult()
 			require.NoError(t, err, "failed to get result from workflow %d", i)
 		}
+		require.EqualValues(t, numWorkflows, recoveryChildExecutions.Load(), "each workflow runs its child once")
 
 		// Flip all workflow statuses to PENDING, then recover
 		for i := range numWorkflows {
@@ -2446,7 +3123,9 @@ func TestWorkflowRecovery(t *testing.T) {
 			recoveredMap[h.GetWorkflowID()] = h
 		}
 
-		// 1) Result is as expected (counter value 1 from single execution, replayed idempotently)
+		// 1) Result is as expected (counter value 1 from single execution, replayed
+		// idempotently). The recovered run replays the child's checkpointed
+		// getResult, which must carry both the child's value and its error.
 		for i := range numWorkflows {
 			recoveredHandle := recoveredMap[handles[i].GetWorkflowID()]
 			require.NotNil(t, recoveredHandle, "workflow %d not found in recovered handles", i)
@@ -2454,12 +3133,13 @@ func TestWorkflowRecovery(t *testing.T) {
 			require.NoError(t, err, "failed to get result from recovered workflow %d", i)
 			require.Equal(t, float64(1), result.(float64), "workflow %d result should be 1", i)
 		}
+		require.EqualValues(t, numWorkflows, recoveryChildExecutions.Load(), "children must replay from their checkpoint, not re-execute")
 
-		// 2) Steps are as expected from a single execution (2 steps: step-one, step-two)
+		// 2) Steps are as expected from a single execution (4 steps: step-one, step-two, child spawn, getResult)
 		for i := range numWorkflows {
 			steps, err := GetWorkflowSteps(dbosCtx, handles[i].GetWorkflowID())
 			require.NoError(t, err, "failed to get steps for workflow %d", i)
-			require.Len(t, steps, 2, "expected 2 steps for workflow %d", i)
+			require.Len(t, steps, 4, "expected 4 steps for workflow %d", i)
 			assert.Equal(t, "step-one", steps[0].StepName, "workflow %d first step name", i)
 			assert.Equal(t, 0, steps[0].StepID, "workflow %d first step ID", i)
 			assert.NotNil(t, steps[0].Output, "workflow %d first step should have output", i)
@@ -2468,6 +3148,13 @@ func TestWorkflowRecovery(t *testing.T) {
 			assert.Equal(t, 1, steps[1].StepID, "workflow %d second step ID", i)
 			assert.NotNil(t, steps[1].Output, "workflow %d second step should have output", i)
 			assert.Nil(t, steps[1].Error, "workflow %d second step should not have error", i)
+			assert.Equal(t, "recovery-child-workflow", steps[2].StepName, "workflow %d third step name", i)
+			assert.Equal(t, 2, steps[2].StepID, "workflow %d third step ID", i)
+			assert.NotEmpty(t, steps[2].ChildWorkflowID, "workflow %d third step should record the child spawn", i)
+			assert.Equal(t, "DBOS.getResult", steps[3].StepName, "workflow %d fourth step name", i)
+			assert.Equal(t, 3, steps[3].StepID, "workflow %d fourth step ID", i)
+			assert.NotNil(t, steps[3].Output, "workflow %d getResult must checkpoint the child's value alongside its error", i)
+			assert.Error(t, steps[3].Error, "workflow %d getResult must checkpoint the child's error", i)
 		}
 
 		// 3) Workflow Attempts counter is 2 (initial run + recovery)
@@ -2475,8 +3162,8 @@ func TestWorkflowRecovery(t *testing.T) {
 		for i := range numWorkflows {
 			workflowIDs[i] = handles[i].GetWorkflowID()
 		}
-		workflows, err := dbosCtx.(*dbosContext).systemDB.listWorkflows(dbosCtx, listWorkflowsDBInput{
-			workflowIDs: workflowIDs,
+		workflows, err := dbosCtx.(*dbosContext).systemDB.ListWorkflows(dbosCtx, sysdb.ListWorkflowsDBInput{
+			WorkflowIDs: workflowIDs,
 		})
 		require.NoError(t, err, "failed to list workflows")
 		require.Len(t, workflows, numWorkflows, "expected %d workflow entries", numWorkflows)
@@ -2489,6 +3176,39 @@ func TestWorkflowRecovery(t *testing.T) {
 			require.True(t, ok, "workflow %d not found in list result", i)
 			require.Equal(t, 2, wf.Attempts, "workflow %d should have 2 attempts after recovery", i)
 		}
+	})
+
+	// Recovering a workflow that is actively running on this executor must not
+	// fence out the live run: recovery skips launching (already active locally)
+	// and must leave owner_xid untouched so the run can record its outcome.
+	t.Run("RecoverWhileRunning", func(t *testing.T) {
+		handle, err := RunWorkflow(dbosCtx, blockingWorkflow, "hello", WithWorkflowID("recover-while-running"))
+		require.NoError(t, err, "failed to start blocking workflow")
+		blockingStart.Wait()
+
+		recoveredHandles, err := recoverPendingWorkflows(dbosCtx.(*dbosContext), []string{"local"})
+		require.NoError(t, err, "failed to recover pending workflows")
+		var recoveredHandle WorkflowHandle[any]
+		for _, h := range recoveredHandles {
+			if h.GetWorkflowID() == handle.GetWorkflowID() {
+				recoveredHandle = h
+			}
+		}
+		require.NotNil(t, recoveredHandle, "expected a handle for the running workflow")
+
+		blockingEvent.Set()
+
+		result, err := handle.GetResult()
+		require.NoError(t, err, "live run should complete despite recovery dispatch")
+		require.Equal(t, "hello", result)
+
+		recoveredResult, err := recoveredHandle.GetResult()
+		require.NoError(t, err, "recovered handle should observe the run's outcome")
+		require.Equal(t, "hello", recoveredResult)
+
+		status, err := handle.GetStatus()
+		require.NoError(t, err, "failed to get workflow status")
+		require.Equal(t, WorkflowStatusSuccess, status.Status)
 	})
 }
 
@@ -2515,6 +3235,59 @@ func TestWorkflowDeadLetterQueue(t *testing.T) {
 	RegisterWorkflow(dbosCtx, deadLetterQueueWorkflow, WithMaxRetries(maxRecoveryAttempts))
 	RegisterWorkflow(dbosCtx, infiniteDeadLetterQueueWorkflow, WithMaxRetries(-1)) // A negative value means infinite retries
 	dbosCtx.Launch()
+
+	t.Run("DatabaseRetryWithSameOwnerDoesNotDeadLetter", func(t *testing.T) {
+		sysDB := dbosCtx.(*dbosContext).systemDB.(*sysdb.SysDB)
+		workflowID := uuid.NewString()
+		status := models.WorkflowStatus{
+			ID:            workflowID,
+			Status:        models.WorkflowStatusPending,
+			Name:          "dead-letter-owner-test",
+			ExecutorID:    "local",
+			CreatedAt:     time.Now(),
+			Serialization: "DBOS_JSON",
+		}
+
+		insert := func(ownerXID string, incrementAttempts bool, maxRetries int) (*sysdb.InsertWorkflowResult, error) {
+			tx, err := sysDB.Pool().BeginTx(context.Background(), TxOptions{})
+			require.NoError(t, err)
+			defer tx.Rollback(context.Background())
+			result, err := sysDB.InsertWorkflowStatus(context.Background(), sysdb.InsertWorkflowStatusDBInput{
+				Status:            status,
+				MaxRetries:        maxRetries,
+				Tx:                tx,
+				OwnerXID:          &ownerXID,
+				IncrementAttempts: incrementAttempts,
+			})
+			if err != nil {
+				return nil, err
+			}
+			require.NoError(t, tx.Commit(context.Background()))
+			return result, nil
+		}
+
+		_, err := insert("initial-owner", false, 1)
+		require.NoError(t, err)
+		result, err := insert("recovery-owner-1", true, 100)
+		require.NoError(t, err)
+		require.Equal(t, 2, result.Attempts)
+		result, err = insert("recovery-owner-2", true, 100)
+		require.NoError(t, err)
+		require.Equal(t, 3, result.Attempts)
+
+		// Replay the original initialization after a lost commit acknowledgement.
+		// Concurrent recoveries raised the counter, but this replay is not a new
+		// recovery attempt and must not dead-letter the workflow.
+		result, err = insert("initial-owner", false, 1)
+		require.NoError(t, err)
+		require.Equal(t, 3, result.Attempts)
+		require.Equal(t, models.WorkflowStatusPending, result.Status)
+
+		// A genuinely new recovery owner is a new attempt and may dead-letter.
+		_, err = insert("next-recovery-owner", true, 1)
+		require.Error(t, err)
+		require.ErrorIs(t, err, &DBOSError{Code: DeadLetterQueueError})
+	})
 
 	t.Run("DeadLetterQueueBehavior", func(t *testing.T) {
 		recoveryCount = 0
@@ -2631,7 +3404,7 @@ func TestCancelWorkflows(t *testing.T) {
 	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
 
 	t.Run("CancelWorkflowsWithChildren", func(t *testing.T) {
-		sysDB := dbosCtx.(*dbosContext).systemDB.(*sysDB)
+		sysDB := dbosCtx.(*dbosContext).systemDB.(*sysdb.SysDB)
 
 		var (
 			parentWorkflowID     = uuid.NewString()
@@ -2697,7 +3470,7 @@ func TestCancelWorkflows(t *testing.T) {
 			mainEvents[id].Wait()
 		}
 
-		workflowStatuses, err := sysDB.getWorkflowChildren(dbosCtx, getWorkflowChildrenDBInput{workflowID: parentWorkflowID})
+		workflowStatuses, err := sysDB.GetWorkflowChildren(dbosCtx, sysdb.GetWorkflowChildrenDBInput{WorkflowID: parentWorkflowID})
 		require.NoError(t, err, "failed to get workflow children")
 		require.Equal(t, len(workflowStatuses), 2, "expected %d children got %d", 2, len(workflowStatuses))
 
@@ -2754,6 +3527,43 @@ func TestCancelWorkflows(t *testing.T) {
 		return input, nil
 	}
 	RegisterWorkflow(dbosCtx, blockingWorkflow)
+
+	var noDeadlineCancelAttempts atomic.Int64
+	noDeadlineCancelStarted := NewEvent()
+	noDeadlineCancelWorkflow := func(ctx DBOSContext, _ string) (string, error) {
+		if noDeadlineCancelAttempts.Add(1) == 1 {
+			noDeadlineCancelStarted.Set()
+			<-ctx.Done()
+			return "", ctx.Err()
+		}
+		return "completed", nil
+	}
+	RegisterWorkflow(dbosCtx, noDeadlineCancelWorkflow)
+
+	var finalStepCancelAttempts atomic.Int64
+	finalStepCancelStarted := NewEvent()
+	finalStepCancelRelease := make(chan struct{})
+	finalStepCancelWorkflow := func(ctx DBOSContext, _ string) (string, error) {
+		if finalStepCancelAttempts.Add(1) == 1 {
+			finalStepCancelStarted.Set()
+			<-finalStepCancelRelease
+		}
+		return "completed", nil
+	}
+	RegisterWorkflow(dbosCtx, finalStepCancelWorkflow)
+
+	// Ignores its cancellation entirely and returns a successful result.
+	var swallowCancelAttempts atomic.Int64
+	swallowCancelStarted := NewEvent()
+	swallowCancelRelease := make(chan struct{})
+	swallowCancelWorkflow := func(ctx DBOSContext, _ string) (string, error) {
+		if swallowCancelAttempts.Add(1) == 1 {
+			swallowCancelStarted.Set()
+			<-swallowCancelRelease
+		}
+		return "swallowed", nil
+	}
+	RegisterWorkflow(dbosCtx, swallowCancelWorkflow)
 
 	err := Launch(dbosCtx)
 	require.NoError(t, err, "failed to launch DBOS instance")
@@ -2828,6 +3638,104 @@ func TestCancelWorkflows(t *testing.T) {
 		require.Error(t, CancelWorkflows(nil, []string{"id"}),
 			"CancelWorkflows should error on nil context")
 	})
+
+	t.Run("CancelledDuringFinalStepDoesNotComplete", func(t *testing.T) {
+		// A workflow API-cancelled while finishing its last work must end as
+		// CANCELLED, not complete: the refused outcome write is surfaced as a
+		// cancellation and the workflow stays resumable (same semantics as the
+		// Python/TS/Java SDKs).
+		handle, err := RunWorkflow(dbosCtx, finalStepCancelWorkflow, "")
+		require.NoError(t, err, "failed to start workflow")
+		finalStepCancelStarted.Wait()
+
+		require.NoError(t, CancelWorkflow(dbosCtx, handle.GetWorkflowID()), "failed to cancel workflow")
+		close(finalStepCancelRelease)
+
+		_, err = handle.GetResult()
+		require.Error(t, err, "a cancelled workflow must not complete")
+		require.True(t, errors.Is(err, &DBOSError{Code: WorkflowCancelled}), "expected WorkflowCancelled error, got: %v", err)
+
+		status, err := handle.GetStatus()
+		require.NoError(t, err, "failed to get workflow status")
+		require.Equal(t, WorkflowStatusCancelled, status.Status, "the durable status must remain CANCELLED")
+		require.Nil(t, status.Output, "the refused outcome must not record an output")
+
+		resumedHandle, err := ResumeWorkflow[string](dbosCtx, handle.GetWorkflowID())
+		require.NoError(t, err, "failed to resume workflow")
+		result, err := resumedHandle.GetResult()
+		require.NoError(t, err, "resumed workflow should complete successfully")
+		require.Equal(t, "completed", result)
+		require.EqualValues(t, 2, finalStepCancelAttempts.Load(), "expected the workflow to re-execute on resume")
+	})
+
+	t.Run("CancelWithoutDeadlineIsResumable", func(t *testing.T) {
+		// A workflow interrupted by plain context cancellation (no deadline, so no
+		// AfterFunc cancels it in the DB) must be marked CANCELLED, not ERROR, so
+		// it can be resumed.
+		cancelCtx, cancelFunc := WithCancel(dbosCtx)
+		defer cancelFunc()
+		handle, err := RunWorkflow(cancelCtx, noDeadlineCancelWorkflow, "")
+		require.NoError(t, err, "failed to start workflow")
+
+		noDeadlineCancelStarted.Wait()
+		cancelFunc()
+
+		_, err = handle.GetResult()
+		require.Error(t, err, "expected error from cancelled workflow")
+		require.True(t, errors.Is(err, context.Canceled), "expected context.Canceled, got: %v", err)
+
+		status, err := handle.GetStatus()
+		require.NoError(t, err, "failed to get workflow status")
+		require.Equal(t, WorkflowStatusCancelled, status.Status, "expected workflow status to be WorkflowStatusCancelled")
+
+		resumedHandle, err := ResumeWorkflow[string](dbosCtx, handle.GetWorkflowID())
+		require.NoError(t, err, "failed to resume workflow")
+		result, err := resumedHandle.GetResult()
+		require.NoError(t, err, "resumed workflow should complete successfully")
+		require.Equal(t, "completed", result)
+		require.EqualValues(t, 2, noDeadlineCancelAttempts.Load(), "expected the workflow to re-execute on resume")
+	})
+
+	t.Run("SwallowedCancellationIsNotSuccess", func(t *testing.T) {
+		// A workflow that ignores its cancellation and returns (result, nil) must
+		// not report success on the in-process handle: the durable row is CANCELLED
+		// and no output was recorded, so GetResult surfaces WorkflowCancelled —
+		// consistent with what a polling handle for the same workflow returns.
+		cancelCtx, cancelFunc := WithCancel(dbosCtx)
+		defer cancelFunc()
+		handle, err := RunWorkflow(cancelCtx, swallowCancelWorkflow, "")
+		require.NoError(t, err, "failed to start workflow")
+
+		swallowCancelStarted.Wait()
+		cancelFunc()
+
+		// Wait for the durable cancel before releasing the workflow, so its
+		// normal return deterministically lands after the cancellation.
+		require.Eventually(t, func() bool {
+			status, err := handle.GetStatus()
+			require.NoError(t, err, "failed to get workflow status")
+			return status.Status == WorkflowStatusCancelled
+		}, 5*time.Second, 10*time.Millisecond, "workflow did not reach cancelled status in time")
+		close(swallowCancelRelease)
+
+		result, err := handle.GetResult()
+		require.Error(t, err, "a cancelled workflow must not report success")
+		require.True(t, errors.Is(err, &DBOSError{Code: WorkflowCancelled}), "expected WorkflowCancelled error, got: %v", err)
+		require.Equal(t, "", result, "no output may be reported for a cancelled workflow")
+
+		status, err := handle.GetStatus()
+		require.NoError(t, err, "failed to get workflow status")
+		require.Equal(t, WorkflowStatusCancelled, status.Status)
+		require.Nil(t, status.Output, "the swallowed result must not be recorded")
+
+		// Plain cancel remains resumable; re-execution completes normally.
+		resumedHandle, err := ResumeWorkflow[string](dbosCtx, handle.GetWorkflowID())
+		require.NoError(t, err, "failed to resume workflow")
+		result, err = resumedHandle.GetResult()
+		require.NoError(t, err, "resumed workflow should complete successfully")
+		require.Equal(t, "swallowed", result)
+		require.EqualValues(t, 2, swallowCancelAttempts.Load(), "expected the workflow to re-execute on resume")
+	})
 }
 
 func TestResumeWorkflows(t *testing.T) {
@@ -2881,7 +3789,7 @@ func TestResumeWorkflows(t *testing.T) {
 
 			status, err := h.GetStatus()
 			require.NoError(t, err, "failed to get status for resumed workflow %s", h.GetWorkflowID())
-			assert.Equal(t, _DBOS_INTERNAL_QUEUE_NAME, status.QueueName, "batch resume should default to the internal queue")
+			assert.Equal(t, models.InternalQueueName, status.QueueName, "batch resume should default to the internal queue")
 		}
 	})
 
@@ -3180,23 +4088,6 @@ func receiveIdempotencyWorkflow(ctx DBOSContext, topic string) (string, error) {
 	return msg, nil
 }
 
-func durableRecvSleepWorkflow(ctx DBOSContext, topic string) (string, error) {
-	// First Recv with 2-second timeout (will timeout)
-	msg1, err := Recv[string](ctx, topic, 2*time.Second)
-	if err != nil && !strings.Contains(err.Error(), fmt.Sprintf("DBOS Error %s", TimeoutError)) {
-		return "", fmt.Errorf("unexpected error in first recv: %w", err)
-	}
-
-	// Second Recv with 2-second timeout (will also timeout)
-	msg2, err := Recv[string](ctx, topic, 2*time.Second)
-	if err != nil && !strings.Contains(err.Error(), fmt.Sprintf("DBOS Error %s", TimeoutError)) {
-		return "", fmt.Errorf("unexpected error in second recv: %w", err)
-	}
-
-	// Return result - will be empty strings since both timeout
-	return msg1 + msg2, nil
-}
-
 func stepThatCallsSend(ctx context.Context, input sendWorkflowInput) (string, error) {
 	err := Send(ctx.(DBOSContext), input.DestinationID, "message-from-step", input.Topic)
 	if err != nil {
@@ -3235,7 +4126,6 @@ func TestSendRecv(t *testing.T) {
 	RegisterWorkflow(dbosCtx, receiveStructWorkflow)
 	RegisterWorkflow(dbosCtx, sendIdempotencyWorkflow)
 	RegisterWorkflow(dbosCtx, receiveIdempotencyWorkflow)
-	RegisterWorkflow(dbosCtx, durableRecvSleepWorkflow)
 	RegisterWorkflow(dbosCtx, workflowThatCallsSendInStep)
 	RegisterWorkflow(dbosCtx, recvContextCancelWorkflow)
 
@@ -3405,6 +4295,73 @@ func TestSendRecv(t *testing.T) {
 		require.Contains(t, steps[0].Error.Error(), "DBOS.recv timed out", "expected step 0 to contain 'DBOS.recv timed out' in error message")
 		// Second step should be sleep
 		require.Equal(t, "DBOS.sleep", steps[1].StepName, "expected step 1 to have StepName 'DBOS.sleep'")
+	})
+
+	t.Run("RecvForkReplay", func(t *testing.T) {
+		sendRecvSyncEvent.Clear()
+
+		receiveHandle, err := RunWorkflow(dbosCtx, receiveIdempotencyWorkflow, "fork-replay-topic")
+		require.NoError(t, err, "failed to start receive workflow")
+
+		// Send the message before Recv runs so it is already pending (no sleep step recorded)
+		err = Send(dbosCtx, receiveHandle.GetWorkflowID(), "fork-me", "fork-replay-topic")
+		require.NoError(t, err, "failed to send message")
+		sendRecvSyncEvent.Set()
+
+		result, err := receiveHandle.GetResult()
+		require.NoError(t, err, "failed to get result from receive workflow")
+		require.Equal(t, "fork-me", result)
+
+		originalSteps, err := GetWorkflowSteps(dbosCtx, receiveHandle.GetWorkflowID())
+		require.NoError(t, err, "failed to get workflow steps")
+		require.Len(t, originalSteps, 1, "expected only the recv step when the message was already pending")
+
+		// Fork past the recv step: its checkpoint is copied and the recv must replay from it,
+		// without waiting (the recv timeout is 60 minutes) and without recording new steps.
+		start := time.Now()
+		forkedHandle, err := ForkWorkflow[string](dbosCtx, ForkWorkflowInput{
+			OriginalWorkflowID: receiveHandle.GetWorkflowID(),
+			StartStep:          2,
+		})
+		require.NoError(t, err, "failed to fork receive workflow")
+		forkedResult, err := forkedHandle.GetResult()
+		require.NoError(t, err, "failed to get result from forked receive workflow")
+		require.Equal(t, "fork-me", forkedResult, "forked recv should replay the checkpointed message")
+		require.Less(t, time.Since(start), 30*time.Second, "forked recv replay should not wait on the recv timeout")
+
+		forkedSteps, err := GetWorkflowSteps(dbosCtx, forkedHandle.GetWorkflowID())
+		require.NoError(t, err, "failed to get forked workflow steps")
+		require.Len(t, forkedSteps, 1, "recv replay must not record extra steps")
+		require.Equal(t, "DBOS.recv", forkedSteps[0].StepName)
+	})
+
+	t.Run("RecvTimeoutForkReplay", func(t *testing.T) {
+		sendRecvSyncEvent.Set()
+
+		receiveHandle, err := RunWorkflow(dbosCtx, receiveWorkflow, struct {
+			Topic   string
+			Timeout time.Duration
+		}{
+			Topic:   "timeout-fork-topic",
+			Timeout: 1 * time.Second,
+		})
+		require.NoError(t, err, "failed to start receive workflow")
+		_, err = receiveHandle.GetResult()
+		require.Error(t, err, "expected timeout error")
+
+		// Fork past the recv step: the checkpointed timeout error must round-trip through
+		// the recorded errStr with its concrete type and code preserved.
+		forkedHandle, err := ForkWorkflow[string](dbosCtx, ForkWorkflowInput{
+			OriginalWorkflowID: receiveHandle.GetWorkflowID(),
+			StartStep:          2,
+		})
+		require.NoError(t, err, "failed to fork receive workflow")
+		_, err = forkedHandle.GetResult()
+		require.Error(t, err, "expected replayed timeout error")
+		dbosErr, ok := err.(*DBOSError)
+		require.True(t, ok, "expected error to be of type *DBOSError, got %T", err)
+		require.Equal(t, TimeoutError, dbosErr.Code, "expected TimeoutError code")
+		require.Contains(t, err.Error(), "DBOS.recv timed out")
 	})
 
 	t.Run("RecvMustRunInsideWorkflows", func(t *testing.T) {
@@ -3612,6 +4569,91 @@ func TestSendRecv(t *testing.T) {
 		require.NoError(t, err, "failed to get workflow status")
 		require.Equal(t, WorkflowStatusCancelled, status.Status, "expected workflow status to be WorkflowStatusCancelled")
 	})
+
+	t.Run("ConcurrentRecvSameTopicConflicts", func(t *testing.T) {
+		// A single (destination, topic) may only have one active receiver at a time.
+		// A second concurrent registration must be rejected with a ConflictingIDError
+		// rather than silently sharing/stealing the first receiver's slot.
+		sysDB := dbosCtx.(*dbosContext).systemDB.(*sysdb.SysDB)
+		destID := uuid.NewString()
+		topic := "single-receiver-topic"
+
+		waiter1, err := sysDB.StartRecvListener(context.Background(), destID, topic)
+		require.NoError(t, err, "first receiver should register")
+		defer waiter1.Release()
+
+		_, err = sysDB.StartRecvListener(context.Background(), destID, topic)
+		require.Error(t, err, "second concurrent receiver for the same (destination, topic) must be rejected")
+		dbosErr, ok := err.(*DBOSError)
+		require.True(t, ok, "expected *DBOSError, got %T", err)
+		require.Equal(t, ConflictingIDError, dbosErr.Code, "expected ConflictingIDError")
+	})
+}
+
+// TestRecvStepConflict verifies that when two executors concurrently run the same
+// workflow and race to checkpoint the recv step, the loser does not fail: it either
+// replays the winner's checkpoint or loses the record race with a ConflictingIDError
+// that routes through the workflow-level conflict handler and awaits the winner's
+// result. Either way both executions converge on the delivered message.
+//
+// The two executors share one database (a single in-process guard cannot double-run
+// a workflow, so a real second executor is required). PostgreSQL row locking on
+// consumeMessage serializes consumption, making the converged outcome deterministic.
+func TestRecvStepConflict(t *testing.T) {
+	// checkLeaks is off: the two executors' lifetimes overlap, so a per-executor
+	// goroutine leak check would observe the other executor's live goroutines.
+	ctxA := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: false})
+	ctxB := setupDBOS(t, setupDBOSOptions{dropDB: false, checkLeaks: false})
+
+	recvConflictWorkflow := func(ctx DBOSContext, topic string) (string, error) {
+		return Recv[string](ctx, topic, 60*time.Second)
+	}
+	RegisterWorkflow(ctxA, recvConflictWorkflow)
+	RegisterWorkflow(ctxB, recvConflictWorkflow)
+	require.NoError(t, Launch(ctxA))
+	require.NoError(t, Launch(ctxB))
+
+	topic := "recv-step-conflict-topic"
+	workflowID := uuid.NewString()
+
+	// Executor A starts the workflow; it registers as receiver and blocks in wait.
+	handleA, err := RunWorkflow(ctxA, recvConflictWorkflow, topic, WithWorkflowID(workflowID))
+	require.NoError(t, err, "failed to start recv workflow on executor A")
+
+	sysA := ctxA.(*dbosContext).systemDB.(*sysdb.SysDB)
+	sysB := ctxB.(*dbosContext).systemDB.(*sysdb.SysDB)
+	payload := fmt.Sprintf("%s::%s", workflowID, topic)
+	require.Eventually(t, func() bool {
+		return sysA.RecvNotifier.Has(payload)
+	}, 5*time.Second, 10*time.Millisecond, "executor A never registered as receiver")
+
+	// Executor B recovers the same workflow: a genuinely concurrent second
+	// execution with its own in-memory receiver map, so it proceeds to wait and
+	// later races A to consume+checkpoint the message.
+	setWorkflowStatusPending(t, ctxA, workflowID)
+	recovered, err := recoverPendingWorkflows(ctxB.(*dbosContext), []string{"local"})
+	require.NoError(t, err, "failed to recover workflow on executor B")
+	require.Len(t, recovered, 1, "expected one recovered handle")
+	require.Equal(t, workflowID, recovered[0].GetWorkflowID())
+
+	// Executor B must actually run the body (register as receiver), not
+	// short-circuit; its separate map confirms a real concurrent execution.
+	require.Eventually(t, func() bool {
+		return sysB.RecvNotifier.Has(payload)
+	}, 5*time.Second, 10*time.Millisecond, "executor B (recovery) never ran the body")
+
+	// Deliver the message. Exactly one executor consumes and checkpoints it; the
+	// other replays that checkpoint or loses the checkpoint race and awaits. Both
+	// must converge on the delivered value with no permanent failure.
+	require.NoError(t, Send(ctxA, workflowID, "delivered", topic), "failed to send message")
+
+	gotA, err := handleA.GetResult()
+	require.NoError(t, err, "executor A workflow should succeed")
+	require.Equal(t, "delivered", gotA)
+
+	gotB, err := recovered[0].GetResult()
+	require.NoError(t, err, "the concurrent recovery must converge on the result, not fail")
+	require.Equal(t, "delivered", gotB)
 }
 
 // receiveTwiceShortWorkflow receives one message (blocking up to 30s), then attempts a
@@ -3633,9 +4675,23 @@ func receiveTwiceShortWorkflow(ctx DBOSContext, topic string) (string, error) {
 	return first + "|" + second, nil
 }
 
+// receiveOneShortWorkflow receives a single message with a short timeout, returning
+// "<timeout>" if none arrives so a test can observe a silently dropped Send.
+func receiveOneShortWorkflow(ctx DBOSContext, topic string) (string, error) {
+	msg, err := Recv[string](ctx, topic, 3*time.Second)
+	if err != nil {
+		if errors.Is(err, &DBOSError{Code: TimeoutError}) {
+			return "<timeout>", nil
+		}
+		return "", err
+	}
+	return msg, nil
+}
+
 func TestSendIdempotencyKey(t *testing.T) {
 	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
 	RegisterWorkflow(dbosCtx, receiveTwiceShortWorkflow)
+	RegisterWorkflow(dbosCtx, receiveOneShortWorkflow)
 	Launch(dbosCtx)
 
 	t.Run("DuplicateKeyDeliversOnce", func(t *testing.T) {
@@ -3669,6 +4725,27 @@ func TestSendIdempotencyKey(t *testing.T) {
 		require.NotContains(t, result, "<timeout>", "both distinct-key messages should be delivered")
 		require.Contains(t, result, "msg-a")
 		require.Contains(t, result, "msg-b")
+	})
+
+	t.Run("SameKeyDistinctDestinationsDeliverEach", func(t *testing.T) {
+		// The idempotency key is scoped per destination (message_uuid is key::destinationID):
+		// the same key sent to two different workflows must deliver to both.
+		handleA, err := RunWorkflow(dbosCtx, receiveOneShortWorkflow, "idem-cross-dest-topic")
+		require.NoError(t, err, "failed to start first receive workflow")
+		handleB, err := RunWorkflow(dbosCtx, receiveOneShortWorkflow, "idem-cross-dest-topic")
+		require.NoError(t, err, "failed to start second receive workflow")
+
+		err = Send(dbosCtx, handleA.GetWorkflowID(), "to-a", "idem-cross-dest-topic", WithIdempotencyKey("cross-dest-key"))
+		require.NoError(t, err, "send to first destination failed")
+		err = Send(dbosCtx, handleB.GetWorkflowID(), "to-b", "idem-cross-dest-topic", WithIdempotencyKey("cross-dest-key"))
+		require.NoError(t, err, "send to second destination failed")
+
+		resultA, err := handleA.GetResult()
+		require.NoError(t, err, "failed to get result from first receive workflow")
+		require.Equal(t, "to-a", resultA)
+		resultB, err := handleB.GetResult()
+		require.NoError(t, err, "failed to get result from second receive workflow")
+		require.Equal(t, "to-b", resultB, "same key to a different destination must still deliver")
 	})
 }
 
@@ -3756,20 +4833,23 @@ func getEventIdempotencyWorkflow(ctx DBOSContext, input setEventWorkflowInput) (
 	return result, nil
 }
 
-func durableGetEventSleepWorkflow(ctx DBOSContext, targetWorkflowID string) (string, error) {
-	// First GetEvent with 2-second timeout (will timeout)
-	val1, err := GetEvent[string](ctx, targetWorkflowID, "key1", 2*time.Second)
-	if err != nil && !strings.Contains(err.Error(), "timed out") {
-		return "", fmt.Errorf("unexpected error in first getEvent: %w", err)
-	}
+func getEventForkReplayWorkflow(ctx DBOSContext, input getEventWorkflowInput) (string, error) {
+	return GetEvent[string](ctx, input.TargetWorkflowID, input.Key, 60*time.Minute)
+}
 
-	// Second GetEvent with 2-second timeout (will timeout)
-	val2, err := GetEvent[string](ctx, targetWorkflowID, "key2", 2*time.Second)
-	if err != nil && !strings.Contains(err.Error(), "timed out") {
-		return "", fmt.Errorf("unexpected error in second getEvent: %w", err)
-	}
+// setManyEventsWorkflow sets one event per (key, value) pair, so a single
+// workflow ID can back concurrent getters spread across several keys.
+type setManyEventsInput struct {
+	Values map[string]string
+}
 
-	return val1 + val2, nil
+func setManyEventsWorkflow(ctx DBOSContext, input setManyEventsInput) (string, error) {
+	for key, value := range input.Values {
+		if err := SetEvent(ctx, key, value); err != nil {
+			return "", err
+		}
+	}
+	return "many-events-set", nil
 }
 
 func TestSetGetEvent(t *testing.T) {
@@ -3781,7 +4861,8 @@ func TestSetGetEvent(t *testing.T) {
 	RegisterWorkflow(dbosCtx, setTwoEventsWorkflow)
 	RegisterWorkflow(dbosCtx, setEventIdempotencyWorkflow)
 	RegisterWorkflow(dbosCtx, getEventIdempotencyWorkflow)
-	RegisterWorkflow(dbosCtx, durableGetEventSleepWorkflow)
+	RegisterWorkflow(dbosCtx, getEventForkReplayWorkflow)
+	RegisterWorkflow(dbosCtx, setManyEventsWorkflow)
 
 	Launch(dbosCtx)
 
@@ -3965,6 +5046,85 @@ func TestSetGetEvent(t *testing.T) {
 		require.Contains(t, err.Error(), "no event found for key 'non-existent-key' within 3s", "expected error message to contain 'no event found for key 'non-existent-key' within 3s'")
 	})
 
+	t.Run("GetEventTimeoutInWorkflow", func(t *testing.T) {
+		// GetEvent waits and times out inside a workflow: the timeout error is
+		// checkpointed on the getEvent step and a sleep step records the deadline.
+		getHandle, err := RunWorkflow(dbosCtx, getEventWorkflow, getEventWorkflowInput{
+			TargetWorkflowID: uuid.NewString(),
+			Key:              "no-such-key",
+		})
+		require.NoError(t, err, "failed to start get event workflow")
+		_, err = getHandle.GetResult()
+		require.Error(t, err, "expected timeout error")
+		dbosErr, ok := err.(*DBOSError)
+		require.True(t, ok, "expected error to be of type *DBOSError, got %T", err)
+		require.Equal(t, TimeoutError, dbosErr.Code, "expected TimeoutError code")
+		require.Contains(t, err.Error(), "no event found for key 'no-such-key'")
+
+		steps, err := GetWorkflowSteps(dbosCtx, getHandle.GetWorkflowID())
+		require.NoError(t, err, "failed to get workflow steps")
+		require.Len(t, steps, 2, "expected 2 steps (getEvent that timed out and its sleep), got %d", len(steps))
+		require.Equal(t, "DBOS.getEvent", steps[0].StepName, "expected step 0 to have StepName 'DBOS.getEvent'")
+		require.NotNil(t, steps[0].Error, "expected getEvent step to record the timeout error")
+		require.Contains(t, steps[0].Error.Error(), "no event found for key 'no-such-key'")
+		require.Equal(t, "DBOS.sleep", steps[1].StepName, "expected step 1 to have StepName 'DBOS.sleep'")
+
+		// Fork past both steps: the checkpointed timeout error must round-trip through
+		// the recorded errStr with its concrete type and code preserved.
+		forkedHandle, err := ForkWorkflow[string](dbosCtx, ForkWorkflowInput{
+			OriginalWorkflowID: getHandle.GetWorkflowID(),
+			StartStep:          2,
+		})
+		require.NoError(t, err, "failed to fork get event workflow")
+		_, err = forkedHandle.GetResult()
+		require.Error(t, err, "expected replayed timeout error")
+		dbosErr, ok = err.(*DBOSError)
+		require.True(t, ok, "expected error to be of type *DBOSError, got %T", err)
+		require.Equal(t, TimeoutError, dbosErr.Code, "expected TimeoutError code")
+		require.Contains(t, err.Error(), "no event found for key 'no-such-key'")
+	})
+
+	t.Run("GetEventForkReplay", func(t *testing.T) {
+		setHandle, err := RunWorkflow(dbosCtx, setEventWorkflow, setEventWorkflowInput{
+			Key:     "fork-replay-key",
+			Message: "fork-me",
+		})
+		require.NoError(t, err, "failed to start set event workflow")
+		_, err = setHandle.GetResult()
+		require.NoError(t, err, "failed to get result from set event workflow")
+
+		getHandle, err := RunWorkflow(dbosCtx, getEventForkReplayWorkflow, getEventWorkflowInput{
+			TargetWorkflowID: setHandle.GetWorkflowID(),
+			Key:              "fork-replay-key",
+		})
+		require.NoError(t, err, "failed to start get event workflow")
+		result, err := getHandle.GetResult()
+		require.NoError(t, err, "failed to get result from get event workflow")
+		require.Equal(t, "fork-me", result)
+
+		originalSteps, err := GetWorkflowSteps(dbosCtx, getHandle.GetWorkflowID())
+		require.NoError(t, err, "failed to get workflow steps")
+		require.Len(t, originalSteps, 1, "expected only the getEvent step when the event was already set")
+
+		// Fork past the getEvent step: its checkpoint is copied and the getEvent must replay
+		// from it, without waiting (the timeout is 60 minutes) and without recording new steps.
+		start := time.Now()
+		forkedHandle, err := ForkWorkflow[string](dbosCtx, ForkWorkflowInput{
+			OriginalWorkflowID: getHandle.GetWorkflowID(),
+			StartStep:          2,
+		})
+		require.NoError(t, err, "failed to fork get event workflow")
+		forkedResult, err := forkedHandle.GetResult()
+		require.NoError(t, err, "failed to get result from forked get event workflow")
+		require.Equal(t, "fork-me", forkedResult, "forked getEvent should replay the checkpointed value")
+		require.Less(t, time.Since(start), 30*time.Second, "forked getEvent replay should not wait on the timeout")
+
+		forkedSteps, err := GetWorkflowSteps(dbosCtx, forkedHandle.GetWorkflowID())
+		require.NoError(t, err, "failed to get forked workflow steps")
+		require.Len(t, forkedSteps, 1, "getEvent replay must not record extra steps")
+		require.Equal(t, "DBOS.getEvent", forkedSteps[0].StepName)
+	})
+
 	t.Run("SetGetEventMustRunInsideWorkflows", func(t *testing.T) {
 		// Attempt to run SetEvent outside of a workflow context
 		err := SetEvent(dbosCtx, "test-key", "test-message")
@@ -4052,45 +5212,193 @@ func TestSetGetEvent(t *testing.T) {
 	})
 
 	t.Run("ConcurrentGetEvent", func(t *testing.T) {
-		// Set event
-		setHandle, err := RunWorkflow(dbosCtx, setEventWorkflow, setEventWorkflowInput{
-			Key:     "concurrent-event-key",
-			Message: "concurrent-event-message",
-		})
-		if err != nil {
-			t.Fatalf("failed to start set event workflow: %v", err)
+		// Spread more getters than keys: several getters register on each key
+		// (within-key concurrency) while distinct keys are independent (across-key
+		// concurrency). Getters start before the events are set so they block rather
+		// than taking the already-set fast path.
+		setWorkflowID := uuid.NewString()
+		const numKeys = 3
+		const numGoroutines = 12 // > numKeys, so multiple getters land on each key
+		keyFor := func(i int) string { return fmt.Sprintf("concurrent-event-key-%d", i%numKeys) }
+		valueFor := func(key string) string { return "value-for-" + key }
+
+		values := make(map[string]string, numKeys)
+		for k := range numKeys {
+			key := fmt.Sprintf("concurrent-event-key-%d", k)
+			values[key] = valueFor(key)
 		}
 
-		// Wait for the set event workflow to complete
-		_, err = setHandle.GetResult()
-		if err != nil {
-			t.Fatalf("failed to get result from set event workflow: %v", err)
-		}
-		// Start a few goroutines that'll concurrently get the event
-		numGoroutines := 5
 		var wg sync.WaitGroup
-		errors := make(chan error, numGoroutines)
+		errs := make(chan error, numGoroutines)
 		wg.Add(numGoroutines)
-		for range numGoroutines {
-			go func() {
+		for i := range numGoroutines {
+			go func(i int) {
 				defer wg.Done()
-				res, err := GetEvent[string](dbosCtx, setHandle.GetWorkflowID(), "concurrent-event-key", 10*time.Second)
+				key := keyFor(i)
+				res, err := GetEvent[string](dbosCtx, setWorkflowID, key, 30*time.Second)
 				if err != nil {
-					errors <- fmt.Errorf("failed to get event in goroutine: %v", err)
+					errs <- fmt.Errorf("goroutine %d (key %s): %w", i, key, err)
 					return
 				}
-				if res != "concurrent-event-message" {
-					errors <- fmt.Errorf("expected result in goroutine to be 'concurrent-event-message', got '%s'", res)
-					return
+				if want := valueFor(key); res != want {
+					errs <- fmt.Errorf("goroutine %d (key %s): expected %q, got %q", i, key, want, res)
 				}
-			}()
+			}(i)
 		}
-		wg.Wait()
-		close(errors)
 
-		// Check for any errors from goroutines
-		for err := range errors {
-			require.FailNow(t, "goroutine error: %v", err)
+		// Wait until every key has a registered waiter before setting the events.
+		sysDB := dbosCtx.(*dbosContext).systemDB.(*sysdb.SysDB)
+		require.Eventually(t, func() bool {
+			for k := range numKeys {
+				payload := fmt.Sprintf("%s::%s", setWorkflowID, fmt.Sprintf("concurrent-event-key-%d", k))
+				if !sysDB.EventNotifier.Has(payload) {
+					return false
+				}
+			}
+			return true
+		}, 5*time.Second, 10*time.Millisecond, "not all keys registered event waiters")
+
+		setHandle, err := RunWorkflow(dbosCtx, setManyEventsWorkflow, setManyEventsInput{Values: values}, WithWorkflowID(setWorkflowID))
+		require.NoError(t, err, "failed to start set-many-events workflow")
+		_, err = setHandle.GetResult()
+		require.NoError(t, err, "failed to get result from set-many-events workflow")
+
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			require.FailNow(t, "goroutine error", err)
+		}
+	})
+
+	t.Run("GetEventMixedTimeoutAndDelivery", func(t *testing.T) {
+		// On a single key, some waiters time out before the event is set and others
+		// block long enough to receive it. A departing waiter must not disturb the
+		// survivors: they must still receive the value once it is set, not return a
+		// premature nil. (Regression test for the per-waiter notify fix.)
+		setWorkflowID := uuid.NewString()
+		key := "mixed-timeout-key"
+		const numLong = 3
+		const numShort = 3
+
+		var longWg, shortWg sync.WaitGroup
+		longErrs := make(chan error, numLong)
+		shortErrs := make(chan error, numShort)
+
+		// Long waiters register first.
+		longWg.Add(numLong)
+		for i := range numLong {
+			go func(i int) {
+				defer longWg.Done()
+				res, err := GetEvent[string](dbosCtx, setWorkflowID, key, 30*time.Second)
+				if err != nil {
+					longErrs <- fmt.Errorf("long waiter %d: %w", i, err)
+					return
+				}
+				if res != "mixed-value" {
+					longErrs <- fmt.Errorf("long waiter %d: expected %q, got %q", i, "mixed-value", res)
+				}
+			}(i)
+		}
+
+		sysDB := dbosCtx.(*dbosContext).systemDB.(*sysdb.SysDB)
+		payload := fmt.Sprintf("%s::%s", setWorkflowID, key)
+		require.Eventually(t, func() bool {
+			return sysDB.EventNotifier.Has(payload)
+		}, 5*time.Second, 10*time.Millisecond, "long waiters never registered")
+
+		// Short waiters register on the same key, then time out and leave.
+		shortWg.Add(numShort)
+		for i := range numShort {
+			go func(i int) {
+				defer shortWg.Done()
+				_, err := GetEvent[string](dbosCtx, setWorkflowID, key, 300*time.Millisecond)
+				if err == nil {
+					shortErrs <- fmt.Errorf("short waiter %d: expected a timeout", i)
+					return
+				}
+				dbosErr, ok := err.(*DBOSError)
+				if !ok || dbosErr.Code != TimeoutError {
+					shortErrs <- fmt.Errorf("short waiter %d: expected TimeoutError, got %v", i, err)
+				}
+			}(i)
+		}
+
+		// Let the short waiters time out and leave before setting the event.
+		shortWg.Wait()
+		close(shortErrs)
+		for err := range shortErrs {
+			require.FailNow(t, "short waiter error", err)
+		}
+
+		setHandle, err := RunWorkflow(dbosCtx, setEventWorkflow, setEventWorkflowInput{
+			Key:     key,
+			Message: "mixed-value",
+		}, WithWorkflowID(setWorkflowID))
+		require.NoError(t, err, "failed to start set event workflow")
+		_, err = setHandle.GetResult()
+		require.NoError(t, err, "failed to get result from set event workflow")
+
+		longWg.Wait()
+		close(longErrs)
+		for err := range longErrs {
+			require.FailNow(t, "long waiter error", err)
+		}
+	})
+
+	t.Run("GetEventSiblingCancellationDoesNotWakeOthers", func(t *testing.T) {
+		// A sibling whose context is cancelled mid-wait must not wake the others into
+		// returning early: the survivor still receives the value once it is set.
+		setWorkflowID := uuid.NewString()
+		key := "cancel-sibling-key"
+
+		var survivorWg sync.WaitGroup
+		survivorErr := make(chan error, 1)
+		survivorWg.Add(1)
+		go func() {
+			defer survivorWg.Done()
+			res, err := GetEvent[string](dbosCtx, setWorkflowID, key, 30*time.Second)
+			if err != nil {
+				survivorErr <- fmt.Errorf("survivor: %w", err)
+				return
+			}
+			if res != "survivor-value" {
+				survivorErr <- fmt.Errorf("survivor: expected %q, got %q", "survivor-value", res)
+			}
+		}()
+
+		sysDB := dbosCtx.(*dbosContext).systemDB.(*sysdb.SysDB)
+		payload := fmt.Sprintf("%s::%s", setWorkflowID, key)
+		require.Eventually(t, func() bool {
+			return sysDB.EventNotifier.Has(payload)
+		}, 5*time.Second, 10*time.Millisecond, "survivor never registered")
+
+		// A sibling on the same key that gets cancelled while waiting.
+		cancelCtx, cancel := WithCancel(dbosCtx)
+		siblingDone := make(chan struct{})
+		go func() {
+			defer close(siblingDone)
+			_, _ = GetEvent[string](cancelCtx, setWorkflowID, key, 30*time.Second)
+		}()
+		// Wait until the sibling has actually registered, then cancel it.
+		require.Eventually(t, func() bool {
+			return sysDB.EventNotifier.WaiterCount(payload) == 2
+		}, 5*time.Second, 10*time.Millisecond, "sibling never registered")
+		cancel()
+		<-siblingDone
+
+		// The survivor must still be waiting; setting the event delivers it.
+		setHandle, err := RunWorkflow(dbosCtx, setEventWorkflow, setEventWorkflowInput{
+			Key:     key,
+			Message: "survivor-value",
+		}, WithWorkflowID(setWorkflowID))
+		require.NoError(t, err, "failed to start set event workflow")
+		_, err = setHandle.GetResult()
+		require.NoError(t, err, "failed to get result from set event workflow")
+
+		survivorWg.Wait()
+		close(survivorErr)
+		for err := range survivorErr {
+			require.FailNow(t, "survivor error", err)
 		}
 	})
 }
@@ -4181,10 +5489,10 @@ func TestWorkflowExecutionMismatch(t *testing.T) {
 
 		// This directly tests the CheckOperationExecution method with mismatched step name
 		wrongStepName := "wrong-step-name"
-		_, err = dbosCtx.(*dbosContext).systemDB.checkOperationExecution(dbosCtx, checkOperationExecutionDBInput{
-			workflowID: workflowID,
-			stepID:     0,
-			stepName:   wrongStepName,
+		_, err = dbosCtx.(*dbosContext).systemDB.CheckOperationExecution(dbosCtx, sysdb.CheckOperationExecutionDBInput{
+			WorkflowID: workflowID,
+			StepID:     0,
+			StepName:   wrongStepName,
 		})
 
 		require.Error(t, err, "expected UnexpectedStep error when checking operation with wrong step name, but got none")
@@ -4409,14 +5717,14 @@ func TestWorkflowTimeout(t *testing.T) {
 		if !ok {
 			return "", fmt.Errorf("failed to cast DBOSContext to dbosContext")
 		}
-		sysDB, ok := dbosCtxInternal.systemDB.(*sysDB)
+		sysDB, ok := dbosCtxInternal.systemDB.(*sysdb.SysDB)
 		if !ok {
 			return "", fmt.Errorf("failed to cast systemDB to sysDB")
 		}
-		query := sysDB.renderSQL(`SELECT status FROM %sworkflow_status WHERE workflow_uuid = $1`, sysDB.dialect.SchemaPrefix(sysDB.schema))
+		query := sysDB.RenderSQL(`SELECT status FROM %sworkflow_status WHERE workflow_uuid = $1`, sysDB.Dialect().SchemaPrefix(sysDB.Schema()))
 		require.Eventually(t, func() bool {
 			var status WorkflowStatusType
-			err := sysDB.pool.QueryRow(uncancellableCtx, query, wfid).Scan(&status)
+			err := sysDB.Pool().QueryRow(uncancellableCtx, query, wfid).Scan(&status)
 			if err != nil {
 				return false
 			}
@@ -4676,12 +5984,11 @@ func TestWorkflowTimeout(t *testing.T) {
 		require.NoError(t, err, "failed to get recovered workflow status")
 		assert.Equal(t, WorkflowStatusCancelled, recoveredStatus.Status, "expected recovered workflow status to be WorkflowStatusCancelled")
 
-		// Check the deadline on the status was is within an expected range (start time + timeout * .1)
-		// FIXME this might be flaky and frankly not super useful
-		expectedDeadline := start.Add(timeout * 10 / 100)
-		assert.True(t, status.Deadline.After(expectedDeadline) && status.Deadline.Before(start.Add(timeout)),
-			"expected workflow deadline to be within %v and %v, got %v", expectedDeadline, start.Add(timeout), status.Deadline)
+		// The durable deadline is insert time + timeout; allow tolerance for insert latency and ms truncation
+		assert.WithinDuration(t, start.Add(timeout), status.Deadline, 500*time.Millisecond,
+			"expected workflow deadline to be about %v, got %v", start.Add(timeout), status.Deadline)
 	})
+
 }
 
 func notificationWaiterWorkflow(ctx DBOSContext, pairID int) (string, error) {
@@ -5063,10 +6370,14 @@ func TestWorkflowCancel(t *testing.T) {
 		// Signal the event so the workflow can move on to Recv()
 		blockingEventNoError.Set()
 
-		// Check the return values of the workflow
-		// Because this is a direct handle it'll not return an error
+		// The workflow swallowed the cancellation and returned success, but the
+		// outcome gate detected the CANCELLED row and propagates the cancellation
+		// to the caller instead of reporting success.
 		result, err := handle.GetResult()
-		require.NoError(t, err, "expected no error from direct handle")
+		require.Error(t, err, "expected cancellation error from direct handle")
+		var directErr *DBOSError
+		require.ErrorAs(t, err, &directErr, "expected error to be of type *DBOSError, got %T", err)
+		assert.Equal(t, WorkflowCancelled, directErr.Code, "expected WorkflowCancelled error code, got: %v", directErr.Code)
 		assert.Equal(t, "", result, "expected empty result from cancelled workflow")
 
 		// Now use a polling handle to get result -- observe the error
@@ -5147,7 +6458,7 @@ func TestCancelAllBefore(t *testing.T) {
 		}
 
 		// Call cancelAllBefore
-		err = dbosCtx.(*dbosContext).systemDB.cancelAllBefore(dbosCtx, cutoffTime)
+		err = dbosCtx.(*dbosContext).systemDB.CancelAllBefore(dbosCtx, cutoffTime)
 		require.NoError(t, err, "failed to call cancelAllBefore")
 
 		// Verify workflows that should be cancelled
@@ -5257,8 +6568,8 @@ func TestGarbageCollect(t *testing.T) {
 		// Garbage collect keeping only the 5 newest workflows
 		// The blocked workflow won't be deleted because it's pending
 		threshold := 5
-		err = dbosCtx.(*dbosContext).systemDB.garbageCollectWorkflows(dbosCtx, garbageCollectWorkflowsInput{
-			rowsThreshold: &threshold,
+		err = dbosCtx.(*dbosContext).systemDB.GarbageCollectWorkflows(dbosCtx, sysdb.GarbageCollectWorkflowsInput{
+			RowsThreshold: &threshold,
 		})
 		require.NoError(t, err, "failed to garbage collect workflows")
 
@@ -5364,8 +6675,8 @@ func TestGarbageCollect(t *testing.T) {
 
 		// Garbage collect workflows completed before cutoff time
 		cutoffTimestamp := cutoffTime.UnixMilli()
-		err = dbosCtx.(*dbosContext).systemDB.garbageCollectWorkflows(dbosCtx, garbageCollectWorkflowsInput{
-			cutoffEpochTimestampMs: &cutoffTimestamp,
+		err = dbosCtx.(*dbosContext).systemDB.GarbageCollectWorkflows(dbosCtx, sysdb.GarbageCollectWorkflowsInput{
+			CutoffEpochTimestampMs: &cutoffTimestamp,
 		})
 		require.NoError(t, err, "failed to garbage collect workflows by time")
 
@@ -5406,8 +6717,8 @@ func TestGarbageCollect(t *testing.T) {
 
 		// Garbage collect all workflows - use a future cutoff to catch everything
 		futureTimestamp := time.Now().Add(1 * time.Hour).UnixMilli()
-		err = dbosCtx.(*dbosContext).systemDB.garbageCollectWorkflows(dbosCtx, garbageCollectWorkflowsInput{
-			cutoffEpochTimestampMs: &futureTimestamp,
+		err = dbosCtx.(*dbosContext).systemDB.GarbageCollectWorkflows(dbosCtx, sysdb.GarbageCollectWorkflowsInput{
+			CutoffEpochTimestampMs: &futureTimestamp,
 		})
 		require.NoError(t, err, "failed to garbage collect all completed workflows")
 
@@ -5433,8 +6744,8 @@ func TestGarbageCollect(t *testing.T) {
 
 		// Verify GC runs without errors on a blank table
 		threshold := 1
-		err = dbosCtx.(*dbosContext).systemDB.garbageCollectWorkflows(dbosCtx, garbageCollectWorkflowsInput{
-			rowsThreshold: &threshold,
+		err = dbosCtx.(*dbosContext).systemDB.GarbageCollectWorkflows(dbosCtx, sysdb.GarbageCollectWorkflowsInput{
+			RowsThreshold: &threshold,
 		})
 		require.NoError(t, err, "garbage collect should work on empty database")
 
@@ -5444,8 +6755,8 @@ func TestGarbageCollect(t *testing.T) {
 		require.Equal(t, 0, len(workflows), "expected exactly 0 workflows after row-based GC on empty database")
 
 		currentTimestamp := time.Now().UnixMilli()
-		err = dbosCtx.(*dbosContext).systemDB.garbageCollectWorkflows(dbosCtx, garbageCollectWorkflowsInput{
-			cutoffEpochTimestampMs: &currentTimestamp,
+		err = dbosCtx.(*dbosContext).systemDB.GarbageCollectWorkflows(dbosCtx, sysdb.GarbageCollectWorkflowsInput{
+			CutoffEpochTimestampMs: &currentTimestamp,
 		})
 		require.NoError(t, err, "time-based garbage collect should work on empty database")
 
@@ -5509,8 +6820,8 @@ func TestGarbageCollect(t *testing.T) {
 		// The blocked workflow is the oldest but won't be deleted because it's pending
 		// So we should have 2 workflows: 1 newest completed + 1 pending
 		threshold := 1
-		err = dbosCtx.(*dbosContext).systemDB.garbageCollectWorkflows(dbosCtx, garbageCollectWorkflowsInput{
-			rowsThreshold: &threshold,
+		err = dbosCtx.(*dbosContext).systemDB.GarbageCollectWorkflows(dbosCtx, sysdb.GarbageCollectWorkflowsInput{
+			RowsThreshold: &threshold,
 		})
 		require.NoError(t, err, "failed to garbage collect workflows")
 
@@ -5550,8 +6861,8 @@ func TestGarbageCollect(t *testing.T) {
 
 		// Now GC everything using future timestamp
 		futureTimestamp := time.Now().Add(1 * time.Hour).UnixMilli()
-		err = dbosCtx.(*dbosContext).systemDB.garbageCollectWorkflows(dbosCtx, garbageCollectWorkflowsInput{
-			cutoffEpochTimestampMs: &futureTimestamp,
+		err = dbosCtx.(*dbosContext).systemDB.GarbageCollectWorkflows(dbosCtx, sysdb.GarbageCollectWorkflowsInput{
+			CutoffEpochTimestampMs: &futureTimestamp,
 		})
 		require.NoError(t, err, "failed to garbage collect all workflows")
 
@@ -5609,9 +6920,9 @@ func TestGarbageCollect(t *testing.T) {
 		// Threshold would keep 6 newest, timestamp would keep 8 newest
 		// Result: threshold wins (higher timestamp), only 6 workflows remain
 		threshold := 6
-		err = dbosCtx.(*dbosContext).systemDB.garbageCollectWorkflows(dbosCtx, garbageCollectWorkflowsInput{
-			rowsThreshold:          &threshold,
-			cutoffEpochTimestampMs: &cutoff1,
+		err = dbosCtx.(*dbosContext).systemDB.GarbageCollectWorkflows(dbosCtx, sysdb.GarbageCollectWorkflowsInput{
+			RowsThreshold:          &threshold,
+			CutoffEpochTimestampMs: &cutoff1,
 		})
 		require.NoError(t, err, "failed to garbage collect with threshold 6 and 7th newest timestamp")
 
@@ -5625,9 +6936,9 @@ func TestGarbageCollect(t *testing.T) {
 
 		// Case2: Threshold is less restrictive (lower cutoff)
 		threshold = 3
-		err = dbosCtx.(*dbosContext).systemDB.garbageCollectWorkflows(dbosCtx, garbageCollectWorkflowsInput{
-			rowsThreshold:          &threshold,
-			cutoffEpochTimestampMs: &cutoff2,
+		err = dbosCtx.(*dbosContext).systemDB.GarbageCollectWorkflows(dbosCtx, sysdb.GarbageCollectWorkflowsInput{
+			RowsThreshold:          &threshold,
+			CutoffEpochTimestampMs: &cutoff2,
 		})
 		require.NoError(t, err, "failed to garbage collect with threshold 3 and 2nd newest timestamp")
 
@@ -5967,8 +7278,8 @@ func captureAuthFromDB(ctx DBOSContext) (authSnapshot, error) {
 	if err != nil {
 		return authSnapshot{}, err
 	}
-	rows, err := ctx.(*dbosContext).systemDB.listWorkflows(ctx, listWorkflowsDBInput{
-		workflowIDs: []string{wfID},
+	rows, err := ctx.(*dbosContext).systemDB.ListWorkflows(ctx, sysdb.ListWorkflowsDBInput{
+		WorkflowIDs: []string{wfID},
 	})
 	if err != nil || len(rows) == 0 {
 		return authSnapshot{}, err
@@ -6181,6 +7492,62 @@ func TestWorkflowHandleContextCancel(t *testing.T) {
 	})
 }
 
+// stubPatchCheckDB answers every DoesPatchExists call made through the
+// SystemDatabase interface with a fixed result. Only DeprecatePatch reaches
+// it that way — SysDB.Patch invokes its own method directly, so Patch keeps
+// working when the embedded SystemDatabase is real.
+type stubPatchCheckDB struct {
+	sysdb.SystemDatabase
+	name string
+	err  error
+}
+
+func (f *stubPatchCheckDB) DoesPatchExists(context.Context, sysdb.PatchDBInput) (string, error) {
+	return f.name, f.err
+}
+
+// TestDeprecatePatchStepID exercises DeprecatePatch's step-ID accounting
+// directly: the step ID may only advance when the history lookup confirms
+// the patch marker occupies the next slot. In particular a failed lookup
+// must leave it untouched — guessing either way corrupts step numbering.
+func TestDeprecatePatchStepID(t *testing.T) {
+	run := func(db sysdb.SystemDatabase) (*workflowState, error) {
+		wfState := &workflowState{workflowID: "wf-id", stepID: 3}
+		c := &dbosContext{
+			ctx:      context.WithValue(context.Background(), workflowStateKey, wfState),
+			config:   &Config{EnablePatching: true},
+			logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+			systemDB: db,
+		}
+		return wfState, c.DeprecatePatch(nil, "my-patch")
+	}
+
+	t.Run("MarkerPresentConsumesStepID", func(t *testing.T) {
+		ws, err := run(&stubPatchCheckDB{name: _DBOS_PATCH_PREFIX + "my-patch"})
+		require.NoError(t, err)
+		require.Equal(t, 4, ws.stepID)
+	})
+
+	t.Run("NoRowLeavesStepIDUntouched", func(t *testing.T) {
+		ws, err := run(&stubPatchCheckDB{err: sysdb.ErrNoRows})
+		require.NoError(t, err)
+		require.Equal(t, 3, ws.stepID)
+	})
+
+	t.Run("OtherMarkerLeavesStepIDUntouched", func(t *testing.T) {
+		ws, err := run(&stubPatchCheckDB{name: _DBOS_PATCH_PREFIX + "other-patch"})
+		require.NoError(t, err)
+		require.Equal(t, 3, ws.stepID)
+	})
+
+	t.Run("LookupErrorPropagatesAndLeavesStepIDUntouched", func(t *testing.T) {
+		injected := errors.New("simulated patch lookup failure")
+		ws, err := run(&stubPatchCheckDB{err: injected})
+		require.ErrorIs(t, err, injected)
+		require.Equal(t, 3, ws.stepID)
+	})
+}
+
 func TestPatching(t *testing.T) {
 	t.Run("PatchingEnabled", func(t *testing.T) {
 		// Create a DBOS context with patching enabled
@@ -6376,6 +7743,84 @@ func TestPatching(t *testing.T) {
 		_, err = forkHandle.GetResult()
 		require.Error(t, err, "expected error when forking old workflow onto new workflow")
 		require.Contains(t, err.Error(), fmt.Sprintf("DBOS Error %s", UnexpectedStep))
+	})
+
+	// A DB error during DeprecatePatch's history check must surface, not be
+	// swallowed. Swallowing it skips the patch marker's step ID, so every
+	// subsequent step drifts one slot back into the marker's position and the
+	// re-execution dies with a spurious UnexpectedStep non-determinism error.
+	t.Run("DeprecatePatchDBErrorPropagates", func(t *testing.T) {
+		databaseURL := backendDatabaseURL(t)
+		resetTestDatabase(t, databaseURL)
+		dbosCtx, err := NewDBOSContext(context.Background(), Config{
+			DatabaseURL:        databaseURL,
+			AppName:            "test-app-deprecate-patch-db-error",
+			EnablePatching:     true,
+			ApplicationVersion: "PATCHING_ENABLED",
+		})
+		require.NoError(t, err, "failed to create DBOS context")
+		t.Cleanup(func() {
+			Shutdown(dbosCtx, 30*time.Second)
+		})
+
+		injectedErr := errors.New("simulated patch lookup failure")
+		c := dbosCtx.(*dbosContext)
+		c.systemDB = &stubPatchCheckDB{SystemDatabase: c.systemDB, err: injectedErr}
+
+		step := func(input int) (int, error) {
+			return input + 1, nil
+		}
+
+		wfPatched := func(ctx DBOSContext, input int) (int, error) {
+			RunAsStep(ctx, func(ctx context.Context) (int, error) {
+				return step(input)
+			}, WithStepName("firstStep"))
+			if _, err := Patch(ctx, "my-patch"); err != nil {
+				return 0, err
+			}
+			return RunAsStep(ctx, func(ctx context.Context) (int, error) {
+				return step(input)
+			}, WithStepName("secondStep"))
+		}
+
+		RegisterWorkflow(dbosCtx, wfPatched, WithWorkflowName("wf"))
+		require.NoError(t, Launch(dbosCtx))
+
+		handle, err := RunWorkflow(dbosCtx, wfPatched, 1)
+		require.NoError(t, err, "failed to start workflow")
+		_, err = handle.GetResult()
+		require.NoError(t, err, "failed to get result")
+		// History: 0=firstStep, 1=DBOS.patch-my-patch, 2=secondStep
+
+		wfDeprecated := func(ctx DBOSContext, input int) (int, error) {
+			RunAsStep(ctx, func(ctx context.Context) (int, error) {
+				return step(input)
+			}, WithStepName("firstStep"))
+			if err := DeprecatePatch(ctx, "my-patch"); err != nil {
+				return 0, err
+			}
+			return RunAsStep(ctx, func(ctx context.Context) (int, error) {
+				return step(input)
+			}, WithStepName("secondStep"))
+		}
+
+		dbosCtx.(*dbosContext).launched.Store(false)
+		ClearRegistries(dbosCtx)
+		RegisterWorkflow(dbosCtx, wfDeprecated, WithWorkflowName("wf"))
+		dbosCtx.(*dbosContext).launched.Store(true)
+
+		// Re-execute the patched history on the deprecated code: after
+		// firstStep replays, DeprecatePatch checks the marker at step 1 and
+		// the check fails with the injected error.
+		forkHandle, err := ForkWorkflow[int](dbosCtx, ForkWorkflowInput{
+			OriginalWorkflowID: handle.GetWorkflowID(),
+			StartStep:          2,
+		})
+		require.NoError(t, err, "failed to fork workflow")
+		_, err = forkHandle.GetResult()
+		require.Error(t, err, "expected the patch lookup error to surface")
+		require.Contains(t, err.Error(), "simulated patch lookup failure")
+		require.NotContains(t, err.Error(), fmt.Sprintf("DBOS Error %s", UnexpectedStep), "step IDs drifted into the patch marker's slot")
 	})
 
 	t.Run("PatchingNotEnabledError", func(t *testing.T) {
@@ -6750,10 +8195,10 @@ func TestStreams(t *testing.T) {
 				// Query database directly to avoid blocking (ReadStream would block)
 				dbosCtxInternal, ok := dbosCtx.(*dbosContext)
 				require.True(t, ok, "expected dbosContext")
-				sysDB, ok := dbosCtxInternal.systemDB.(*sysDB)
+				sysDB, ok := dbosCtxInternal.systemDB.(*sysdb.SysDB)
 				require.True(t, ok, "expected sysDB")
 
-				entries, closed, err := sysDB.readStream(context.Background(), readStreamDBInput{
+				entries, closed, err := sysDB.ReadStream(context.Background(), sysdb.ReadStreamDBInput{
 					WorkflowID: forkHandle.GetWorkflowID(),
 					Key:        streamKey,
 					FromOffset: 0,
@@ -6870,10 +8315,10 @@ func TestStreams(t *testing.T) {
 		// Query database directly to avoid blocking (ReadStream would block)
 		dbosCtxInternal, ok := dbosCtx.(*dbosContext)
 		require.True(t, ok, "expected dbosContext")
-		sysDB, ok := dbosCtxInternal.systemDB.(*sysDB)
+		sysDB, ok := dbosCtxInternal.systemDB.(*sysdb.SysDB)
 		require.True(t, ok, "expected sysDB")
 
-		entries, closed, err := sysDB.readStream(context.Background(), readStreamDBInput{
+		entries, closed, err := sysDB.ReadStream(context.Background(), sysdb.ReadStreamDBInput{
 			WorkflowID: forkHandle.GetWorkflowID(),
 			Key:        streamKey,
 			FromOffset: 0,
@@ -7014,8 +8459,8 @@ func TestStreams(t *testing.T) {
 
 	t.Run("NotificationLatency", func(t *testing.T) {
 		// A blocked reader must be woken by the streams LISTEN/NOTIFY trigger,
-		// not the bounded-wait fallback that fires every _DB_RETRY_INTERVAL (1s).
-		if dbosCtx.(*dbosContext).systemDB.(*sysDB).listenNotifyPool() == nil {
+		// not the bounded-wait fallback that fires every sysdb.DBRetryInterval (1s).
+		if dbosCtx.(*dbosContext).systemDB.(*sysdb.SysDB).ListenNotifyPool() == nil {
 			t.Skip("backend does not support LISTEN/NOTIFY")
 		}
 
@@ -7216,10 +8661,10 @@ func TestExportImportWorkflow(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, originalGrandchildSteps, 0, "grandchild should have 0 steps")
 
-	sdb := dbosCtx.(*dbosContext).systemDB.(*sysDB)
+	sdb := dbosCtx.(*dbosContext).systemDB.(*sysdb.SysDB)
 
 	t.Run("ExportWithChildren", func(t *testing.T) {
-		exported, err := sdb.exportWorkflow(dbosCtx, parentID, true)
+		exported, err := sdb.ExportWorkflow(dbosCtx, parentID, true)
 		require.NoError(t, err)
 		require.Len(t, exported, 3, "expected 3 exported workflows (parent + child + grandchild)")
 
@@ -7232,13 +8677,13 @@ func TestExportImportWorkflow(t *testing.T) {
 	})
 
 	t.Run("ExportWithoutChildren", func(t *testing.T) {
-		exported, err := sdb.exportWorkflow(dbosCtx, parentID, false)
+		exported, err := sdb.ExportWorkflow(dbosCtx, parentID, false)
 		require.NoError(t, err)
 		require.Len(t, exported, 1, "expected only 1 exported workflow without children")
 	})
 
 	t.Run("ExportNonExistentWorkflow", func(t *testing.T) {
-		_, err := sdb.exportWorkflow(dbosCtx, "non-existent-wf-id", false)
+		_, err := sdb.ExportWorkflow(dbosCtx, "non-existent-wf-id", false)
 		require.Error(t, err)
 		var dbosErr *DBOSError
 		require.ErrorAs(t, err, &dbosErr)
@@ -7246,41 +8691,41 @@ func TestExportImportWorkflow(t *testing.T) {
 	})
 
 	t.Run("ImportConflict", func(t *testing.T) {
-		exported, err := sdb.exportWorkflow(dbosCtx, parentID, true)
+		exported, err := sdb.ExportWorkflow(dbosCtx, parentID, true)
 		require.NoError(t, err)
 
-		err = sdb.importWorkflow(dbosCtx, exported)
+		err = sdb.ImportWorkflow(dbosCtx, exported)
 		require.Error(t, err, "expected error when importing duplicate workflow")
 	})
 
 	t.Run("ImportIntoCleanDB", func(t *testing.T) {
-		exported, err := sdb.exportWorkflow(dbosCtx, parentID, true)
+		exported, err := sdb.ExportWorkflow(dbosCtx, parentID, true)
 		require.NoError(t, err)
 		require.Len(t, exported, 3)
 
 		// Delete all workflows so we can re-import
-		err = sdb.deleteWorkflows(dbosCtx, deleteWorkflowsDBInput{
-			workflowIDs:    []string{parentID},
-			deleteChildren: true,
+		err = sdb.DeleteWorkflows(dbosCtx, sysdb.DeleteWorkflowsDBInput{
+			WorkflowIDs:    []string{parentID},
+			DeleteChildren: true,
 		})
 		require.NoError(t, err)
 
 		// Verify all 3 workflows are gone
-		wfs, err := sdb.listWorkflows(dbosCtx, listWorkflowsDBInput{
-			workflowIDs: []string{parentID, childID, grandchildID},
+		wfs, err := sdb.ListWorkflows(dbosCtx, sysdb.ListWorkflowsDBInput{
+			WorkflowIDs: []string{parentID, childID, grandchildID},
 		})
 		require.NoError(t, err)
 		require.Empty(t, wfs, "expected no workflows after deletion")
 
 		// Import the exported workflows
-		err = sdb.importWorkflow(dbosCtx, exported)
+		err = sdb.ImportWorkflow(dbosCtx, exported)
 		require.NoError(t, err)
 
 		// Verify all 3 workflows are present with correct input/output
-		wfs, err = sdb.listWorkflows(dbosCtx, listWorkflowsDBInput{
-			workflowIDs: []string{parentID, childID, grandchildID},
-			loadInput:   true,
-			loadOutput:  true,
+		wfs, err = sdb.ListWorkflows(dbosCtx, sysdb.ListWorkflowsDBInput{
+			WorkflowIDs: []string{parentID, childID, grandchildID},
+			LoadInput:   true,
+			LoadOutput:  true,
 		})
 		require.NoError(t, err)
 		require.Len(t, wfs, 3, "expected 3 workflows after import")
@@ -7347,25 +8792,25 @@ func TestExportImportWorkflow(t *testing.T) {
 		require.Len(t, importedGrandchildSteps, 0, "imported grandchild should have 0 steps")
 
 		// Verify events, streams, and history via direct DB queries
-		schemaPrefix := sdb.dialect.SchemaPrefix(sdb.schema)
+		schemaPrefix := sdb.Dialect().SchemaPrefix(sdb.Schema())
 
 		var eventCount int
-		err = sdb.pool.QueryRow(dbosCtx,
-			sdb.renderSQL(`SELECT COUNT(*) FROM %sworkflow_events WHERE workflow_uuid = $1`, schemaPrefix),
+		err = sdb.Pool().QueryRow(dbosCtx,
+			sdb.RenderSQL(`SELECT COUNT(*) FROM %sworkflow_events WHERE workflow_uuid = $1`, schemaPrefix),
 			parentID).Scan(&eventCount)
 		require.NoError(t, err)
 		assert.Greater(t, eventCount, 0, "expected events to be imported")
 
 		var streamCount int
-		err = sdb.pool.QueryRow(dbosCtx,
-			sdb.renderSQL(`SELECT COUNT(*) FROM %sstreams WHERE workflow_uuid = $1`, schemaPrefix),
+		err = sdb.Pool().QueryRow(dbosCtx,
+			sdb.RenderSQL(`SELECT COUNT(*) FROM %sstreams WHERE workflow_uuid = $1`, schemaPrefix),
 			parentID).Scan(&streamCount)
 		require.NoError(t, err)
 		assert.Greater(t, streamCount, 0, "expected streams to be imported")
 
 		var historyCount int
-		err = sdb.pool.QueryRow(dbosCtx,
-			sdb.renderSQL(`SELECT COUNT(*) FROM %sworkflow_events_history WHERE workflow_uuid = $1`, schemaPrefix),
+		err = sdb.Pool().QueryRow(dbosCtx,
+			sdb.RenderSQL(`SELECT COUNT(*) FROM %sworkflow_events_history WHERE workflow_uuid = $1`, schemaPrefix),
 			parentID).Scan(&historyCount)
 		require.NoError(t, err)
 		assert.Greater(t, historyCount, 0, "expected workflow events history to be imported")
@@ -7523,6 +8968,52 @@ func TestGetWorkflowAggregates(t *testing.T) {
 		})
 		require.NoError(t, err)
 		assert.Empty(t, rows)
+	})
+
+	t.Run("FilterByAttributes", func(t *testing.T) {
+		skipIfSqlite(t, "attribute filters require JSONB containment")
+
+		for i := 0; i < 2; i++ {
+			handle, err := RunWorkflow(dbosCtx, aggregatesWorkflowSuccess, fmt.Sprintf("attr-%d", i),
+				WithWorkflowAttributes(map[string]any{"customer": "acme-agg", "tier": 1}))
+			require.NoError(t, err)
+			_, err = handle.GetResult()
+			require.NoError(t, err)
+		}
+
+		rows, err := GetWorkflowAggregates(dbosCtx, GetWorkflowAggregatesInput{
+			GroupByName: true,
+			SelectCount: true,
+			Attributes:  map[string]any{"customer": "acme-agg"},
+		})
+		require.NoError(t, err)
+		require.Len(t, rows, 1)
+		require.NotNil(t, rows[0].Group["name"])
+		require.NotNil(t, rows[0].Count)
+		assert.Equal(t, successFQN, *rows[0].Group["name"])
+		assert.Equal(t, int64(2), *rows[0].Count)
+
+		// A non-matching attribute value yields no rows
+		rows, err = GetWorkflowAggregates(dbosCtx, GetWorkflowAggregatesInput{
+			GroupByStatus: true,
+			SelectCount:   true,
+			Attributes:    map[string]any{"customer": "nobody"},
+		})
+		require.NoError(t, err)
+		assert.Empty(t, rows)
+	})
+
+	t.Run("FilterByAttributesUnsupportedOnSQLite", func(t *testing.T) {
+		if !useSqliteBackend() {
+			t.Skip("tests the SQLite-only error path")
+		}
+		_, err := GetWorkflowAggregates(dbosCtx, GetWorkflowAggregatesInput{
+			GroupByStatus: true,
+			SelectCount:   true,
+			Attributes:    map[string]any{"customer": "acme"},
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "not supported")
 	})
 
 	t.Run("SelectMinCreatedAtAndLatency", func(t *testing.T) {
@@ -7846,11 +9337,14 @@ func TestUserCancellationFinalizesWorkflow(t *testing.T) {
 
 	_, err = h.GetResult()
 	require.Error(t, err, "expected the cancellation error from the workflow")
-	require.True(t, errors.Is(err, context.Canceled), "expected context.Canceled, got: %v", err)
 
 	st, err := h.GetStatus()
 	require.NoError(t, err)
-	require.Equal(t, WorkflowStatusError, st.Status,
+	// Upstream durably cancels a workflow whose context is cancelled by its
+	// caller, so the finalised status is CANCELLED (pre-#384 it was ERROR).
+	// The invariant this test pins is that the workflow is NOT left PENDING,
+	// which would silently re-execute it on the next launch.
+	require.Contains(t, []WorkflowStatusType{WorkflowStatusError, WorkflowStatusCancelled}, st.Status,
 		"a user-cancelled workflow must be finalised, not left PENDING for recovery")
 }
 
@@ -7928,4 +9422,899 @@ func TestGracefulRebootDoesNotExhaustRecoveryAttempts(t *testing.T) {
 	st, err := h.GetStatus()
 	require.NoError(t, err)
 	require.Equal(t, WorkflowStatusSuccess, st.Status)
+}
+
+var (
+	attrBlockingStartEvent = NewEvent()
+	attrBlockingBlockEvent = NewEvent()
+)
+
+func attrChildWorkflow(dbosCtx DBOSContext, _ string) (string, error) {
+	return "child", nil
+}
+
+// attrParentWorkflow runs a child workflow and returns the child's workflow ID
+func attrParentWorkflow(dbosCtx DBOSContext, _ string) (string, error) {
+	handle, err := RunWorkflow(dbosCtx, attrChildWorkflow, "")
+	if err != nil {
+		return "", err
+	}
+	if _, err := handle.GetResult(); err != nil {
+		return "", err
+	}
+	return handle.GetWorkflowID(), nil
+}
+
+func attrNoopWorkflow(dbosCtx DBOSContext, x int) (int, error) {
+	return x, nil
+}
+
+func attrBlockingWorkflow(dbosCtx DBOSContext, _ string) (string, error) {
+	attrBlockingStartEvent.Set()
+	attrBlockingBlockEvent.Wait()
+	return "done", nil
+}
+
+func attrDebouncedWorkflow(dbosCtx DBOSContext, x int) (int, error) {
+	return x, nil
+}
+
+func TestWorkflowAttributes(t *testing.T) {
+	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
+
+	RegisterWorkflow(dbosCtx, attrParentWorkflow)
+	RegisterWorkflow(dbosCtx, attrChildWorkflow)
+	RegisterWorkflow(dbosCtx, attrNoopWorkflow)
+	RegisterWorkflow(dbosCtx, attrBlockingWorkflow)
+	RegisterWorkflow(dbosCtx, attrDebouncedWorkflow)
+
+	queue, err := RegisterQueue(dbosCtx, "attr-test-queue")
+	require.NoError(t, err)
+
+	debouncer := NewDebouncer(dbosCtx, attrDebouncedWorkflow)
+
+	require.NoError(t, Launch(dbosCtx), "failed to launch DBOS")
+
+	// matchedIDs returns the set of workflow IDs whose attributes contain all the given key-value pairs
+	matchedIDs := func(t *testing.T, attributes map[string]any) map[string]bool {
+		t.Helper()
+		statuses, err := ListWorkflows(dbosCtx, WithFilterAttributes(attributes))
+		require.NoError(t, err)
+		ids := make(map[string]bool, len(statuses))
+		for _, s := range statuses {
+			ids[s.ID] = true
+		}
+		return ids
+	}
+
+	t.Run("DirectInvocation", func(t *testing.T) {
+		wfid := uuid.NewString()
+		attributes := map[string]any{"customer": "acme", "tier": 3}
+		handle, err := RunWorkflow(dbosCtx, attrParentWorkflow, "", WithWorkflowID(wfid), WithWorkflowAttributes(attributes))
+		require.NoError(t, err)
+		childID, err := handle.GetResult()
+		require.NoError(t, err)
+
+		status, err := handle.GetStatus()
+		require.NoError(t, err)
+		// Numbers round-trip through JSON as float64
+		assert.Equal(t, map[string]any{"customer": "acme", "tier": float64(3)}, status.Attributes)
+
+		// Child workflows do not inherit their parent's attributes
+		childStatuses, err := ListWorkflows(dbosCtx, WithWorkflowIDs([]string{childID}))
+		require.NoError(t, err)
+		require.Len(t, childStatuses, 1)
+		assert.Nil(t, childStatuses[0].Attributes)
+		// Workflows not enqueued by a named schedule have no schedule name and
+		// are never returned by the schedule name filter.
+		assert.Empty(t, childStatuses[0].ScheduleName)
+
+		// Workflows started without the option have no attributes
+		plainHandle, err := RunWorkflow(dbosCtx, attrParentWorkflow, "")
+		require.NoError(t, err)
+		_, err = plainHandle.GetResult()
+		require.NoError(t, err)
+		plainStatus, err := plainHandle.GetStatus()
+		require.NoError(t, err)
+		assert.Nil(t, plainStatus.Attributes)
+	})
+
+	t.Run("Enqueue", func(t *testing.T) {
+		handle, err := RunWorkflow(dbosCtx, attrNoopWorkflow, 5, WithQueue(queue.GetName()), WithWorkflowAttributes(map[string]any{"source": "queue"}))
+		require.NoError(t, err)
+		result, err := handle.GetResult()
+		require.NoError(t, err)
+		assert.Equal(t, 5, result)
+		status, err := handle.GetStatus()
+		require.NoError(t, err)
+		assert.Equal(t, map[string]any{"source": "queue"}, status.Attributes)
+	})
+
+	t.Run("Fork", func(t *testing.T) {
+		wfid := uuid.NewString()
+		handle, err := RunWorkflow(dbosCtx, attrNoopWorkflow, 7, WithWorkflowID(wfid), WithWorkflowAttributes(map[string]any{"customer": "acme-fork"}))
+		require.NoError(t, err)
+		_, err = handle.GetResult()
+		require.NoError(t, err)
+
+		forkedHandle, err := ForkWorkflow[int](dbosCtx, ForkWorkflowInput{OriginalWorkflowID: wfid})
+		require.NoError(t, err)
+		_, err = forkedHandle.GetResult()
+		require.NoError(t, err)
+		forkedStatus, err := forkedHandle.GetStatus()
+		require.NoError(t, err)
+		assert.Equal(t, map[string]any{"customer": "acme-fork"}, forkedStatus.Attributes)
+	})
+
+	t.Run("ClientEnqueue", func(t *testing.T) {
+		config := ClientConfig{
+			DatabaseURL: backendDatabaseURL(t),
+		}
+		client, err := NewClient(dbosCtx, config)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			client.Shutdown(30 * time.Second)
+		})
+
+		// Enqueue to a queue nothing consumes; the workflow stays ENQUEUED, which
+		// is enough to check the attributes recorded at creation.
+		handle, err := client.Enqueue("unconsumed-queue", "client-workflow", 1, WithEnqueueAttributes(map[string]any{"source": "client", "n": 1}))
+		require.NoError(t, err)
+		status, err := handle.GetStatus()
+		require.NoError(t, err)
+		assert.Equal(t, map[string]any{"source": "client", "n": float64(1)}, status.Attributes)
+
+		if !useSqliteBackend() {
+			handle2, err := client.Enqueue("unconsumed-queue", "client-workflow", 2, WithEnqueueAttributes(map[string]any{"source": "client", "n": 2}))
+			require.NoError(t, err)
+			statuses, err := client.ListWorkflows(WithFilterAttributes(map[string]any{"source": "client"}))
+			require.NoError(t, err)
+			ids := make(map[string]bool, len(statuses))
+			for _, s := range statuses {
+				ids[s.ID] = true
+			}
+			assert.Equal(t, map[string]bool{handle.GetWorkflowID(): true, handle2.GetWorkflowID(): true}, ids)
+			queued, err := client.ListWorkflows(WithQueuesOnly(), WithFilterAttributes(map[string]any{"n": 2}))
+			require.NoError(t, err)
+			require.Len(t, queued, 1)
+			assert.Equal(t, handle2.GetWorkflowID(), queued[0].ID)
+		}
+	})
+
+	t.Run("ListFilter", func(t *testing.T) {
+		skipIfSqlite(t, "attribute filters require JSONB containment")
+
+		h1, err := RunWorkflow(dbosCtx, attrNoopWorkflow, 1, WithWorkflowAttributes(map[string]any{"customer": "acme-list", "tier": 1, "beta": true, "note": nil}))
+		require.NoError(t, err)
+		h2, err := RunWorkflow(dbosCtx, attrNoopWorkflow, 2, WithWorkflowAttributes(map[string]any{"customer": "bigco-list", "tier": 2, "meta": map[string]any{"region": "us-east-1"}}))
+		require.NoError(t, err)
+		_, err = h1.GetResult()
+		require.NoError(t, err)
+		_, err = h2.GetResult()
+		require.NoError(t, err)
+
+		// Single key
+		assert.Equal(t, map[string]bool{h1.GetWorkflowID(): true}, matchedIDs(t, map[string]any{"customer": "acme-list"}))
+		// Multiple keys AND together
+		assert.Equal(t, map[string]bool{h2.GetWorkflowID(): true}, matchedIDs(t, map[string]any{"customer": "bigco-list", "tier": 2}))
+		// Value mismatch on one key matches nothing
+		assert.Empty(t, matchedIDs(t, map[string]any{"customer": "acme-list", "tier": 2}))
+		// Non-string value types
+		assert.Equal(t, map[string]bool{h1.GetWorkflowID(): true}, matchedIDs(t, map[string]any{"beta": true}))
+		assert.Equal(t, map[string]bool{h1.GetWorkflowID(): true}, matchedIDs(t, map[string]any{"note": nil}))
+		assert.Equal(t, map[string]bool{h2.GetWorkflowID(): true}, matchedIDs(t, map[string]any{"meta": map[string]any{"region": "us-east-1"}}))
+		// Composes with other filters
+		composed, err := ListWorkflows(dbosCtx, WithFilterAttributes(map[string]any{"tier": 1}), WithWorkflowIDs([]string{h2.GetWorkflowID()}))
+		require.NoError(t, err)
+		assert.Empty(t, composed)
+		// Workflows without attributes never match
+		assert.Empty(t, matchedIDs(t, map[string]any{"missing": "key"}))
+	})
+
+	t.Run("ListQueued", func(t *testing.T) {
+		skipIfSqlite(t, "attribute filters require JSONB containment")
+
+		handle, err := RunWorkflow(dbosCtx, attrBlockingWorkflow, "", WithQueue(queue.GetName()), WithWorkflowAttributes(map[string]any{"side": "queued"}))
+		require.NoError(t, err)
+		attrBlockingStartEvent.Wait()
+
+		queued, err := ListWorkflows(dbosCtx, WithQueuesOnly(), WithFilterAttributes(map[string]any{"side": "queued"}))
+		require.NoError(t, err)
+		require.Len(t, queued, 1)
+		assert.Equal(t, handle.GetWorkflowID(), queued[0].ID)
+
+		other, err := ListWorkflows(dbosCtx, WithQueuesOnly(), WithFilterAttributes(map[string]any{"side": "other"}))
+		require.NoError(t, err)
+		assert.Empty(t, other)
+
+		attrBlockingBlockEvent.Set()
+		_, err = handle.GetResult()
+		require.NoError(t, err)
+	})
+
+	t.Run("FilterUnsupportedOnSQLite", func(t *testing.T) {
+		if !useSqliteBackend() {
+			t.Skip("tests the SQLite-only error path")
+		}
+		_, err := ListWorkflows(dbosCtx, WithFilterAttributes(map[string]any{"customer": "acme"}))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "not supported")
+	})
+
+	t.Run("NonSerializableAttributesRejected", func(t *testing.T) {
+		_, err := RunWorkflow(dbosCtx, attrNoopWorkflow, 1, WithWorkflowAttributes(map[string]any{"bad": make(chan int)}))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to marshal workflow attributes")
+	})
+
+	t.Run("Debouncer", func(t *testing.T) {
+		handle, err := debouncer.Debounce(dbosCtx, "attr-key", 100*time.Millisecond, 9, WithWorkflowAttributes(map[string]any{"source": "debouncer"}))
+		require.NoError(t, err)
+		result, err := handle.GetResult()
+		require.NoError(t, err)
+		assert.Equal(t, 9, result)
+		status, err := handle.GetStatus()
+		require.NoError(t, err)
+		assert.Equal(t, map[string]any{"source": "debouncer"}, status.Attributes)
+
+		// The internal debouncer workflow itself does not get the user's attributes
+		internalStatuses, err := ListWorkflows(dbosCtx, WithName(debouncer.internalDebouncerFQN))
+		require.NoError(t, err)
+		require.NotEmpty(t, internalStatuses)
+		for _, s := range internalStatuses {
+			if !strings.Contains(s.Name, "internalDebouncerWF") {
+				continue
+			}
+			assert.Nil(t, s.Attributes)
+		}
+	})
+
+	t.Run("Update", func(t *testing.T) {
+		wfid := uuid.NewString()
+		handle, err := RunWorkflow(dbosCtx, attrNoopWorkflow, 1, WithWorkflowID(wfid), WithWorkflowAttributes(map[string]any{"customer": "acme-upd", "tier": 1}))
+		require.NoError(t, err)
+		_, err = handle.GetResult()
+		require.NoError(t, err)
+
+		// Replace the attributes entirely
+		require.NoError(t, UpdateWorkflowAttributes(dbosCtx, wfid, map[string]any{"customer": "globex-upd"}))
+		status, err := handle.GetStatus()
+		require.NoError(t, err)
+		assert.Equal(t, map[string]any{"customer": "globex-upd"}, status.Attributes)
+
+		// The old attribute value no longer matches; the new one does (Postgres only)
+		if !useSqliteBackend() {
+			assert.NotContains(t, matchedIDs(t, map[string]any{"customer": "acme-upd"}), wfid)
+			assert.Contains(t, matchedIDs(t, map[string]any{"customer": "globex-upd"}), wfid)
+		}
+
+		// Passing nil clears all attributes
+		require.NoError(t, UpdateWorkflowAttributes(dbosCtx, wfid, nil))
+		status, err = handle.GetStatus()
+		require.NoError(t, err)
+		assert.Nil(t, status.Attributes)
+	})
+
+	t.Run("UpdateNonExistentWorkflow", func(t *testing.T) {
+		err := UpdateWorkflowAttributes(dbosCtx, "does-not-exist-"+uuid.NewString(), map[string]any{"k": "v"})
+		require.Error(t, err)
+		var dbosErr *DBOSError
+		require.ErrorAs(t, err, &dbosErr)
+		assert.Equal(t, NonExistentWorkflowError, dbosErr.Code)
+	})
+}
+
+func TestFork(t *testing.T) {
+	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
+
+	// Workflow whose second and third steps fail on their first call, for fork-from-failure tests.
+	var failStepOneCount, failStepTwoCount, failStepThreeCount atomic.Int64
+	failableWorkflow := func(ctx DBOSContext, _ string) (int, error) {
+		one, err := RunAsStep(ctx, func(ctx context.Context) (int, error) {
+			failStepOneCount.Add(1)
+			return 1, nil
+		}, WithStepName("stepOne"))
+		if err != nil {
+			return 0, err
+		}
+		two, err := RunAsStep(ctx, func(ctx context.Context) (int, error) {
+			if failStepTwoCount.Add(1) == 1 { // fail on first call only (wf1)
+				return 0, errors.New("step two failed")
+			}
+			return 2, nil
+		}, WithStepName("stepTwo"))
+		if err != nil {
+			return 0, err
+		}
+		three, err := RunAsStep(ctx, func(ctx context.Context) (int, error) {
+			if failStepThreeCount.Add(1) == 1 { // fail on first call only (wf2)
+				return 0, errors.New("step three failed")
+			}
+			return 3, nil
+		}, WithStepName("stepThree"))
+		if err != nil {
+			return 0, err
+		}
+		return one + two + three, nil
+	}
+
+	// Always-succeeding workflow for bulk fork tests.
+	var stepOneCount, stepTwoCount, stepThreeCount atomic.Int64
+	threeStepWorkflow := func(ctx DBOSContext, _ string) (int, error) {
+		one, err := RunAsStep(ctx, func(ctx context.Context) (int, error) {
+			stepOneCount.Add(1)
+			return 1, nil
+		}, WithStepName("stepOne"))
+		if err != nil {
+			return 0, err
+		}
+		two, err := RunAsStep(ctx, func(ctx context.Context) (int, error) {
+			stepTwoCount.Add(1)
+			return 2, nil
+		}, WithStepName("stepTwo"))
+		if err != nil {
+			return 0, err
+		}
+		three, err := RunAsStep(ctx, func(ctx context.Context) (int, error) {
+			stepThreeCount.Add(1)
+			return 3, nil
+		}, WithStepName("stepThree"))
+		if err != nil {
+			return 0, err
+		}
+		return one + two + three, nil
+	}
+
+	// Workflow that catches its second step's error and continues, so its last
+	// failed step (1) differs from its last step (2) — distinguishing
+	// fromLastFailure from fromLastStep.
+	var caughtStepTwoCount atomic.Int64
+	caughtFailureWorkflow := func(ctx DBOSContext, _ string) (int, error) {
+		one, err := RunAsStep(ctx, func(ctx context.Context) (int, error) {
+			return 1, nil
+		}, WithStepName("stepOne"))
+		if err != nil {
+			return 0, err
+		}
+		two, err := RunAsStep(ctx, func(ctx context.Context) (int, error) {
+			if caughtStepTwoCount.Add(1) == 1 { // fail on first call only
+				return 0, errors.New("step two failed")
+			}
+			return 2, nil
+		}, WithStepName("stepTwo"))
+		if err != nil {
+			two = 0 // swallow the error and continue
+		}
+		three, err := RunAsStep(ctx, func(ctx context.Context) (int, error) {
+			return 3, nil
+		}, WithStepName("stepThree"))
+		if err != nil {
+			return 0, err
+		}
+		return one + two + three, nil
+	}
+
+	RegisterWorkflow(dbosCtx, failableWorkflow, WithWorkflowName("failableThreeStepWorkflow"))
+	RegisterWorkflow(dbosCtx, threeStepWorkflow, WithWorkflowName("bulkForkWorkflow"))
+	RegisterWorkflow(dbosCtx, caughtFailureWorkflow, WithWorkflowName("caughtFailureWorkflow"))
+	require.NoError(t, Launch(dbosCtx))
+
+	sysDB := dbosCtx.(*dbosContext).systemDB
+
+	t.Run("FromFailure", func(t *testing.T) {
+		runToFailure := func(expectedErr string) string {
+			wfID := uuid.NewString()
+			handle, err := RunWorkflow(dbosCtx, failableWorkflow, "", WithWorkflowID(wfID))
+			require.NoError(t, err)
+			_, err = handle.GetResult()
+			require.ErrorContains(t, err, expectedErr)
+			return wfID
+		}
+
+		awaitForks := func(forkedIDs []string) {
+			for _, fid := range forkedIDs {
+				fh, err := RetrieveWorkflow[int](dbosCtx, fid)
+				require.NoError(t, err)
+				res, err := fh.GetResult()
+				require.NoError(t, err)
+				require.Equal(t, 6, res)
+			}
+		}
+
+		// wf1: step two fails -> last failed step is 1
+		wf1ID := runToFailure("step two failed")
+		require.Equal(t, int64(1), failStepOneCount.Load())
+		require.Equal(t, int64(1), failStepTwoCount.Load())
+		require.Equal(t, int64(0), failStepThreeCount.Load())
+
+		// wf2: step two succeeds, step three fails -> last failed step is 2
+		wf2ID := runToFailure("step three failed")
+		require.Equal(t, int64(2), failStepOneCount.Load())
+		require.Equal(t, int64(2), failStepTwoCount.Load())
+		require.Equal(t, int64(1), failStepThreeCount.Load())
+
+		// wf3: all steps succeed -> no failed step, falls back to last step (2)
+		wf3ID := uuid.NewString()
+		handle, err := RunWorkflow(dbosCtx, failableWorkflow, "", WithWorkflowID(wf3ID))
+		require.NoError(t, err)
+		res, err := handle.GetResult()
+		require.NoError(t, err)
+		require.Equal(t, 6, res)
+		require.Equal(t, int64(3), failStepOneCount.Load())
+		require.Equal(t, int64(3), failStepTwoCount.Load())
+		require.Equal(t, int64(2), failStepThreeCount.Load())
+
+		t.Run("FromLastFailure", func(t *testing.T) {
+			forkedIDs, err := sysDB.ForkFrom(dbosCtx, sysdb.ForkFromDBInput{
+				WorkflowIDs:     []string{wf1ID, wf2ID, wf3ID},
+				FromLastFailure: true,
+			})
+			require.NoError(t, err)
+			require.Len(t, forkedIDs, 3)
+			awaitForks(forkedIDs)
+
+			require.Equal(t, int64(3), failStepOneCount.Load())   // replayed for all three forks
+			require.Equal(t, int64(4), failStepTwoCount.Load())   // re-run for wf1's fork only
+			require.Equal(t, int64(5), failStepThreeCount.Load()) // re-run for all three forks
+
+			// A fork also marks its source was_forked_from.
+			srcs, err := sysDB.ListWorkflows(dbosCtx, sysdb.ListWorkflowsDBInput{WorkflowIDs: []string{wf1ID}})
+			require.NoError(t, err)
+			require.Len(t, srcs, 1)
+			require.True(t, srcs[0].WasForkedFrom, "a forked-from workflow should be marked was_forked_from")
+		})
+
+		t.Run("FromLastStep", func(t *testing.T) {
+			forkedIDs, err := sysDB.ForkFrom(dbosCtx, sysdb.ForkFromDBInput{
+				WorkflowIDs:  []string{wf1ID, wf2ID, wf3ID},
+				FromLastStep: true,
+			})
+			require.NoError(t, err)
+			require.Len(t, forkedIDs, 3)
+			awaitForks(forkedIDs)
+
+			// wf1's last step is stepTwo (stepThree never ran), so stepTwo re-runs
+			require.Equal(t, int64(5), failStepTwoCount.Load())
+			// all three forks re-run stepThree
+			require.Equal(t, int64(8), failStepThreeCount.Load())
+		})
+
+		t.Run("FromStep", func(t *testing.T) {
+			startStep := 0
+			forkedIDs, err := sysDB.ForkFrom(dbosCtx, sysdb.ForkFromDBInput{
+				WorkflowIDs: []string{wf3ID},
+				FromStep:    &startStep,
+			})
+			require.NoError(t, err)
+			require.Len(t, forkedIDs, 1)
+			awaitForks(forkedIDs)
+
+			require.Equal(t, int64(4), failStepOneCount.Load())
+			require.Equal(t, int64(6), failStepTwoCount.Load())
+			require.Equal(t, int64(9), failStepThreeCount.Load())
+		})
+
+		t.Run("FromStepName", func(t *testing.T) {
+			stepName := "stepTwo"
+			forkedIDs, err := sysDB.ForkFrom(dbosCtx, sysdb.ForkFromDBInput{
+				WorkflowIDs:  []string{wf3ID},
+				FromStepName: &stepName,
+			})
+			require.NoError(t, err)
+			require.Len(t, forkedIDs, 1)
+			awaitForks(forkedIDs)
+
+			require.Equal(t, int64(4), failStepOneCount.Load())    // replayed
+			require.Equal(t, int64(7), failStepTwoCount.Load())    // re-run
+			require.Equal(t, int64(10), failStepThreeCount.Load()) // re-run
+		})
+
+		t.Run("Validation", func(t *testing.T) {
+			// wf1 never ran stepThree
+			missingName := "stepThree"
+			_, err := sysDB.ForkFrom(dbosCtx, sysdb.ForkFromDBInput{
+				WorkflowIDs:  []string{wf1ID},
+				FromStepName: &missingName,
+			})
+			require.ErrorContains(t, err, "has no step named")
+
+			nonexistent := "nonexistentStep"
+			_, err = sysDB.ForkFrom(dbosCtx, sysdb.ForkFromDBInput{
+				WorkflowIDs:  []string{wf3ID},
+				FromStepName: &nonexistent,
+			})
+			require.ErrorContains(t, err, "has no step named")
+
+			// no mode specified
+			_, err = sysDB.ForkFrom(dbosCtx, sysdb.ForkFromDBInput{
+				WorkflowIDs: []string{wf3ID},
+			})
+			require.ErrorContains(t, err, "exactly one")
+
+			// multiple modes specified
+			_, err = sysDB.ForkFrom(dbosCtx, sysdb.ForkFromDBInput{
+				WorkflowIDs:     []string{wf3ID},
+				FromLastFailure: true,
+				FromLastStep:    true,
+			})
+			require.ErrorContains(t, err, "exactly one")
+		})
+
+		t.Run("LastFailureVsLastStep", func(t *testing.T) {
+			wfID := uuid.NewString()
+			handle, err := RunWorkflow(dbosCtx, caughtFailureWorkflow, "", WithWorkflowID(wfID))
+			require.NoError(t, err)
+			res, err := handle.GetResult()
+			require.NoError(t, err)
+			require.Equal(t, 4, res) // stepTwo's error was caught, so two contributes 0
+
+			forkAndGet := func(input sysdb.ForkFromDBInput) int {
+				input.WorkflowIDs = []string{wfID}
+				forkedIDs, err := sysDB.ForkFrom(dbosCtx, input)
+				require.NoError(t, err)
+				require.Len(t, forkedIDs, 1)
+				fh, err := RetrieveWorkflow[int](dbosCtx, forkedIDs[0])
+				require.NoError(t, err)
+				res, err := fh.GetResult()
+				require.NoError(t, err)
+				return res
+			}
+
+			// fromLastStep starts at the last step (stepThree): stepTwo's
+			// checkpointed error replays and is caught again.
+			require.Equal(t, 4, forkAndGet(sysdb.ForkFromDBInput{FromLastStep: true}))
+			// fromLastFailure starts at the failed step (stepTwo) even though a
+			// later step succeeded: stepTwo re-runs and succeeds this time.
+			require.Equal(t, 6, forkAndGet(sysdb.ForkFromDBInput{FromLastFailure: true}))
+		})
+	})
+
+	t.Run("ForkWorkflows", func(t *testing.T) {
+		// Run three workflows to completion
+		originalIDs := make([]string, 3)
+		for i := range originalIDs {
+			originalIDs[i] = uuid.NewString()
+			handle, err := RunWorkflow(dbosCtx, threeStepWorkflow, "", WithWorkflowID(originalIDs[i]))
+			require.NoError(t, err)
+			res, err := handle.GetResult()
+			require.NoError(t, err)
+			require.Equal(t, 6, res)
+		}
+		require.Equal(t, int64(3), stepOneCount.Load())
+		require.Equal(t, int64(3), stepTwoCount.Load())
+		require.Equal(t, int64(3), stepThreeCount.Load())
+
+		awaitForks := func(forkedIDs []string) {
+			for i, fid := range forkedIDs {
+				fh, err := RetrieveWorkflow[int](dbosCtx, fid)
+				require.NoError(t, err)
+				res, err := fh.GetResult()
+				require.NoError(t, err)
+				require.Equal(t, 6, res)
+				status, err := fh.GetStatus()
+				require.NoError(t, err)
+				require.Equal(t, originalIDs[i], status.ForkedFrom)
+			}
+		}
+
+		t.Run("MixedStartSteps", func(t *testing.T) {
+			forkedIDs, err := sysDB.ForkWorkflows(dbosCtx, sysdb.ForkWorkflowsDBInput{
+				OriginalWorkflowIDs: originalIDs,
+				StartSteps:          []int{0, 1, 2},
+			})
+			require.NoError(t, err)
+			require.Len(t, forkedIDs, 3)
+			require.Len(t, map[string]bool{forkedIDs[0]: true, forkedIDs[1]: true, forkedIDs[2]: true}, 3)
+			awaitForks(forkedIDs)
+
+			// fork 1 re-runs all steps, fork 2 replays stepOne, fork 3 replays stepOne and stepTwo
+			require.Equal(t, int64(4), stepOneCount.Load())
+			require.Equal(t, int64(5), stepTwoCount.Load())
+			require.Equal(t, int64(6), stepThreeCount.Load())
+
+			// The originals are marked as forked from
+			for _, id := range originalIDs {
+				oh, err := RetrieveWorkflow[int](dbosCtx, id)
+				require.NoError(t, err)
+				status, err := oh.GetStatus()
+				require.NoError(t, err)
+				require.True(t, status.WasForkedFrom)
+			}
+		})
+
+		t.Run("CustomForkedIDs", func(t *testing.T) {
+			customID := "custom-forked-" + uuid.NewString()
+			forkedIDs, err := sysDB.ForkWorkflows(dbosCtx, sysdb.ForkWorkflowsDBInput{
+				OriginalWorkflowIDs: originalIDs[:2],
+				ForkedWorkflowIDs:   []string{customID, ""}, // empty entry is auto-generated
+				StartSteps:          []int{2, 2},
+			})
+			require.NoError(t, err)
+			require.Len(t, forkedIDs, 2)
+			require.Equal(t, customID, forkedIDs[0])
+			require.NotEmpty(t, forkedIDs[1])
+			awaitForks(forkedIDs)
+		})
+
+		t.Run("PublicAPI", func(t *testing.T) {
+			// Exercise the public batch fork API end-to-end, including a custom
+			// forked ID, mixed start steps, and an auto-generated ID.
+			customID := "public-forked-" + uuid.NewString()
+			handles, err := ForkWorkflows[int](dbosCtx, ForkWorkflowsInput{
+				Workflows: []ForkWorkflowSpec{
+					{OriginalWorkflowID: originalIDs[0], ForkedWorkflowID: customID, StartStep: 2},
+					{OriginalWorkflowID: originalIDs[1], StartStep: 1},
+					{OriginalWorkflowID: originalIDs[2]},
+				},
+			})
+			require.NoError(t, err)
+			require.Len(t, handles, 3)
+			// Handles are returned in the same order as the input specs.
+			require.Equal(t, customID, handles[0].GetWorkflowID())
+			require.NotEmpty(t, handles[1].GetWorkflowID())
+
+			forkedIDs := make([]string, len(handles))
+			for i, h := range handles {
+				res, err := h.GetResult()
+				require.NoError(t, err)
+				require.Equal(t, 6, res)
+				forkedIDs[i] = h.GetWorkflowID()
+			}
+			awaitForks(forkedIDs)
+
+			t.Run("Validation", func(t *testing.T) {
+				_, err := ForkWorkflows[int](nil, ForkWorkflowsInput{})
+				require.ErrorContains(t, err, "ctx cannot be nil")
+
+				_, err = ForkWorkflows[int](dbosCtx, ForkWorkflowsInput{})
+				require.ErrorContains(t, err, "at least one workflow")
+
+				_, err = ForkWorkflows[int](dbosCtx, ForkWorkflowsInput{
+					Workflows: []ForkWorkflowSpec{{OriginalWorkflowID: ""}},
+				})
+				require.ErrorContains(t, err, "original workflow ID cannot be empty")
+
+				_, err = ForkWorkflows[int](dbosCtx, ForkWorkflowsInput{
+					Workflows:         []ForkWorkflowSpec{{OriginalWorkflowID: originalIDs[0]}},
+					QueuePartitionKey: "pk",
+				})
+				require.ErrorContains(t, err, "queue partition key requires a queue name")
+			})
+		})
+
+		t.Run("Validation", func(t *testing.T) {
+			// Empty input is a no-op
+			forkedIDs, err := sysDB.ForkWorkflows(dbosCtx, sysdb.ForkWorkflowsDBInput{})
+			require.NoError(t, err)
+			require.Empty(t, forkedIDs)
+
+			// startSteps length mismatch
+			_, err = sysDB.ForkWorkflows(dbosCtx, sysdb.ForkWorkflowsDBInput{
+				OriginalWorkflowIDs: originalIDs,
+				StartSteps:          []int{0},
+			})
+			require.ErrorContains(t, err, "same length")
+
+			// forkedWorkflowIDs length mismatch
+			_, err = sysDB.ForkWorkflows(dbosCtx, sysdb.ForkWorkflowsDBInput{
+				OriginalWorkflowIDs: originalIDs,
+				ForkedWorkflowIDs:   []string{"only-one"},
+				StartSteps:          []int{0, 0, 0},
+			})
+			require.ErrorContains(t, err, "same length")
+
+			// Negative start step
+			_, err = sysDB.ForkWorkflows(dbosCtx, sysdb.ForkWorkflowsDBInput{
+				OriginalWorkflowIDs: originalIDs[:1],
+				StartSteps:          []int{-1},
+			})
+			require.ErrorContains(t, err, "startStep must be >= 0")
+		})
+
+		t.Run("Atomicity", func(t *testing.T) {
+			// Count existing forks of the first original
+			listForks := func() int {
+				wfs, err := sysDB.ListWorkflows(dbosCtx, sysdb.ListWorkflowsDBInput{ForkedFrom: originalIDs[:1]})
+				require.NoError(t, err)
+				return len(wfs)
+			}
+			forksBefore := listForks()
+
+			// A batch containing a nonexistent workflow fails and forks nothing
+			_, err := sysDB.ForkWorkflows(dbosCtx, sysdb.ForkWorkflowsDBInput{
+				OriginalWorkflowIDs: []string{originalIDs[0], "nonexistent-workflow-id"},
+				StartSteps:          []int{2, 2},
+			})
+			require.ErrorContains(t, err, "nonexistent-workflow-id does not exist")
+			require.Equal(t, forksBefore, listForks())
+		})
+	})
+}
+
+// parkingPool wraps the system database pool and parks the first
+// updateWorkflowOutcome Exec for the target workflow until released,
+// signaling staleDone once that write has been attempted.
+type parkingPool struct {
+	Pool
+	target    string
+	parked    *Event
+	release   chan struct{}
+	staleDone chan struct{}
+	first     atomic.Bool
+}
+
+func (p *parkingPool) Exec(ctx context.Context, query string, args ...any) (Result, error) {
+	// Match on placeholder-free fragments: sqlite rewrites $N to ?N, so keying on
+	// "$2"/"$4" would never match there. The outcome-write UPDATE is the only query
+	// that sets both output and completed_at.
+	isOutcomeWrite := strings.Contains(query, "output =") && strings.Contains(query, "completed_at =")
+	if isOutcomeWrite && len(args) >= 5 && args[4] == any(p.target) && p.first.CompareAndSwap(false, true) {
+		p.parked.Set()
+		<-p.release
+		res, err := p.Pool.Exec(ctx, query, args...)
+		close(p.staleDone)
+		return res, err
+	}
+	return p.Pool.Exec(ctx, query, args...)
+}
+
+// A cancelled run's stale outcome write landing while the resumed row is still
+// ENQUEUED (resumed but not yet dequeued) must not flip it back to a terminal
+// state: the row would never be dequeued and the resume would be lost. The
+// resume targets a queue this process does not listen to yet, holding the row
+// in ENQUEUED until the stale write has been refused.
+func TestStaleOutcomeWriteOverEnqueued(t *testing.T) {
+	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
+
+	wfID := uuid.NewString()
+
+	var runs atomic.Int64
+	firstEntered := NewEvent()
+	firstRelease := make(chan struct{})
+	releaseFirst := sync.OnceFunc(func() { close(firstRelease) })
+	t.Cleanup(releaseFirst)
+
+	wf := func(ctx DBOSContext, _ string) (string, error) {
+		if runs.Add(1) == 1 {
+			firstEntered.Set()
+			<-firstRelease
+			return "", ctx.Err() // interrupted by the cancellation
+		}
+		return "completed", nil
+	}
+	RegisterWorkflow(dbosCtx, wf, WithWorkflowName("stale-over-enqueued-workflow"))
+
+	const parkedQueue = "stale-outcome-parked-queue"
+	_, err := RegisterQueue(dbosCtx, parkedQueue)
+	require.NoError(t, err, "failed to register queue")
+	// Don't listen to the parked queue yet: the resumed row must stay ENQUEUED
+	// until the stale write has landed.
+	ListenQueues(dbosCtx, WorkflowQueue{Name: "stale-outcome-unused-queue"})
+
+	sysdb := dbosCtx.(*dbosContext).systemDB.(*sysdb.SysDB)
+	park := &parkingPool{
+		Pool:      sysdb.Pool(),
+		target:    wfID,
+		parked:    NewEvent(),
+		release:   make(chan struct{}),
+		staleDone: make(chan struct{}),
+	}
+	sysdb.SetPool(park)
+	releaseStale := sync.OnceFunc(func() { close(park.release) })
+	t.Cleanup(releaseStale)
+
+	require.NoError(t, Launch(dbosCtx), "failed to launch DBOS instance")
+
+	handle, err := RunWorkflow(dbosCtx, wf, "", WithWorkflowID(wfID))
+	require.NoError(t, err, "failed to start workflow")
+	firstEntered.Wait()
+
+	// Durably cancel while the first run is executing.
+	require.NoError(t, CancelWorkflow(dbosCtx, wfID), "failed to cancel workflow")
+
+	// Let the first run return: its outcome write parks before executing.
+	releaseFirst()
+	park.parked.Wait()
+
+	// The durable status is CANCELLED (written by CancelWorkflow, not parked).
+	status, err := handle.GetStatus()
+	require.NoError(t, err, "failed to get workflow status")
+	require.Equal(t, WorkflowStatusCancelled, status.Status, "expected CANCELLED before resume")
+
+	// Resume onto the unlistened queue: the row is ENQUEUED and stays there.
+	resumedHandle, err := ResumeWorkflow[string](dbosCtx, wfID, WithResumeQueue(parkedQueue))
+	require.NoError(t, err, "failed to resume workflow")
+
+	// Land the stale write on the ENQUEUED row: it must be refused.
+	releaseStale()
+	<-park.staleDone
+
+	status, err = resumedHandle.GetStatus()
+	require.NoError(t, err, "failed to get workflow status")
+	require.Equal(t, WorkflowStatusEnqueued, status.Status, "the stale outcome write must not flip the resumed row terminal")
+
+	// Start listening to the queue: the workflow is dequeued and completes.
+	ListenQueues(dbosCtx, WorkflowQueue{Name: parkedQueue})
+
+	result, err := resumedHandle.GetResult()
+	require.NoError(t, err, "failed to get resumed workflow result")
+	require.Equal(t, "completed", result)
+	require.EqualValues(t, 2, runs.Load(), "the resume must re-dispatch the workflow")
+
+	status, err = resumedHandle.GetStatus()
+	require.NoError(t, err, "failed to get workflow status")
+	require.Equal(t, WorkflowStatusSuccess, status.Status, "the resumed run's outcome must survive")
+}
+
+// TestConcurrentStartRaceSameExecutor reproduces B5: the active-workflow-ID check
+// (Load inside the insert tx) and set (LoadOrStore in the spawned goroutine) are not
+// atomic, and recovery/dequeue starts bypass the ownerXID guard. Two concurrent
+// recovery requests for the same PENDING workflow can both pass the Load check before
+// either goroutine runs LoadOrStore, so both execute the workflow body; the loser then
+// deleted the winner's active entry on completion. The workflow body must never run
+// concurrently with itself on one executor, and every handle must still resolve.
+func TestConcurrentStartRaceSameExecutor(t *testing.T) {
+	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
+	c := dbosCtx.(*dbosContext)
+
+	var running atomic.Int32
+	var doubleExecutions atomic.Int32
+	raceWorkflow := func(ctx DBOSContext, _ string) (string, error) {
+		if running.Add(1) > 1 {
+			doubleExecutions.Add(1)
+		}
+		defer running.Add(-1)
+		// Keep the body open long enough for an overlapping execution to be observed.
+		time.Sleep(50 * time.Millisecond)
+		return "done", nil
+	}
+	RegisterWorkflow(dbosCtx, raceWorkflow, WithWorkflowName("start-race-workflow"))
+	require.NoError(t, Launch(dbosCtx), "failed to launch DBOS")
+
+	const attempts = 20
+	for i := range attempts {
+		workflowID := fmt.Sprintf("start-race-%d", i)
+		handle, err := RunWorkflow(dbosCtx, raceWorkflow, "in", WithWorkflowID(workflowID))
+		require.NoError(t, err, "failed to run workflow")
+		_, err = handle.GetResult()
+		require.NoError(t, err, "failed to get seed result")
+
+		setWorkflowStatusPending(t, dbosCtx, workflowID)
+
+		// Fire two concurrent recovery requests for the same PENDING workflow. Both
+		// bypass the ownerXID guard, so both can land in the Load/LoadOrStore window.
+		var wg sync.WaitGroup
+		recoveredHandles := make([][]WorkflowHandle[any], 2)
+		for j := range 2 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				handles, err := recoverPendingWorkflows(c, []string{"local"})
+				assert.NoError(t, err, "recoverPendingWorkflows failed")
+				recoveredHandles[j] = handles
+			}()
+		}
+		wg.Wait()
+
+		// Join every recovered execution before asserting; a handle that never
+		// resolves (workflow stuck PENDING) fails the test via the suite timeout.
+		var handleErrs []error
+		for _, handles := range recoveredHandles {
+			for _, h := range handles {
+				if _, err := h.GetResult(); err != nil {
+					handleErrs = append(handleErrs, err)
+				}
+			}
+		}
+
+		require.Zero(t, doubleExecutions.Load(),
+			"attempt %d: workflow body executed concurrently with itself on the same executor", i)
+		for _, err := range handleErrs {
+			require.NoError(t, err, "attempt %d: a recovered handle returned an error", i)
+		}
+
+		status, err := handle.GetStatus()
+		require.NoError(t, err, "failed to get workflow status")
+		require.Equal(t, WorkflowStatusSuccess, status.Status, "attempt %d: workflow must end SUCCESS", i)
+	}
 }

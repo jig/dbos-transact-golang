@@ -10,6 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/jig/dbos-transact-golang/dbos/internal/sysdb"
 )
 
 const (
@@ -32,22 +34,41 @@ const (
 	_ADMIN_SERVER_READ_HEADER_TIMEOUT = 5 * time.Second
 )
 
+// stringOrSlice unmarshals a JSON value that is either a single string ("X")
+// or an array of strings (["X","Y"]). This matches the status filter contract
+// used by the DBOS console and the Python/TypeScript SDKs.
+type stringOrSlice []string
+
+func (s *stringOrSlice) UnmarshalJSON(data []byte) error {
+	var single string
+	if err := json.Unmarshal(data, &single); err == nil {
+		*s = []string{single}
+		return nil
+	}
+	var many []string
+	if err := json.Unmarshal(data, &many); err != nil {
+		return err
+	}
+	*s = many
+	return nil
+}
+
 // listWorkflowsRequest represents the request structure for listing workflows
 type listWorkflowsRequest struct {
-	WorkflowUUIDs      []string   `json:"workflow_uuids"`      // Filter by specific workflow IDs
-	AuthenticatedUser  *string    `json:"authenticated_user"`  // Filter by user who initiated the workflow
-	StartTime          *time.Time `json:"start_time"`          // Filter workflows created after this time (RFC3339 format)
-	EndTime            *time.Time `json:"end_time"`            // Filter workflows created before this time (RFC3339 format)
-	Status             string     `json:"status"`              // Filter by workflow status
-	ApplicationVersion *string    `json:"application_version"` // Filter by application version
-	WorkflowName       *string    `json:"workflow_name"`       // Filter by workflow function name
-	Limit              *int       `json:"limit"`               // Maximum number of results to return
-	Offset             *int       `json:"offset"`              // Offset for pagination
-	SortDesc           *bool      `json:"sort_desc"`           // Sort in descending order by creation time
-	WorkflowIDPrefix   *string    `json:"workflow_id_prefix"`  // Filter by workflow ID prefix
-	LoadInput          *bool      `json:"load_input"`          // Include workflow input in response
-	LoadOutput         *bool      `json:"load_output"`         // Include workflow output in response
-	QueueName          *string    `json:"queue_name"`          // Filter by queue name (for queued workflows)
+	WorkflowUUIDs      []string      `json:"workflow_uuids"`      // Filter by specific workflow IDs
+	AuthenticatedUser  *string       `json:"authenticated_user"`  // Filter by user who initiated the workflow
+	StartTime          *time.Time    `json:"start_time"`          // Filter workflows created after this time (RFC3339 format)
+	EndTime            *time.Time    `json:"end_time"`            // Filter workflows created before this time (RFC3339 format)
+	Status             stringOrSlice `json:"status"`              // Filter by workflow status (string or array of strings)
+	ApplicationVersion *string       `json:"application_version"` // Filter by application version
+	WorkflowName       *string       `json:"workflow_name"`       // Filter by workflow function name
+	Limit              *int          `json:"limit"`               // Maximum number of results to return
+	Offset             *int          `json:"offset"`              // Offset for pagination
+	SortDesc           *bool         `json:"sort_desc"`           // Sort in descending order by creation time
+	WorkflowIDPrefix   *string       `json:"workflow_id_prefix"`  // Filter by workflow ID prefix
+	LoadInput          *bool         `json:"load_input"`          // Include workflow input in response
+	LoadOutput         *bool         `json:"load_output"`         // Include workflow output in response
+	QueueName          *string       `json:"queue_name"`          // Filter by queue name (for queued workflows)
 }
 
 // buildOptions converts the request struct into a slice of ListWorkflowsOption
@@ -66,8 +87,10 @@ func (req *listWorkflowsRequest) toListWorkflowsOptions() []ListWorkflowsOption 
 		opts = append(opts, WithEndTime(*req.EndTime))
 	}
 	if len(req.Status) > 0 {
-		statuses := make([]WorkflowStatusType, 1)
-		statuses[0] = WorkflowStatusType(req.Status)
+		statuses := make([]WorkflowStatusType, len(req.Status))
+		for i, s := range req.Status {
+			statuses[i] = WorkflowStatusType(s)
+		}
 		opts = append(opts, WithStatus(statuses))
 	}
 	if req.ApplicationVersion != nil {
@@ -303,9 +326,9 @@ func newAdminServer(ctx *dbosContext, port int) *adminServer {
 		cutoffTime := time.UnixMilli(inputs.CutoffEpochTimestampMs)
 		ctx.logger.Info("Global timeout request", "cutoff_time", cutoffTime)
 
-		err := retry(ctx, func() error {
-			return ctx.systemDB.cancelAllBefore(ctx, cutoffTime)
-		}, withRetrierLogger(ctx.logger))
+		err := sysdb.Retry(ctx, func() error {
+			return ctx.systemDB.CancelAllBefore(ctx, cutoffTime)
+		}, sysdb.WithRetrierLogger(ctx.logger))
 		if err != nil {
 			ctx.logger.Error("Global timeout failed", "error", err)
 			http.Error(w, fmt.Sprintf("Global timeout failed: %v", err), http.StatusInternalServerError)

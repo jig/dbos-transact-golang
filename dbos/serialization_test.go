@@ -7,9 +7,13 @@ import (
 	"encoding/gob"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"reflect"
 	"testing"
 	"time"
+
+	"github.com/jig/dbos-transact-golang/dbos/internal/models"
+	"github.com/jig/dbos-transact-golang/dbos/internal/sysdb"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -145,6 +149,12 @@ func testAllSerializationPaths[T any](
 		require.NoError(t, err)
 		require.Len(t, wfs, 1)
 		wf := wfs[0]
+
+		// GetStatus on a launched context must load input/output too
+		status, err := handle.GetStatus()
+		require.NoError(t, err)
+		assert.Equal(t, wf.Input, status.Input, "GetStatus input should match ListWorkflows input")
+		assert.Equal(t, wf.Output, status.Output, "GetStatus output should match ListWorkflows output")
 		if isNilExpected {
 			require.Nil(t, wf.Input, "Workflow input should be nil")
 			require.Nil(t, wf.Output, "Workflow output should be nil")
@@ -192,16 +202,16 @@ func testAllSerializationPaths[T any](
 			// Get the database pool to query directly
 			dbosCtx, ok := executor.(*dbosContext)
 			require.True(t, ok, "expected dbosContext")
-			sysDB, ok := dbosCtx.systemDB.(*sysDB)
+			sysDB, ok := dbosCtx.systemDB.(*sysdb.SysDB)
 			require.True(t, ok, "expected sysDB")
 
 			// Query the database directly to check for the marker
 			ctx := context.Background()
-			schemaPrefix := sysDB.dialect.SchemaPrefix(sysDB.schema)
-			query := sysDB.renderSQL(`SELECT inputs, output FROM %sworkflow_status WHERE workflow_uuid = $1`, schemaPrefix)
+			schemaPrefix := sysDB.Dialect().SchemaPrefix(sysDB.Schema())
+			query := sysDB.RenderSQL(`SELECT inputs, output FROM %sworkflow_status WHERE workflow_uuid = $1`, schemaPrefix)
 
 			var inputString, outputString *string
-			err := sysDB.pool.QueryRow(ctx, query, workflowID).Scan(&inputString, &outputString)
+			err := sysDB.Pool().QueryRow(ctx, query, workflowID).Scan(&inputString, &outputString)
 			require.NoError(t, err, "failed to query workflow status")
 
 			// Both input and output should be the nil marker
@@ -212,9 +222,9 @@ func testAllSerializationPaths[T any](
 			assert.Equal(t, nilMarker, *outputString, "output should be the nil marker")
 
 			// Also check the step output in operation_outputs
-			stepQuery := sysDB.renderSQL(`SELECT output FROM %soperation_outputs WHERE workflow_uuid = $1 ORDER BY function_id LIMIT 1`, schemaPrefix)
+			stepQuery := sysDB.RenderSQL(`SELECT output FROM %soperation_outputs WHERE workflow_uuid = $1 ORDER BY function_id LIMIT 1`, schemaPrefix)
 			var stepOutputString *string
-			err = sysDB.pool.QueryRow(ctx, stepQuery, workflowID).Scan(&stepOutputString)
+			err = sysDB.Pool().QueryRow(ctx, stepQuery, workflowID).Scan(&stepOutputString)
 			require.NoError(t, err, "failed to query step output")
 			require.NotNil(t, stepOutputString, "step output should not be NULL in database")
 			assert.Equal(t, nilMarker, *stepOutputString, "step output should be the nil marker")
@@ -990,6 +1000,24 @@ var (
 )
 
 // TestGobSerializer tests the built-in gob serializer through all workflow paths.
+func TestGobScheduledWorkflowInput(t *testing.T) {
+	// ScheduledWorkflowInput is gob-registered by the SDK itself; a gob
+	// serializer must round-trip it without any user-side registration.
+	ser := NewGobSerializer()
+	in := ScheduledWorkflowInput{
+		ScheduledTime: time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC),
+		Context:       "schedule-context",
+	}
+	encoded, err := ser.Encode(in)
+	require.NoError(t, err)
+	decoded, err := ser.Decode(encoded)
+	require.NoError(t, err)
+	out, ok := decoded.(ScheduledWorkflowInput)
+	require.True(t, ok, "decoded value has type %T", decoded)
+	require.True(t, out.ScheduledTime.Equal(in.ScheduledTime))
+	require.Equal(t, in.Context, out.Context)
+}
+
 func TestGobSerializer(t *testing.T) {
 	executor := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true, serializer: NewGobSerializer()})
 
@@ -1424,6 +1452,110 @@ func TestChickenSerializer(t *testing.T) {
 	})
 }
 
+// timeHostileSerializer behaves like the default JSON serializer but refuses to
+// encode a time.Time. It models a realistic custom serializer (schema/protobuf
+// based, or one with a type allowlist) that has no mapping for time.Time. It is
+// used to guard against DBOS routing an internal deadline through the user
+// serializer as a time.Time: the special steps (Sleep, and the timeout sleep of
+// Recv/GetEvent) must checkpoint the deadline as epoch millis (int64), which any
+// serializer can round-trip, rather than a time.Time.
+type timeHostileSerializer struct{}
+
+func (timeHostileSerializer) Name() string { return "TIME_HOSTILE" }
+
+func (timeHostileSerializer) Encode(data any) (*string, error) {
+	if _, ok := data.(time.Time); ok {
+		return nil, fmt.Errorf("timeHostileSerializer refuses to encode time.Time")
+	}
+	b, err := json.Marshal(data)
+	if err != nil {
+		return nil, err
+	}
+	s := string(b)
+	return &s, nil
+}
+
+func (timeHostileSerializer) Decode(data *string) (any, error) {
+	if data == nil {
+		return nil, nil
+	}
+	dec := json.NewDecoder(bytes.NewReader([]byte(*data)))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return nil, err
+	}
+	// Return whole numbers as int64 so DBOS's typed decode of the epoch-millis
+	// deadline round-trips instead of surfacing a float64.
+	if n, ok := v.(json.Number); ok {
+		if i, ierr := n.Int64(); ierr == nil {
+			return i, nil
+		}
+		f, ferr := n.Float64()
+		if ferr != nil {
+			return nil, ferr
+		}
+		return f, nil
+	}
+	return v, nil
+}
+
+// TestTimeHostileSerializer verifies the special steps whose durable deadline is
+// a timestamp (Sleep, and the internal timeout sleep of Recv/GetEvent) encode that deadline as int64.
+func TestTimeHostileSerializer(t *testing.T) {
+	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true, serializer: timeHostileSerializer{}})
+
+	sleepWorkflow := func(ctx DBOSContext, ms int) (time.Duration, error) {
+		return Sleep(ctx, time.Duration(ms)*time.Millisecond)
+	}
+	recvTimeoutWorkflow := func(ctx DBOSContext, topic string) (string, error) {
+		return Recv[string](ctx, topic, 500*time.Millisecond)
+	}
+	getEventTimeoutWorkflow := func(ctx DBOSContext, targetID string) (string, error) {
+		return GetEvent[string](ctx, targetID, "no-such-key", 500*time.Millisecond)
+	}
+	RegisterWorkflow(dbosCtx, sleepWorkflow)
+	RegisterWorkflow(dbosCtx, recvTimeoutWorkflow)
+	RegisterWorkflow(dbosCtx, getEventTimeoutWorkflow)
+
+	err := Launch(dbosCtx)
+	require.NoError(t, err)
+
+	t.Run("Sleep", func(t *testing.T) {
+		handle, err := RunWorkflow(dbosCtx, sleepWorkflow, 100)
+		require.NoError(t, err, "failed to start sleep workflow")
+		slept, err := handle.GetResult()
+		require.NoError(t, err, "Sleep must succeed: the deadline is stored as epoch millis, not a time.Time the serializer rejects")
+		require.LessOrEqual(t, slept, 100*time.Millisecond)
+
+		steps, err := GetWorkflowSteps(dbosCtx, handle.GetWorkflowID())
+		require.NoError(t, err)
+		require.Len(t, steps, 1)
+		require.Equal(t, "DBOS.sleep", steps[0].StepName)
+		require.Nil(t, steps[0].Error, "the sleep deadline must checkpoint cleanly")
+	})
+
+	t.Run("RecvTimeout", func(t *testing.T) {
+		handle, err := RunWorkflow(dbosCtx, recvTimeoutWorkflow, "time-hostile-topic")
+		require.NoError(t, err, "failed to start recv workflow")
+		_, err = handle.GetResult()
+		require.Error(t, err, "expected a timeout")
+		dbosErr, ok := err.(*DBOSError)
+		require.True(t, ok, "expected *DBOSError, got %T (a serialization failure here would mean the deadline was routed through the serializer as a time.Time)", err)
+		require.Equal(t, TimeoutError, dbosErr.Code, "expected TimeoutError, not a serialization error")
+	})
+
+	t.Run("GetEventTimeout", func(t *testing.T) {
+		handle, err := RunWorkflow(dbosCtx, getEventTimeoutWorkflow, "time-hostile-nonexistent-target")
+		require.NoError(t, err, "failed to start getEvent workflow")
+		_, err = handle.GetResult()
+		require.Error(t, err, "expected a timeout")
+		dbosErr, ok := err.(*DBOSError)
+		require.True(t, ok, "expected *DBOSError, got %T", err)
+		require.Equal(t, TimeoutError, dbosErr.Code, "expected TimeoutError, not a serialization error")
+	})
+}
+
 // TestPortableInterop tests cross-language interoperability using the portable JSON format.
 // It simulates another language inserting a workflow into the DB with portable_json serialization,
 // and verifies that Go can recover and execute it correctly.
@@ -1544,15 +1676,15 @@ func TestPortableInterop(t *testing.T) {
 	insertPortableWorkflow := func(t *testing.T, workflowID, status string, queueName *string) {
 		t.Helper()
 		c := executor.(*dbosContext)
-		sysDB := c.systemDB.(*sysDB)
-		insertQuery := sysDB.renderSQL(`INSERT INTO %sworkflow_status (
+		sysDB := c.systemDB.(*sysdb.SysDB)
+		insertQuery := sysDB.RenderSQL(`INSERT INTO %sworkflow_status (
 			workflow_uuid, status, name, inputs, serialization, queue_name,
 			created_at, updated_at, recovery_attempts, executor_id, priority,
 			application_version, application_id, authenticated_user, assumed_role, authenticated_roles
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
-			sysDB.dialect.SchemaPrefix(sysDB.schema))
+			sysDB.Dialect().SchemaPrefix(sysDB.Schema()))
 		now := time.Now().UnixMilli()
-		_, err := sysDB.pool.Exec(context.Background(), insertQuery,
+		_, err := sysDB.Pool().Exec(context.Background(), insertQuery,
 			workflowID, status, "interop_workflow", goldenInputsJSON, PortableSerializerName, queueName,
 			now, now, 0, "local", 0, c.applicationVersion, "", "", "", "[]")
 		require.NoError(t, err)
@@ -1647,11 +1779,11 @@ func TestPortableInterop(t *testing.T) {
 
 		// Verify the DB has portable_json serialization and the correct envelope
 		c := executor.(*dbosContext)
-		sysDB := c.systemDB.(*sysDB)
+		sysDB := c.systemDB.(*sysdb.SysDB)
 		var storedInputs, storedSerialization string
-		selectQuery := sysDB.renderSQL(`SELECT inputs, serialization FROM %sworkflow_status WHERE workflow_uuid = $1`,
-			sysDB.dialect.SchemaPrefix(sysDB.schema))
-		err = sysDB.pool.QueryRow(context.Background(), selectQuery, handle.GetWorkflowID()).Scan(&storedInputs, &storedSerialization)
+		selectQuery := sysDB.RenderSQL(`SELECT inputs, serialization FROM %sworkflow_status WHERE workflow_uuid = $1`,
+			sysDB.Dialect().SchemaPrefix(sysDB.Schema()))
+		err = sysDB.Pool().QueryRow(context.Background(), selectQuery, handle.GetWorkflowID()).Scan(&storedInputs, &storedSerialization)
 		require.NoError(t, err)
 		assert.Equal(t, PortableSerializerName, storedSerialization)
 
@@ -1677,15 +1809,15 @@ func TestPortableInterop(t *testing.T) {
 		badInputsJSON := `{"positionalArgs":["not-an-object"],"namedArgs":{}}`
 
 		c := executor.(*dbosContext)
-		sysDB := c.systemDB.(*sysDB)
-		insertQuery := sysDB.renderSQL(`INSERT INTO %sworkflow_status (
+		sysDB := c.systemDB.(*sysdb.SysDB)
+		insertQuery := sysDB.RenderSQL(`INSERT INTO %sworkflow_status (
 			workflow_uuid, status, name, inputs, serialization, queue_name,
 			created_at, updated_at, recovery_attempts, executor_id, priority,
 			application_version, application_id, authenticated_user, assumed_role, authenticated_roles
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
-			sysDB.dialect.SchemaPrefix(sysDB.schema))
+			sysDB.Dialect().SchemaPrefix(sysDB.Schema()))
 		now := time.Now().UnixMilli()
-		_, err := sysDB.pool.Exec(context.Background(), insertQuery,
+		_, err := sysDB.Pool().Exec(context.Background(), insertQuery,
 			workflowID, string(WorkflowStatusEnqueued), "interop_workflow", badInputsJSON, PortableSerializerName, &queueName,
 			now, now, 0, "local", 0, c.applicationVersion, "", "", "", "[]")
 		require.NoError(t, err)
@@ -1715,16 +1847,16 @@ func TestPortablePerOperationOptions(t *testing.T) {
 	payload := Payload{Name: "portable-op", Count: 7}
 
 	c := executor.(*dbosContext)
-	sysDB := c.systemDB.(*sysDB)
+	sysDB := c.systemDB.(*sysdb.SysDB)
 
 	// Helper: fetch the serialization recorded in operation_outputs for the Recv step of a workflow.
 	// The Recv step stores the serialization of the message it consumed, which reflects what the sender used.
 	recvStepSerialization := func(t *testing.T, workflowID string) string {
 		t.Helper()
 		var ser string
-		q := sysDB.renderSQL(`SELECT serialization FROM %soperation_outputs WHERE workflow_uuid = $1 AND function_name = 'DBOS.recv' ORDER BY function_id ASC LIMIT 1`,
-			sysDB.dialect.SchemaPrefix(sysDB.schema))
-		require.NoError(t, sysDB.pool.QueryRow(context.Background(), q, workflowID).Scan(&ser))
+		q := sysDB.RenderSQL(`SELECT serialization FROM %soperation_outputs WHERE workflow_uuid = $1 AND function_name = 'DBOS.recv' ORDER BY function_id ASC LIMIT 1`,
+			sysDB.Dialect().SchemaPrefix(sysDB.Schema()))
+		require.NoError(t, sysDB.Pool().QueryRow(context.Background(), q, workflowID).Scan(&ser))
 		return ser
 	}
 
@@ -1732,9 +1864,9 @@ func TestPortablePerOperationOptions(t *testing.T) {
 	eventSerialization := func(t *testing.T, workflowID, key string) string {
 		t.Helper()
 		var ser string
-		q := sysDB.renderSQL(`SELECT serialization FROM %sworkflow_events WHERE workflow_uuid = $1 AND key = $2`,
-			sysDB.dialect.SchemaPrefix(sysDB.schema))
-		require.NoError(t, sysDB.pool.QueryRow(context.Background(), q, workflowID, key).Scan(&ser))
+		q := sysDB.RenderSQL(`SELECT serialization FROM %sworkflow_events WHERE workflow_uuid = $1 AND key = $2`,
+			sysDB.Dialect().SchemaPrefix(sysDB.Schema()))
+		require.NoError(t, sysDB.Pool().QueryRow(context.Background(), q, workflowID, key).Scan(&ser))
 		return ser
 	}
 
@@ -1742,9 +1874,9 @@ func TestPortablePerOperationOptions(t *testing.T) {
 	streamSerialization := func(t *testing.T, workflowID, key string) string {
 		t.Helper()
 		var ser string
-		q := sysDB.renderSQL(`SELECT serialization FROM %sstreams WHERE workflow_uuid = $1 AND key = $2 AND value != $3 ORDER BY "offset" LIMIT 1`,
-			sysDB.dialect.SchemaPrefix(sysDB.schema))
-		require.NoError(t, sysDB.pool.QueryRow(context.Background(), q, workflowID, key, _DBOS_STREAM_CLOSED_SENTINEL).Scan(&ser))
+		q := sysDB.RenderSQL(`SELECT serialization FROM %sstreams WHERE workflow_uuid = $1 AND key = $2 AND value != $3 ORDER BY "offset" LIMIT 1`,
+			sysDB.Dialect().SchemaPrefix(sysDB.Schema()))
+		require.NoError(t, sysDB.Pool().QueryRow(context.Background(), q, workflowID, key, sysdb.StreamClosedSentinel).Scan(&ser))
 		return ser
 	}
 
@@ -1935,15 +2067,15 @@ func TestDirectRunPortableWorkflow(t *testing.T) {
 	defer Shutdown(executor, 10*time.Second)
 
 	c := executor.(*dbosContext)
-	sysDB := c.systemDB.(*sysDB)
+	sysDB := c.systemDB.(*sysdb.SysDB)
 
 	// Helper: read the stored inputs and serialization from the DB.
 	readStoredInputs := func(t *testing.T, workflowID string) (string, string) {
 		t.Helper()
 		var storedInputs, storedSerialization string
-		q := sysDB.renderSQL(`SELECT inputs, serialization FROM %sworkflow_status WHERE workflow_uuid = $1`,
-			sysDB.dialect.SchemaPrefix(sysDB.schema))
-		err := sysDB.pool.QueryRow(context.Background(), q, workflowID).Scan(&storedInputs, &storedSerialization)
+		q := sysDB.RenderSQL(`SELECT inputs, serialization FROM %sworkflow_status WHERE workflow_uuid = $1`,
+			sysDB.Dialect().SchemaPrefix(sysDB.Schema()))
+		err := sysDB.Pool().QueryRow(context.Background(), q, workflowID).Scan(&storedInputs, &storedSerialization)
 		require.NoError(t, err)
 		return storedInputs, storedSerialization
 	}
@@ -1951,13 +2083,13 @@ func TestDirectRunPortableWorkflow(t *testing.T) {
 	// Helper: flip a completed workflow back to PENDING for recovery.
 	resetToPending := func(t *testing.T, workflowID string) {
 		t.Helper()
-		schemaPrefix := sysDB.dialect.SchemaPrefix(sysDB.schema)
-		q := sysDB.renderSQL(`UPDATE %sworkflow_status SET status = $1, output = NULL, error = NULL WHERE workflow_uuid = $2`, schemaPrefix)
-		_, err := sysDB.pool.Exec(context.Background(), q, string(WorkflowStatusPending), workflowID)
+		schemaPrefix := sysDB.Dialect().SchemaPrefix(sysDB.Schema())
+		q := sysDB.RenderSQL(`UPDATE %sworkflow_status SET status = $1, output = NULL, error = NULL WHERE workflow_uuid = $2`, schemaPrefix)
+		_, err := sysDB.Pool().Exec(context.Background(), q, string(WorkflowStatusPending), workflowID)
 		require.NoError(t, err)
 		// Also clear operation outputs so the workflow re-executes its steps.
-		dq := sysDB.renderSQL(`DELETE FROM %soperation_outputs WHERE workflow_uuid = $1`, schemaPrefix)
-		_, err = sysDB.pool.Exec(context.Background(), dq, workflowID)
+		dq := sysDB.RenderSQL(`DELETE FROM %soperation_outputs WHERE workflow_uuid = $1`, schemaPrefix)
+		_, err = sysDB.Pool().Exec(context.Background(), dq, workflowID)
 		require.NoError(t, err)
 	}
 
@@ -2131,14 +2263,14 @@ func TestDirectRunPortableWorkflow(t *testing.T) {
 
 		// Verify operation_outputs exist for this workflow.
 		var stepCount int
-		schemaPrefix := sysDB.dialect.SchemaPrefix(sysDB.schema)
-		countQ := sysDB.renderSQL(`SELECT count(*) FROM %soperation_outputs WHERE workflow_uuid = $1`, schemaPrefix)
-		require.NoError(t, sysDB.pool.QueryRow(context.Background(), countQ, workflowID).Scan(&stepCount))
+		schemaPrefix := sysDB.Dialect().SchemaPrefix(sysDB.Schema())
+		countQ := sysDB.RenderSQL(`SELECT count(*) FROM %soperation_outputs WHERE workflow_uuid = $1`, schemaPrefix)
+		require.NoError(t, sysDB.Pool().QueryRow(context.Background(), countQ, workflowID).Scan(&stepCount))
 		require.Greater(t, stepCount, 0, "expected operation_outputs rows from first execution")
 
 		// Reset to PENDING but KEEP operation_outputs — steps will be replayed from DB.
-		resetQ := sysDB.renderSQL(`UPDATE %sworkflow_status SET status = $1, output = NULL, error = NULL WHERE workflow_uuid = $2`, schemaPrefix)
-		_, err = sysDB.pool.Exec(context.Background(), resetQ, string(WorkflowStatusPending), workflowID)
+		resetQ := sysDB.RenderSQL(`UPDATE %sworkflow_status SET status = $1, output = NULL, error = NULL WHERE workflow_uuid = $2`, schemaPrefix)
+		_, err = sysDB.Pool().Exec(context.Background(), resetQ, string(WorkflowStatusPending), workflowID)
 		require.NoError(t, err)
 
 		// Recover — each step hits checkOperationExecution and decodes from stored serialization.
@@ -2206,14 +2338,14 @@ func TestPortableWorkflowError(t *testing.T) {
 	defer Shutdown(executor, 10*time.Second)
 
 	c := executor.(*dbosContext)
-	sysDB := c.systemDB.(*sysDB)
+	sysDB := c.systemDB.(*sysdb.SysDB)
 
 	readStoredError := func(t *testing.T, workflowID string) string {
 		t.Helper()
 		var storedError *string
-		q := sysDB.renderSQL(`SELECT error FROM %sworkflow_status WHERE workflow_uuid = $1`,
-			sysDB.dialect.SchemaPrefix(sysDB.schema))
-		require.NoError(t, sysDB.pool.QueryRow(context.Background(), q, workflowID).Scan(&storedError))
+		q := sysDB.RenderSQL(`SELECT error FROM %sworkflow_status WHERE workflow_uuid = $1`,
+			sysDB.Dialect().SchemaPrefix(sysDB.Schema()))
+		require.NoError(t, sysDB.Pool().QueryRow(context.Background(), q, workflowID).Scan(&storedError))
 		require.NotNil(t, storedError)
 		return *storedError
 	}
@@ -2221,9 +2353,9 @@ func TestPortableWorkflowError(t *testing.T) {
 	readStoredStepError := func(t *testing.T, workflowID string, stepID int) string {
 		t.Helper()
 		var storedError *string
-		q := sysDB.renderSQL(`SELECT error FROM %soperation_outputs WHERE workflow_uuid = $1 AND function_id = $2`,
-			sysDB.dialect.SchemaPrefix(sysDB.schema))
-		require.NoError(t, sysDB.pool.QueryRow(context.Background(), q, workflowID, stepID).Scan(&storedError))
+		q := sysDB.RenderSQL(`SELECT error FROM %soperation_outputs WHERE workflow_uuid = $1 AND function_id = $2`,
+			sysDB.Dialect().SchemaPrefix(sysDB.Schema()))
+		require.NoError(t, sysDB.Pool().QueryRow(context.Background(), q, workflowID, stepID).Scan(&storedError))
 		require.NotNil(t, storedError)
 		return *storedError
 	}
@@ -2355,8 +2487,8 @@ func TestPortableWorkflowError(t *testing.T) {
 // portable workflows use the cross-language JSON envelope, and decode is self-describing.
 func TestWorkflowErrorSerializationRoundTrip(t *testing.T) {
 	t.Run("DBOSErrorPreservedGoToGo", func(t *testing.T) {
-		orig := newQueueDeduplicatedError("wf-1", "q-1", "dedup-1")
-		s := serializeWorkflowError(orig, "DBOS_JSON")
+		orig := models.NewQueueDeduplicatedError("wf-1", "q-1", "dedup-1")
+		s := serializeWorkflowError(nil, orig, "DBOS_JSON")
 
 		got := deserializeWorkflowError(&s)
 		var de *DBOSError
@@ -2370,14 +2502,38 @@ func TestWorkflowErrorSerializationRoundTrip(t *testing.T) {
 		require.ErrorIs(t, got, &DBOSError{Code: QueueDeduplicated})
 	})
 
+	t.Run("GobWireNamePinned", func(t *testing.T) {
+		// Stored errors reference the registered gob name; it must stay
+		// "*dbos.DBOSError" (see the RegisterName in serialization.go) or
+		// errors persisted by earlier versions become undecodable.
+		s := serializeWorkflowError(nil, models.NewQueueDeduplicatedError("wf-1", "q-1", "dedup-1"), "DBOS_JSON")
+		raw, err := base64.StdEncoding.DecodeString(s)
+		require.NoError(t, err)
+		require.Contains(t, string(raw), "*dbos.DBOSError")
+	})
+
 	t.Run("PlainErrorGoToGo", func(t *testing.T) {
 		// errors.New/fmt.Errorf types are not gob-encodable → plain-string fallback.
-		s := serializeWorkflowError(fmt.Errorf("boom"), "DBOS_JSON")
+		s := serializeWorkflowError(nil, fmt.Errorf("boom"), "DBOS_JSON")
 		got := deserializeWorkflowError(&s)
 		require.Error(t, got)
 		assert.Equal(t, "boom", got.Error())
 		var de *DBOSError
 		assert.NotErrorAs(t, got, &de)
+	})
+
+	t.Run("WarnsOnPlainStringFallback", func(t *testing.T) {
+		var buf bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&buf, nil))
+
+		// Non-gob-encodable type → plain-string fallback must warn
+		serializeWorkflowError(logger, fmt.Errorf("boom"), "DBOS_JSON")
+		assert.Contains(t, buf.String(), "cannot be gob-encoded", "expected a warning for the plain-string fallback")
+
+		// Gob-encodable error must not warn
+		buf.Reset()
+		serializeWorkflowError(logger, models.NewWorkflowCancelledError("wf-1", context.Canceled), "DBOS_JSON")
+		assert.Empty(t, buf.String(), "expected no warning for a gob-encodable error")
 	})
 
 	t.Run("LegacyPlainStringDecodes", func(t *testing.T) {
@@ -2393,7 +2549,7 @@ func TestWorkflowErrorSerializationRoundTrip(t *testing.T) {
 		assert.NoError(t, deserializeWorkflowError(nil))
 		empty := ""
 		assert.NoError(t, deserializeWorkflowError(&empty))
-		assert.Equal(t, "", serializeWorkflowError(nil, "DBOS_JSON"))
+		assert.Equal(t, "", serializeWorkflowError(nil, nil, "DBOS_JSON"))
 	})
 }
 
@@ -2486,8 +2642,8 @@ func TestListWorkflowsAndGetWorkflowStepsIsolateDecodeErrors(t *testing.T) {
 	defer Shutdown(executor, 10*time.Second)
 
 	c := executor.(*dbosContext)
-	sysDB := c.systemDB.(*sysDB)
-	schemaPrefix := sysDB.dialect.SchemaPrefix(sysDB.schema)
+	sysDB := c.systemDB.(*sysdb.SysDB)
+	schemaPrefix := sysDB.Dialect().SchemaPrefix(sysDB.Schema())
 
 	const garbage = "not-valid-base64!!!"
 
@@ -2495,8 +2651,8 @@ func TestListWorkflowsAndGetWorkflowStepsIsolateDecodeErrors(t *testing.T) {
 	// with a value that cannot be base64-decoded.
 	corruptWorkflowColumn := func(t *testing.T, column, workflowID string) {
 		t.Helper()
-		q := sysDB.renderSQL(`UPDATE %sworkflow_status SET `+column+` = $1 WHERE workflow_uuid = $2`, schemaPrefix)
-		_, err := sysDB.pool.Exec(context.Background(), q, garbage, workflowID)
+		q := sysDB.RenderSQL(`UPDATE %sworkflow_status SET `+column+` = $1 WHERE workflow_uuid = $2`, schemaPrefix)
+		_, err := sysDB.Pool().Exec(context.Background(), q, garbage, workflowID)
 		require.NoError(t, err)
 	}
 
@@ -2504,8 +2660,8 @@ func TestListWorkflowsAndGetWorkflowStepsIsolateDecodeErrors(t *testing.T) {
 	// value that cannot be base64-decoded.
 	corruptStepOutput := func(t *testing.T, workflowID string, functionID int) {
 		t.Helper()
-		q := sysDB.renderSQL(`UPDATE %soperation_outputs SET output = $1 WHERE workflow_uuid = $2 AND function_id = $3`, schemaPrefix)
-		_, err := sysDB.pool.Exec(context.Background(), q, garbage, workflowID, functionID)
+		q := sysDB.RenderSQL(`UPDATE %soperation_outputs SET output = $1 WHERE workflow_uuid = $2 AND function_id = $3`, schemaPrefix)
+		_, err := sysDB.Pool().Exec(context.Background(), q, garbage, workflowID, functionID)
 		require.NoError(t, err)
 	}
 
@@ -2590,4 +2746,149 @@ func TestListWorkflowsAndGetWorkflowStepsIsolateDecodeErrors(t *testing.T) {
 		assert.Contains(t, corruptStepOutputVal, "failed to decode step output")
 		assert.Equal(t, `"payload-step-2"`, steps[2].Output)
 	})
+}
+
+// TestForkPreservesSerialization: forking with StartStep > 0 must copy the
+// serialization column on checkpoints, events, and streams. If the copies
+// drop it, the forked replay decodes gob payloads with the default JSON
+// decoder and fails.
+func TestForkPreservesSerialization(t *testing.T) {
+	executor := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true, serializer: NewGobSerializer()})
+
+	wf := func(ctx DBOSContext, input TestWorkflowData) (TestWorkflowData, error) {
+		out, err := RunAsStep(ctx, func(ctx context.Context) (TestWorkflowData, error) {
+			return input, nil
+		}, WithStepName("checkpointStep"))
+		if err != nil {
+			return TestWorkflowData{}, err
+		}
+		if err := SetEvent(ctx, "fork-event", out); err != nil {
+			return TestWorkflowData{}, err
+		}
+		if err := WriteStream(ctx, "fork-stream", out); err != nil {
+			return TestWorkflowData{}, err
+		}
+		return out, nil
+	}
+	RegisterWorkflow(executor, wf, WithWorkflowName("fork-serialization-wf"))
+	require.NoError(t, Launch(executor))
+
+	input := TestWorkflowData{
+		ID: "fork-serialization", Message: "gob payload", Value: 7,
+		Data:     TestData{Message: "nested", Value: 14},
+		Metadata: map[string]string{"path": "fork"},
+	}
+	handle, err := RunWorkflow(executor, wf, input, WithWorkflowID("fork-serialization-orig"))
+	require.NoError(t, err)
+	result, err := handle.GetResult()
+	require.NoError(t, err)
+	require.Equal(t, input, result)
+
+	// Fork past all recorded steps (0=checkpointStep, 1=SetEvent, 2=WriteStream)
+	// so every copied row must carry its serialization to replay correctly.
+	forkHandle, err := ForkWorkflow[TestWorkflowData](executor, ForkWorkflowInput{
+		OriginalWorkflowID: "fork-serialization-orig",
+		StartStep:          3,
+	})
+	require.NoError(t, err)
+	forkResult, err := forkHandle.GetResult()
+	require.NoError(t, err, "forked replay must decode copied checkpoints with their recorded serializer")
+	assert.Equal(t, input, forkResult)
+
+	forkID := forkHandle.GetWorkflowID()
+	event, err := GetEvent[TestWorkflowData](executor, forkID, "fork-event", 10*time.Second)
+	require.NoError(t, err, "copied event must decode with its recorded serializer")
+	assert.Equal(t, input, event)
+
+	values, closed, err := ReadStream[TestWorkflowData](executor, forkID, "fork-stream")
+	require.NoError(t, err, "copied stream entry must decode with its recorded serializer")
+	assert.True(t, closed)
+	require.Len(t, values, 1)
+	assert.Equal(t, input, values[0])
+}
+
+// TestExportImportPreservesSerialization: export/import must round-trip the
+// serialization column on checkpoints, events, events history, and streams —
+// not just workflow_status. If import writes NULL serialization, every reader
+// of the reimported rows falls back to the default JSON decoder and fails on
+// gob payloads.
+func TestExportImportPreservesSerialization(t *testing.T) {
+	executor := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true, serializer: NewGobSerializer()})
+
+	wf := func(ctx DBOSContext, input TestWorkflowData) (TestWorkflowData, error) {
+		out, err := RunAsStep(ctx, func(ctx context.Context) (TestWorkflowData, error) {
+			return input, nil
+		}, WithStepName("checkpointStep"))
+		if err != nil {
+			return TestWorkflowData{}, err
+		}
+		if err := SetEvent(ctx, "export-event", out); err != nil {
+			return TestWorkflowData{}, err
+		}
+		if err := WriteStream(ctx, "export-stream", out); err != nil {
+			return TestWorkflowData{}, err
+		}
+		return out, nil
+	}
+	RegisterWorkflow(executor, wf, WithWorkflowName("export-serialization-wf"))
+	require.NoError(t, Launch(executor))
+
+	input := TestWorkflowData{
+		ID: "export-serialization", Message: "gob payload", Value: 7,
+		Data:     TestData{Message: "nested", Value: 14},
+		Metadata: map[string]string{"path": "export"},
+	}
+	workflowID := "export-serialization-orig"
+	handle, err := RunWorkflow(executor, wf, input, WithWorkflowID(workflowID))
+	require.NoError(t, err)
+	result, err := handle.GetResult()
+	require.NoError(t, err)
+	require.Equal(t, input, result)
+
+	sdb := executor.(*dbosContext).systemDB.(*sysdb.SysDB)
+
+	exported, err := sdb.ExportWorkflow(executor, workflowID, false)
+	require.NoError(t, err)
+	require.Len(t, exported, 1)
+
+	// The exported payload itself must carry serialization on every table.
+	requireSerialization := func(table string, rows []map[string]any) {
+		require.NotEmpty(t, rows, "expected exported %s rows", table)
+		for _, row := range rows {
+			ser, ok := row["serialization"].(*string)
+			require.True(t, ok, "%s row missing serialization key", table)
+			require.NotNil(t, ser, "%s row exported with NULL serialization", table)
+		}
+	}
+	requireSerialization("operation_outputs", exported[0].OperationOutputs)
+	requireSerialization("workflow_events", exported[0].WorkflowEvents)
+	requireSerialization("workflow_events_history", exported[0].WorkflowEventsHistory)
+	requireSerialization("streams", exported[0].Streams)
+
+	require.NoError(t, sdb.DeleteWorkflows(executor, sysdb.DeleteWorkflowsDBInput{
+		WorkflowIDs: []string{workflowID},
+	}))
+	require.NoError(t, sdb.ImportWorkflow(executor, exported))
+
+	// Readers of the reimported rows must decode with the recorded serializer.
+	event, err := GetEvent[TestWorkflowData](executor, workflowID, "export-event", 10*time.Second)
+	require.NoError(t, err, "reimported event must decode with its recorded serializer")
+	assert.Equal(t, input, event)
+
+	values, closed, err := ReadStream[TestWorkflowData](executor, workflowID, "export-stream")
+	require.NoError(t, err, "reimported stream entry must decode with its recorded serializer")
+	assert.True(t, closed)
+	require.Len(t, values, 1)
+	assert.Equal(t, input, values[0])
+
+	// Fork past all steps: replay of the reimported checkpoints must decode
+	// with the serialization the import round-tripped.
+	forkHandle, err := ForkWorkflow[TestWorkflowData](executor, ForkWorkflowInput{
+		OriginalWorkflowID: workflowID,
+		StartStep:          3,
+	})
+	require.NoError(t, err)
+	forkResult, err := forkHandle.GetResult()
+	require.NoError(t, err, "replay of reimported checkpoints must decode with their recorded serializer")
+	assert.Equal(t, input, forkResult)
 }

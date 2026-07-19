@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strconv"
 	"time"
+
+	"github.com/jig/dbos-transact-golang/dbos/internal/sysdb"
 )
 
 // stringOrList is a custom JSON type that accepts either a single string
@@ -45,6 +47,7 @@ const (
 	listStepsMessage             messageType = "list_steps"
 	getWorkflowMessage           messageType = "get_workflow"
 	forkWorkflowMessage          messageType = "fork_workflow"
+	forkFromFailureMessage       messageType = "fork_from_failure"
 	existPendingWorkflowsMessage messageType = "exist_pending_workflows"
 	retentionMessage             messageType = "retention"
 	getMetricsMessage            messageType = "get_metrics"
@@ -99,30 +102,32 @@ type executorInfoResponse struct {
 
 // listWorkflowsConductorRequestBody contains filter parameters for listing workflows.
 type listWorkflowsConductorRequestBody struct {
-	WorkflowUUIDs      []string     `json:"workflow_uuids,omitempty"`
-	WorkflowName       stringOrList `json:"workflow_name,omitempty"`
-	AuthenticatedUser  stringOrList `json:"authenticated_user,omitempty"`
-	StartTime          *time.Time   `json:"start_time,omitempty"`       // ISO 8601
-	EndTime            *time.Time   `json:"end_time,omitempty"`         // ISO 8601
-	CompletedAfter     *time.Time   `json:"completed_after,omitempty"`  // ISO 8601
-	CompletedBefore    *time.Time   `json:"completed_before,omitempty"` // ISO 8601
-	DequeuedAfter      *time.Time   `json:"dequeued_after,omitempty"`   // ISO 8601
-	DequeuedBefore     *time.Time   `json:"dequeued_before,omitempty"`  // ISO 8601
-	Status             stringOrList `json:"status,omitempty"`
-	ApplicationVersion stringOrList `json:"application_version,omitempty"`
-	ForkedFrom         stringOrList `json:"forked_from,omitempty"`
-	ParentWorkflowID   stringOrList `json:"parent_workflow_id,omitempty"`
-	WasForkedFrom      *bool        `json:"was_forked_from,omitempty"`
-	HasParent          *bool        `json:"has_parent,omitempty"`
-	QueueName          stringOrList `json:"queue_name,omitempty"`
-	Limit              *int         `json:"limit,omitempty"`
-	Offset             *int         `json:"offset,omitempty"`
-	SortDesc           bool         `json:"sort_desc"`
-	WorkflowIDPrefix   stringOrList `json:"workflow_id_prefix,omitempty"`
-	LoadInput          bool         `json:"load_input"`
-	LoadOutput         bool         `json:"load_output"`
-	ExecutorID         stringOrList `json:"executor_id,omitempty"`
-	QueuesOnly         bool         `json:"queues_only"`
+	WorkflowUUIDs      []string       `json:"workflow_uuids,omitempty"`
+	WorkflowName       stringOrList   `json:"workflow_name,omitempty"`
+	AuthenticatedUser  stringOrList   `json:"authenticated_user,omitempty"`
+	StartTime          *time.Time     `json:"start_time,omitempty"`       // ISO 8601
+	EndTime            *time.Time     `json:"end_time,omitempty"`         // ISO 8601
+	CompletedAfter     *time.Time     `json:"completed_after,omitempty"`  // ISO 8601
+	CompletedBefore    *time.Time     `json:"completed_before,omitempty"` // ISO 8601
+	DequeuedAfter      *time.Time     `json:"dequeued_after,omitempty"`   // ISO 8601
+	DequeuedBefore     *time.Time     `json:"dequeued_before,omitempty"`  // ISO 8601
+	Status             stringOrList   `json:"status,omitempty"`
+	ApplicationVersion stringOrList   `json:"application_version,omitempty"`
+	ForkedFrom         stringOrList   `json:"forked_from,omitempty"`
+	ParentWorkflowID   stringOrList   `json:"parent_workflow_id,omitempty"`
+	WasForkedFrom      *bool          `json:"was_forked_from,omitempty"`
+	HasParent          *bool          `json:"has_parent,omitempty"`
+	QueueName          stringOrList   `json:"queue_name,omitempty"`
+	Limit              *int           `json:"limit,omitempty"`
+	Offset             *int           `json:"offset,omitempty"`
+	SortDesc           bool           `json:"sort_desc"`
+	WorkflowIDPrefix   stringOrList   `json:"workflow_id_prefix,omitempty"`
+	LoadInput          bool           `json:"load_input"`
+	LoadOutput         bool           `json:"load_output"`
+	ExecutorID         stringOrList   `json:"executor_id,omitempty"`
+	QueuesOnly         bool           `json:"queues_only"`
+	Attributes         map[string]any `json:"attributes,omitempty"`
+	ScheduleName       stringOrList   `json:"schedule_name,omitempty"`
 }
 
 // listWorkflowsConductorRequest is sent by the conductor to list workflows
@@ -160,6 +165,8 @@ type listWorkflowsConductorResponseBody struct {
 	DequeuedAt              *string `json:"DequeuedAt,omitempty"`
 	DelayUntilEpochMS       *string `json:"DelayUntilEpochMS,omitempty"`
 	CompletedAt             *string `json:"CompletedAt,omitempty"`
+	Attributes              *string `json:"Attributes,omitempty"`
+	ScheduleName            *string `json:"ScheduleName,omitempty"`
 }
 
 // listWorkflowsConductorResponse is sent in response to list workflows requests
@@ -305,6 +312,20 @@ func formatListWorkflowsResponseBody(wf WorkflowStatus) listWorkflowsConductorRe
 		output.CompletedAt = &completedStr
 	}
 
+	// Marshal attributes to a JSON string so the wire format is parseable by Conductor
+	if len(wf.Attributes) > 0 {
+		attributesJSON, err := json.Marshal(wf.Attributes)
+		if err == nil {
+			attributesStr := string(attributesJSON)
+			output.Attributes = &attributesStr
+		}
+	}
+
+	// Copy schedule name
+	if wf.ScheduleName != "" {
+		output.ScheduleName = &wf.ScheduleName
+	}
+
 	return output
 }
 
@@ -409,6 +430,30 @@ type forkWorkflowConductorResponse struct {
 	NewWorkflowID *string `json:"new_workflow_id,omitempty"`
 }
 
+// forkFromFailureConductorRequestBody contains the bulk fork-from-failure parameters
+type forkFromFailureConductorRequestBody struct {
+	WorkflowIDs        []string `json:"workflow_ids"`
+	ApplicationVersion *string  `json:"application_version,omitempty"`
+	QueueName          *string  `json:"queue_name,omitempty"`
+	QueuePartitionKey  *string  `json:"queue_partition_key,omitempty"`
+	FromLastFailure    bool     `json:"from_last_failure,omitempty"`
+	FromLastStep       bool     `json:"from_last_step,omitempty"`
+	FromStep           *int     `json:"from_step,omitempty"`
+	FromStepName       *string  `json:"from_step_name,omitempty"`
+}
+
+// forkFromFailureConductorRequest is sent by the conductor to bulk fork workflows
+type forkFromFailureConductorRequest struct {
+	baseMessage
+	Body forkFromFailureConductorRequestBody `json:"body"`
+}
+
+// forkFromFailureConductorResponse is sent in response to fork-from-failure requests
+type forkFromFailureConductorResponse struct {
+	baseResponse
+	ForkedWorkflowIDs []string `json:"forked_workflow_ids,omitempty"`
+}
+
 // cancelWorkflowConductorRequest is sent by the conductor to cancel a workflow
 type cancelWorkflowConductorRequest struct {
 	baseMessage
@@ -492,7 +537,7 @@ type getMetricsConductorRequest struct {
 // getMetricsConductorResponse is sent in response to metrics requests
 type getMetricsConductorResponse struct {
 	baseResponse
-	Metrics []metricData `json:"metrics"`
+	Metrics []sysdb.MetricData `json:"metrics"`
 }
 
 // exportWorkflowConductorRequest is sent by the conductor to export a workflow
@@ -743,28 +788,35 @@ type getWorkflowStreamsConductorResponse struct {
 
 // getWorkflowAggregatesConductorRequestBody contains the workflow aggregate query parameters.
 type getWorkflowAggregatesConductorRequestBody struct {
-	GroupByStatus             bool         `json:"group_by_status"`
-	GroupByName               bool         `json:"group_by_name"`
-	GroupByQueueName          bool         `json:"group_by_queue_name"`
-	GroupByExecutorID         bool         `json:"group_by_executor_id"`
-	GroupByApplicationVersion bool         `json:"group_by_application_version"`
-	SelectCount               bool         `json:"select_count"`
-	SelectMinCreatedAt        bool         `json:"select_min_created_at"`
-	SelectMaxQueueWaitMs      bool         `json:"select_max_queue_wait_ms"`
-	SelectMaxTotalLatencyMs   bool         `json:"select_max_total_latency_ms"`
-	TimeBucketSizeMs          *int64       `json:"time_bucket_size_ms,omitempty"`
-	Status                    stringOrList `json:"status,omitempty"`
-	StartTime                 *time.Time   `json:"start_time,omitempty"`       // ISO 8601
-	EndTime                   *time.Time   `json:"end_time,omitempty"`         // ISO 8601
-	CompletedAfter            *time.Time   `json:"completed_after,omitempty"`  // ISO 8601
-	CompletedBefore           *time.Time   `json:"completed_before,omitempty"` // ISO 8601
-	DequeuedAfter             *time.Time   `json:"dequeued_after,omitempty"`   // ISO 8601
-	DequeuedBefore            *time.Time   `json:"dequeued_before,omitempty"`  // ISO 8601
-	Name                      stringOrList `json:"name,omitempty"`
-	AppVersion                stringOrList `json:"app_version,omitempty"`
-	ExecutorID                stringOrList `json:"executor_id,omitempty"`
-	QueueName                 stringOrList `json:"queue_name,omitempty"`
-	WorkflowIDPrefix          stringOrList `json:"workflow_id_prefix,omitempty"`
+	GroupByStatus             bool           `json:"group_by_status"`
+	GroupByName               bool           `json:"group_by_name"`
+	GroupByQueueName          bool           `json:"group_by_queue_name"`
+	GroupByExecutorID         bool           `json:"group_by_executor_id"`
+	GroupByApplicationVersion bool           `json:"group_by_application_version"`
+	SelectCount               bool           `json:"select_count"`
+	SelectMinCreatedAt        bool           `json:"select_min_created_at"`
+	SelectMaxQueueWaitMs      bool           `json:"select_max_queue_wait_ms"`
+	SelectMaxTotalLatencyMs   bool           `json:"select_max_total_latency_ms"`
+	TimeBucketSizeMs          *int64         `json:"time_bucket_size_ms,omitempty"`
+	Status                    stringOrList   `json:"status,omitempty"`
+	StartTime                 *time.Time     `json:"start_time,omitempty"`       // ISO 8601
+	EndTime                   *time.Time     `json:"end_time,omitempty"`         // ISO 8601
+	CompletedAfter            *time.Time     `json:"completed_after,omitempty"`  // ISO 8601
+	CompletedBefore           *time.Time     `json:"completed_before,omitempty"` // ISO 8601
+	DequeuedAfter             *time.Time     `json:"dequeued_after,omitempty"`   // ISO 8601
+	DequeuedBefore            *time.Time     `json:"dequeued_before,omitempty"`  // ISO 8601
+	Name                      stringOrList   `json:"name,omitempty"`
+	AppVersion                stringOrList   `json:"app_version,omitempty"`
+	ExecutorID                stringOrList   `json:"executor_id,omitempty"`
+	QueueName                 stringOrList   `json:"queue_name,omitempty"`
+	WorkflowIDPrefix          stringOrList   `json:"workflow_id_prefix,omitempty"`
+	WorkflowIDs               stringOrList   `json:"workflow_ids,omitempty"`
+	ForkedFrom                stringOrList   `json:"forked_from,omitempty"`
+	ParentWorkflowID          stringOrList   `json:"parent_workflow_id,omitempty"`
+	User                      stringOrList   `json:"user,omitempty"`
+	WasForkedFrom             *bool          `json:"was_forked_from,omitempty"`
+	HasParent                 *bool          `json:"has_parent,omitempty"`
+	Attributes                map[string]any `json:"attributes,omitempty"`
 }
 
 // getWorkflowAggregatesConductorRequest is sent by the conductor to fetch workflow aggregates.

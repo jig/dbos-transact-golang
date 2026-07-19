@@ -7,15 +7,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jig/dbos-transact-golang/dbos/internal/sysdb"
+
 	"github.com/stretchr/testify/require"
 )
 
 // gateRowState reads the authoritative gate row.
 func gateRowState(t *testing.T, c DBOSContext, wfID, gate string) (open bool, found bool) {
 	t.Helper()
-	s := c.(*dbosContext).systemDB.concrete()
-	q := s.renderSQL(`SELECT open FROM %sworkflow_gates WHERE workflow_uuid = $1 AND gate = $2`, s.dialect.SchemaPrefix(s.schema))
-	err := s.pool.QueryRow(context.Background(), q, wfID, gate).Scan(&open)
+	s := c.(*dbosContext).systemDB.(*sysdb.SysDB)
+	q := s.RenderSQL(`SELECT open FROM %sworkflow_gates WHERE workflow_uuid = $1 AND gate = $2`, s.Dialect().SchemaPrefix(s.Schema()))
+	err := s.Pool().QueryRow(context.Background(), q, wfID, gate).Scan(&open)
 	if err != nil {
 		return false, false
 	}
@@ -24,10 +26,10 @@ func gateRowState(t *testing.T, c DBOSContext, wfID, gate string) (open bool, fo
 
 func deliveryOutcome(t *testing.T, c DBOSContext, deliveryID string) string {
 	t.Helper()
-	s := c.(*dbosContext).systemDB.concrete()
-	q := s.renderSQL(`SELECT outcome FROM %sworkflow_gate_deliveries WHERE delivery_uuid = $1`, s.dialect.SchemaPrefix(s.schema))
+	s := c.(*dbosContext).systemDB.(*sysdb.SysDB)
+	q := s.RenderSQL(`SELECT outcome FROM %sworkflow_gate_deliveries WHERE delivery_uuid = $1`, s.Dialect().SchemaPrefix(s.Schema()))
 	var outcome string
-	require.NoError(t, s.pool.QueryRow(context.Background(), q, deliveryID).Scan(&outcome))
+	require.NoError(t, s.Pool().QueryRow(context.Background(), q, deliveryID).Scan(&outcome))
 	return outcome
 }
 

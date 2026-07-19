@@ -20,10 +20,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jig/dbos-transact-golang/dbos"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/jig/dbos-transact-golang/dbos"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"

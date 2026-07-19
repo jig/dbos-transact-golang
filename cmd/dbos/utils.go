@@ -9,8 +9,8 @@ import (
 	"os"
 	"regexp"
 
-	"github.com/jig/dbos-transact-golang/dbos"
 	"github.com/jackc/pgx/v5"
+	"github.com/jig/dbos-transact-golang/dbos"
 	"github.com/spf13/viper"
 )
 

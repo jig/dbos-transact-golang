@@ -9,23 +9,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jackc/pgerrcode"
-	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jig/dbos-transact-golang/dbos/internal/models"
+	"github.com/jig/dbos-transact-golang/dbos/internal/sysdb"
 )
 
-const (
-	_DBOS_INTERNAL_QUEUE_NAME        = "_dbos_internal_queue"
-	_DEFAULT_MAX_TASKS_PER_ITERATION = 100
-	_DEFAULT_BASE_POLLING_INTERVAL   = 1 * time.Second
-	_DEFAULT_MAX_POLLING_INTERVAL    = 120 * time.Second
-)
-
-// RateLimiter configures rate limiting for workflow queue execution.
-// Rate limits prevent overwhelming external services and provide backpressure.
-type RateLimiter struct {
-	Limit  int           // Maximum number of workflows to start within the period
-	Period time.Duration // Time period for the rate limit
-}
+const _DEFAULT_MAX_POLLING_INTERVAL = 120 * time.Second
 
 // WorkflowQueue defines a named queue for workflow execution.
 // Queues provide controlled workflow execution with concurrency limits, priority scheduling, and rate limiting.
@@ -42,6 +30,47 @@ type WorkflowQueue struct {
 
 	databaseBacked bool                    // Whether this queue's config lives in the queues table
 	onConflict     QueueConflictResolution // Registration conflict policy
+}
+
+// toConfig converts to the persisted representation used by internal/sysdb.
+func (q WorkflowQueue) toConfig() models.QueueConfig {
+	return models.QueueConfig{
+		Name:                 q.Name,
+		WorkerConcurrency:    q.WorkerConcurrency,
+		GlobalConcurrency:    q.GlobalConcurrency,
+		PriorityEnabled:      q.PriorityEnabled,
+		RateLimit:            q.RateLimit,
+		MaxTasksPerIteration: q.MaxTasksPerIteration,
+		PartitionQueue:       q.PartitionQueue,
+		BasePollingInterval:  q.basePollingInterval,
+		MaxPollingInterval:   q.maxPollingInterval,
+		DatabaseBacked:       q.databaseBacked,
+	}
+}
+
+// queueFromConfig builds a WorkflowQueue from its persisted representation.
+// Registration-only state (onConflict) is not persisted and stays zero.
+func queueFromConfig(cfg models.QueueConfig) WorkflowQueue {
+	return WorkflowQueue{
+		Name:                 cfg.Name,
+		WorkerConcurrency:    cfg.WorkerConcurrency,
+		GlobalConcurrency:    cfg.GlobalConcurrency,
+		PriorityEnabled:      cfg.PriorityEnabled,
+		RateLimit:            cfg.RateLimit,
+		MaxTasksPerIteration: cfg.MaxTasksPerIteration,
+		PartitionQueue:       cfg.PartitionQueue,
+		basePollingInterval:  cfg.BasePollingInterval,
+		maxPollingInterval:   cfg.MaxPollingInterval,
+		databaseBacked:       cfg.DatabaseBacked,
+	}
+}
+
+func queuesFromConfigs(cfgs []models.QueueConfig) []WorkflowQueue {
+	queues := make([]WorkflowQueue, 0, len(cfgs))
+	for _, cfg := range cfgs {
+		queues = append(queues, queueFromConfig(cfg))
+	}
+	return queues
 }
 
 // Queue is a handle to a registered workflow queue. It is returned by
@@ -142,12 +171,17 @@ func (q *WorkflowQueue) applyConfigChange(ctx DBOSContext, mutate func(*Workflow
 	if !ok {
 		return errors.New("invalid DBOS context")
 	}
-	_, err := retryWithResult(c, func() (*WorkflowQueue, error) {
-		return c.systemDB.updateQueueConfig(c, q.Name, func(fresh *WorkflowQueue) error {
-			mutate(fresh)
-			return validateQueueConfig(fresh)
+	_, err := sysdb.RetryWithResult(c, func() (*models.QueueConfig, error) {
+		return c.systemDB.UpdateQueueConfig(c, q.Name, func(fresh *models.QueueConfig) error {
+			w := queueFromConfig(*fresh)
+			mutate(&w)
+			if err := validateQueueConfig(&w); err != nil {
+				return err
+			}
+			*fresh = w.toConfig()
+			return nil
 		})
-	}, withRetrierLogger(c.logger), withRetryCondition(postgresDialect{}.IsRetryableTransaction, sqliteDialect{}.IsRetryableTransaction))
+	}, sysdb.WithRetrierLogger(c.logger), sysdb.WithRetryCondition(sysdb.PostgresDialect{}.IsRetryableTransaction, sysdb.SqliteDialect{}.IsRetryableTransaction))
 	if err != nil {
 		return err
 	}
@@ -265,7 +299,7 @@ func NewWorkflowQueue(dbosCtx DBOSContext, name string, options ...QueueOption) 
 	ctx.logger.Debug("Creating new workflow queue", "queue_name", name)
 
 	if _, exists := ctx.queueRunner.workflowQueueRegistry[name]; exists {
-		panic(newConflictingRegistrationError(name))
+		panic(models.NewConflictingRegistrationError(name))
 	}
 
 	// Create queue with default settings
@@ -275,8 +309,8 @@ func NewWorkflowQueue(dbosCtx DBOSContext, name string, options ...QueueOption) 
 		GlobalConcurrency:    nil,
 		PriorityEnabled:      false,
 		RateLimit:            nil,
-		MaxTasksPerIteration: _DEFAULT_MAX_TASKS_PER_ITERATION,
-		basePollingInterval:  _DEFAULT_BASE_POLLING_INTERVAL,
+		MaxTasksPerIteration: models.DefaultMaxTasksPerIteration,
+		basePollingInterval:  models.DefaultBasePollingInterval,
 		maxPollingInterval:   _DEFAULT_MAX_POLLING_INTERVAL,
 	}
 
@@ -339,8 +373,8 @@ func (c *dbosContext) RegisterQueue(_ DBOSContext, name string, options ...Queue
 
 	q := WorkflowQueue{
 		Name:                 name,
-		MaxTasksPerIteration: _DEFAULT_MAX_TASKS_PER_ITERATION,
-		basePollingInterval:  _DEFAULT_BASE_POLLING_INTERVAL,
+		MaxTasksPerIteration: models.DefaultMaxTasksPerIteration,
+		basePollingInterval:  models.DefaultBasePollingInterval,
 		maxPollingInterval:   _DEFAULT_MAX_POLLING_INTERVAL,
 		onConflict:           QueueConflictUpdateIfLatestVersion,
 		databaseBacked:       true,
@@ -367,9 +401,9 @@ func (c *dbosContext) RegisterQueue(_ DBOSContext, name string, options ...Queue
 	case QueueConflictNeverUpdate:
 		updateExisting = false
 	default: // QueueConflictUpdateIfLatestVersion
-		latest, err := retryWithResult(c, func() (*VersionInfo, error) {
-			return c.systemDB.getLatestApplicationVersion(c, nil)
-		}, withRetrierLogger(c.logger))
+		latest, err := sysdb.RetryWithResult(c, func() (*VersionInfo, error) {
+			return c.systemDB.GetLatestApplicationVersion(c, nil)
+		}, sysdb.WithRetrierLogger(c.logger))
 		switch {
 		case errors.Is(err, &DBOSError{Code: NoApplicationVersions}):
 			// No registered versions yet: this process is the first, hence the latest.
@@ -383,25 +417,26 @@ func (c *dbosContext) RegisterQueue(_ DBOSContext, name string, options ...Queue
 		}
 	}
 
-	inserted, err := retryWithResult(c, func() (bool, error) {
-		return c.systemDB.upsertQueue(c, upsertQueueDBInput{queue: q, updateExisting: updateExisting})
-	}, withRetrierLogger(c.logger))
+	inserted, err := sysdb.RetryWithResult(c, func() (bool, error) {
+		return c.systemDB.UpsertQueue(c, sysdb.UpsertQueueDBInput{Queue: q.toConfig(), UpdateExisting: updateExisting})
+	}, sysdb.WithRetrierLogger(c.logger))
 	if err != nil {
 		return nil, err
 	}
-	persisted, err := retryWithResult(c, func() (*WorkflowQueue, error) {
-		return c.systemDB.getQueue(c, name)
-	}, withRetrierLogger(c.logger))
+	persistedCfg, err := sysdb.RetryWithResult(c, func() (*models.QueueConfig, error) {
+		return c.systemDB.GetQueue(c, name)
+	}, sysdb.WithRetrierLogger(c.logger))
 	if err != nil {
 		return nil, err
 	}
-	if persisted == nil {
+	if persistedCfg == nil {
 		return nil, fmt.Errorf("queue %s missing from database after upsert", name)
 	}
 	if inserted {
 		c.logger.Info("Registered database-backed queue", "queue_name", name)
 	}
-	return persisted, nil
+	persisted := queueFromConfig(*persistedCfg)
+	return &persisted, nil
 }
 
 // RetrieveQueue returns the queue with the given name, or nil if
@@ -414,17 +449,18 @@ func RetrieveQueue(ctx DBOSContext, name string) (Queue, error) {
 }
 
 func (c *dbosContext) RetrieveQueue(_ DBOSContext, name string) (Queue, error) {
-	q, err := retryWithResult(c, func() (*WorkflowQueue, error) {
-		return c.systemDB.getQueue(c, name)
-	}, withRetrierLogger(c.logger))
+	cfg, err := sysdb.RetryWithResult(c, func() (*models.QueueConfig, error) {
+		return c.systemDB.GetQueue(c, name)
+	}, sysdb.WithRetrierLogger(c.logger))
 	if err != nil {
 		return nil, err
 	}
-	if q == nil {
+	if cfg == nil {
 		// Return an untyped nil interface so callers' nil checks behave as expected.
 		return nil, nil
 	}
-	return q, nil
+	q := queueFromConfig(*cfg)
+	return &q, nil
 }
 
 // ListQueues returns all queues registered in the system database.
@@ -436,9 +472,10 @@ func ListQueues(ctx DBOSContext) ([]Queue, error) {
 }
 
 func (c *dbosContext) ListQueues(_ DBOSContext) ([]Queue, error) {
-	queues, err := retryWithResult(c, func() ([]WorkflowQueue, error) {
-		return c.systemDB.listQueues(c)
-	}, withRetrierLogger(c.logger))
+	cfgs, err := sysdb.RetryWithResult(c, func() ([]models.QueueConfig, error) {
+		return c.systemDB.ListQueues(c)
+	}, sysdb.WithRetrierLogger(c.logger))
+	queues := queuesFromConfigs(cfgs)
 	if err != nil {
 		return nil, err
 	}
@@ -458,9 +495,9 @@ func DeleteQueue(ctx DBOSContext, name string) error {
 }
 
 func (c *dbosContext) DeleteQueue(_ DBOSContext, name string) error {
-	return retry(c, func() error {
-		return c.systemDB.deleteQueue(c, name)
-	}, withRetrierLogger(c.logger))
+	return sysdb.Retry(c, func() error {
+		return c.systemDB.DeleteQueue(c, name)
+	}, sysdb.WithRetrierLogger(c.logger))
 }
 
 type queueRunner struct {
@@ -547,9 +584,9 @@ func (qr *queueRunner) run(ctx *dbosContext) {
 	const reconcileInterval = 1 * time.Second
 	for ctx.Err() == nil { // While ctx is not cancelled
 		// Transition any DELAYED workflows whose delay has expired to ENQUEUED.
-		if err := retry(ctx, func() error {
-			return ctx.systemDB.transitionDelayedWorkflows(ctx)
-		}, withRetrierLogger(qr.logger)); err != nil {
+		if err := sysdb.Retry(ctx, func() error {
+			return ctx.systemDB.TransitionDelayedWorkflows(ctx)
+		}, sysdb.WithRetrierLogger(qr.logger)); err != nil {
 			qr.logger.Warn("Exception transitioning delayed workflows", "error", err)
 		}
 
@@ -600,15 +637,16 @@ func (qr *queueRunner) queuesToListen(ctx *dbosContext) map[string]WorkflowQueue
 
 	// In-memory queues are always available
 	for name, queue := range qr.workflowQueueRegistry {
-		if hasListenFilter && !listen[name] && name != _DBOS_INTERNAL_QUEUE_NAME {
+		if hasListenFilter && !listen[name] && name != models.InternalQueueName {
 			continue
 		}
 		current[name] = queue
 	}
 
-	dbQueues, err := retryWithResult(ctx, func() ([]WorkflowQueue, error) {
-		return ctx.systemDB.listQueues(ctx)
-	}, withRetrierLogger(qr.logger))
+	dbQueueCfgs, err := sysdb.RetryWithResult(ctx, func() ([]models.QueueConfig, error) {
+		return ctx.systemDB.ListQueues(ctx)
+	}, sysdb.WithRetrierLogger(qr.logger))
+	dbQueues := queuesFromConfigs(dbQueueCfgs)
 	if err != nil {
 		// Return a snapshot of the current set in case of transient errors
 		qr.logger.Warn("Exception listing database-backed queues", "error", err)
@@ -684,16 +722,13 @@ func (qr *queueRunner) runQueue(ctx *dbosContext, queue WorkflowQueue) {
 		// Default to empty string for non-partitioned queues
 		partitionKeys := []string{""}
 		if queue.PartitionQueue {
-			partitions, err := retryWithResult(ctx, func() ([]string, error) {
-				return ctx.systemDB.getQueuePartitions(ctx, queue.Name)
-			}, withRetrierLogger(queueLogger))
+			partitions, err := sysdb.RetryWithResult(ctx, func() ([]string, error) {
+				return ctx.systemDB.GetQueuePartitions(ctx, queue.Name)
+			}, sysdb.WithRetrierLogger(queueLogger))
 			if err != nil {
 				skipDequeue = true
-				if pgErr, ok := err.(*pgconn.PgError); ok {
-					switch pgErr.Code {
-					case pgerrcode.SerializationFailure, pgerrcode.LockNotAvailable:
-						hasBackoffError = true
-					}
+				if ctx.systemDB.IsContentionError(err) {
+					hasBackoffError = true
 				} else {
 					queueLogger.Error("Error getting queue partitions", "error", err)
 				}
@@ -704,7 +739,7 @@ func (qr *queueRunner) runQueue(ctx *dbosContext, queue WorkflowQueue) {
 
 		// Dequeue from each partition (or once for non-partitioned queues)
 		if !skipDequeue {
-			var dequeuedWorkflows []dequeuedWorkflow
+			var dequeuedWorkflows []sysdb.DequeuedWorkflow
 			for _, partitionKey := range partitionKeys {
 				workflows, shouldContinue := qr.dequeueWorkflows(ctx, queue, partitionKey, &hasBackoffError)
 				if shouldContinue {
@@ -719,29 +754,29 @@ func (qr *queueRunner) runQueue(ctx *dbosContext, queue WorkflowQueue) {
 			for _, workflow := range dequeuedWorkflows {
 				// Find the workflow in the registry. Configured instance workflows are
 				// registered under a name qualified with their config name.
-				lookupName := workflow.name
-				if workflow.configName != nil && *workflow.configName != "" {
-					lookupName = instanceQualifiedName(workflow.name, *workflow.configName)
+				lookupName := workflow.Name
+				if workflow.ConfigName != nil && *workflow.ConfigName != "" {
+					lookupName = instanceQualifiedName(workflow.Name, *workflow.ConfigName)
 				}
 				wfName, ok := ctx.workflowCustomNametoFQN.Load(lookupName)
 				if !ok {
-					queueLogger.Error("Workflow not found in registry", "workflow_name", workflow.name)
+					queueLogger.Error("Workflow not found in registry", "workflow_name", workflow.Name)
 					continue
 				}
 
 				registeredWorkflowAny, exists := ctx.workflowRegistry.Load(wfName.(string))
 				if !exists {
-					queueLogger.Error("workflow function not found in registry", "workflow_name", workflow.name)
+					queueLogger.Error("workflow function not found in registry", "workflow_name", workflow.Name)
 					continue
 				}
 				registeredWorkflow, ok := registeredWorkflowAny.(WorkflowRegistryEntry)
 				if !ok {
-					queueLogger.Error("invalid workflow registry entry type", "workflow_name", workflow.name)
+					queueLogger.Error("invalid workflow registry entry type", "workflow_name", workflow.Name)
 					continue
 				}
 
 				// Pass encoded input directly - decoding will happen in workflow wrapper when we know the target type
-				_, err := registeredWorkflow.wrappedFunction(ctx, workflow.input, workflow.serialization, WithWorkflowID(workflow.id), withIsDequeue())
+				_, err := registeredWorkflow.wrappedFunction(ctx, workflow.Input, workflow.Serialization, WithWorkflowID(workflow.Id), withIsDequeue())
 				if err != nil {
 					queueLogger.Error("Error running queued workflow", "error", err)
 				}
@@ -776,23 +811,20 @@ func (qr *queueRunner) runQueue(ctx *dbosContext, queue WorkflowQueue) {
 
 // dequeueWorkflows dequeues workflows from a specific partition and handles errors.
 // Returns the dequeued workflows and a boolean indicating whether to continue to the next iteration.
-func (qr *queueRunner) dequeueWorkflows(ctx *dbosContext, queue WorkflowQueue, partitionKey string, hasBackoffError *bool) ([]dequeuedWorkflow, bool) {
-	dequeuedWorkflows, err := retryWithResult(ctx, func() ([]dequeuedWorkflow, error) {
-		return ctx.systemDB.dequeueWorkflows(ctx, dequeueWorkflowsInput{
-			queue:              queue,
-			executorID:         ctx.executorID,
-			applicationVersion: ctx.applicationVersion,
-			queuePartitionKey:  partitionKey,
-			localRunningCount:  ctx.countActiveWorkflowsForQueue(queue.Name, partitionKey),
+func (qr *queueRunner) dequeueWorkflows(ctx *dbosContext, queue WorkflowQueue, partitionKey string, hasBackoffError *bool) ([]sysdb.DequeuedWorkflow, bool) {
+	dequeuedWorkflows, err := sysdb.RetryWithResult(ctx, func() ([]sysdb.DequeuedWorkflow, error) {
+		return ctx.systemDB.DequeueWorkflows(ctx, sysdb.DequeueWorkflowsInput{
+			Queue:              queue.toConfig(),
+			ExecutorID:         ctx.executorID,
+			ApplicationVersion: ctx.applicationVersion,
+			QueuePartitionKey:  partitionKey,
+			LocalRunningCount:  ctx.countActiveWorkflowsForQueue(queue.Name, partitionKey),
 		})
-	}, withRetrierLogger(qr.logger))
+	}, sysdb.WithRetrierLogger(qr.logger))
 
 	if err != nil {
-		if pgErr, ok := err.(*pgconn.PgError); ok {
-			switch pgErr.Code {
-			case pgerrcode.SerializationFailure, pgerrcode.LockNotAvailable:
-				*hasBackoffError = true
-			}
+		if ctx.systemDB.IsContentionError(err) {
+			*hasBackoffError = true
 		} else {
 			qr.logger.Error("Error dequeuing workflows from queue", "queue_name", queue.Name, "partition_key", partitionKey, "error", err)
 		}
