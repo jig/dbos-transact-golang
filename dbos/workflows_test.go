@@ -6435,7 +6435,11 @@ func TestWorkflowTimeout(t *testing.T) {
 }
 
 func notificationWaiterWorkflow(ctx Context, pairID int) (string, error) {
-	result, err := GetEvent[string](ctx, fmt.Sprintf("notification-setter-%d", pairID), "event-key", 10*time.Second)
+	// Fork de-flake: with 1000 workflows contending for sqlite's single writer
+	// under -race, a setter can land more than 10 s after its waiter started
+	// (pure upstream shows the same on a loaded machine). The timeout only
+	// bounds a genuinely lost event; give it room.
+	result, err := GetEvent[string](ctx, fmt.Sprintf("notification-setter-%d", pairID), "event-key", 60*time.Second)
 	if err != nil {
 		return "", err
 	}
@@ -7355,15 +7359,14 @@ func TestGarbageCollect(t *testing.T) {
 			require.NoError(t, err, "failed to start workflow %d", i)
 			handles[i] = handle
 
-			// Add small delay to ensure distinct timestamps
-			time.Sleep(10 * time.Millisecond)
-		}
-
-		// Wait for all workflows to complete
-		for i, handle := range handles {
+			// The cutoffs below are completed_at values with millisecond
+			// resolution: let each workflow finish before starting the next, and
+			// leave a gap, so no two completion timestamps can tie (a tie keeps
+			// one workflow too many past the cutoff and flakes the counts).
 			result, err := handle.GetResult()
 			require.NoError(t, err, "failed to get result from workflow %d", i)
 			require.Equal(t, i, result)
+			time.Sleep(10 * time.Millisecond)
 		}
 
 		// Get timestamps for testing

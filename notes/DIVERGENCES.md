@@ -80,6 +80,21 @@ touched, the change **type**, the rationale, and notes/risks for re-applying.
   - Tests: sqlite needs the `dbos/driver/sqlite` blank import (#407; upstream's
     `utils_test.go` carries it). `durable_sleep_test.go` was ported to
     `RegisterQueue`/`WithQueue(queue)`.
+  - §2 poller cost: after the merge, CI (sqlite, `-race`) lost 1 of 500 getEvent
+    waiters in `TestConcurrentWorkflows/NotificationWorkflows`: the poller ran
+    one EXISTS probe per registered waiter every 100 ms (upstream polls every
+    1 s), starving sqlite. `pollNotifications`/`pollEvents` now issue one query
+    per table per tick (`dialectAnyClause` over the distinct ids), so a tick
+    costs O(1) queries whatever the waiter count; the 100 ms interval stays.
+    In the same investigation, `WakeWorkflowWaiters` (called on every workflow
+    completion, §1) gained a read-only fast path: it opens its write transaction
+    only when `workflow_waiters` has a row for the completed workflow. Before,
+    every completion paid an extra write transaction on sqlite's single writer.
+    The waiter side closes the register/complete race itself (`suspendForResult`
+    re-checks the awaited status after committing), so the read guard loses no
+    wake-up.
+  - `TestNewDBOSContextDoesNotDeadlockOnMigrationFailure` (fork, §9) is skipped
+    on CockroachDB: insecure-mode CRDB rejects `CREATE ROLE ... PASSWORD`.
   - **Rename gotcha for future merges:** a word-boundary `DBOSError`→`Error` sed
     must NOT touch string literals: upstream pins the gob wire name
     `gob.RegisterName("*dbos.DBOSError", &Error{})` for v0-persisted errors (the
@@ -133,7 +148,7 @@ a polling backend like CockroachDB.
 | Area | Files | Type | Notes |
 |---|---|---|---|
 | Drop trigger/func migrations | `migrations/1_initial_dbos_schema_listen_notify.sql`, `10_add_notifications_pkey.sql`, `14_add_pgsql_client_functions.sql`, `20_set_function_search_path.sql` (deleted) | **Deletion** | replaced by a plain mig-10 applied in code (`applyNotificationsPKeyMigration`) |
-| Migration plumbing | `system_database.go` (`buildMigrations(schema, isCockroach)` reduced to 2 args; removed `notificationListenerLoop`, `listenNotifyPool`, channel consts; added `notificationPollerLoop`, `_NOTIFICATION_POLL_INTERVAL = 100ms`) | **Hot-rewrite** | |
+| Migration plumbing | `system_database.go` (`buildMigrations(schema, isCockroach)` reduced to 2 args; removed `notificationListenerLoop`, `listenNotifyPool`, channel consts; added `notificationPollerLoop`, `_NOTIFICATION_POLL_INTERVAL = 100ms`; since 2026-09 `pollNotifications`/`pollEvents` batch all waiters into one query per tick) | **Hot-rewrite** | |
 | Dialect interface | `dialect.go` (removed `SupportsListenNotify` from interface + all impls; cockroach kept only `Name()`) | Deletion | |
 | sqlite list | `sqlite_migrations.go` (skip 10/14/20) | Deletion | |
 | Client functions test | `pgsql_client_test.go` (deleted, -381) | Deletion | tested the removed helper functions |

@@ -4142,62 +4142,99 @@ func (s *SysDB) notificationPollerLoop(ctx context.Context) {
 	}
 }
 
+// pollNotifications wakes the recv waiters whose (destination, topic) has an
+// unconsumed message. One query per tick covers every registered waiter, so
+// the cost of a tick is bounded by the number of distinct destinations, not by
+// the number of waiters (a per-waiter EXISTS probe at 100 ms starved sqlite
+// under a few hundred concurrent waiters).
 func (s *SysDB) pollNotifications(ctx context.Context) {
-	// Iterate through all registered notification payloads
-	for _, payload := range s.RecvNotifier.payloads() {
-		// Parse payload: format is "destinationID::topic"
-		parts := strings.SplitN(payload, "::", 2)
-		if len(parts) != 2 {
-			s.logger.Warn("Invalid notification payload format", "payload", payload)
-			continue
+	wanted, destinations := splitPayloads(s.logger, "notification", s.RecvNotifier.payloads())
+	if len(destinations) == 0 {
+		return
+	}
+	query := s.RenderSQL(`SELECT DISTINCT destination_uuid, topic FROM %snotifications WHERE consumed = false AND `+
+		dialectAnyClause(s.dialect, "destination_uuid", 1), s.dialect.SchemaPrefix(s.schema))
+	param, err := encodeArrayParam(s.dialect, destinations)
+	if err != nil {
+		s.logger.Warn("Failed to poll notifications", "error", err)
+		return
+	}
+	rows, err := s.pool.Query(ctx, query, param)
+	if err != nil {
+		s.logger.Warn("Failed to poll notifications", "error", err)
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var destinationID, topic string
+		if err := rows.Scan(&destinationID, &topic); err != nil {
+			s.logger.Warn("Failed to scan polled notification", "error", err)
+			return
 		}
-
-		destinationID := parts[0]
-		topic := parts[1]
-
-		// Query database to check if an unconsumed notification exists
-		query := s.RenderSQL(`SELECT EXISTS (SELECT 1 FROM %snotifications WHERE destination_uuid = $1 AND topic = $2 AND consumed = false)`, s.dialect.SchemaPrefix(s.schema))
-		var exists bool
-		err := s.pool.QueryRow(ctx, query, destinationID, topic).Scan(&exists)
-		if err != nil {
-			s.logger.Warn("Failed to poll notification", "payload", payload, "error", err)
-			continue
-		}
-
-		// If a notification exists, wake the waiters so they re-check.
-		if exists {
+		if payload := destinationID + "::" + topic; wanted[payload] {
 			s.RecvNotifier.notify(payload)
 		}
 	}
+	if err := rows.Err(); err != nil {
+		s.logger.Warn("Failed to poll notifications", "error", err)
+	}
 }
 
+// pollEvents wakes the getEvent waiters whose (workflow, key) event is set,
+// with one query per tick; see pollNotifications.
 func (s *SysDB) pollEvents(ctx context.Context) {
-	// Iterate through all registered event payloads
-	for _, payload := range s.EventNotifier.payloads() {
-		// Parse payload: format is "targetWorkflowID::key"
-		parts := strings.SplitN(payload, "::", 2)
-		if len(parts) != 2 {
-			s.logger.Warn("Invalid event payload format", "payload", payload)
-			continue
+	wanted, workflowIDs := splitPayloads(s.logger, "event", s.EventNotifier.payloads())
+	if len(workflowIDs) == 0 {
+		return
+	}
+	query := s.RenderSQL(`SELECT workflow_uuid, key FROM %sworkflow_events WHERE `+
+		dialectAnyClause(s.dialect, "workflow_uuid", 1), s.dialect.SchemaPrefix(s.schema))
+	param, err := encodeArrayParam(s.dialect, workflowIDs)
+	if err != nil {
+		s.logger.Warn("Failed to poll events", "error", err)
+		return
+	}
+	rows, err := s.pool.Query(ctx, query, param)
+	if err != nil {
+		s.logger.Warn("Failed to poll events", "error", err)
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var workflowID, key string
+		if err := rows.Scan(&workflowID, &key); err != nil {
+			s.logger.Warn("Failed to scan polled event", "error", err)
+			return
 		}
-
-		targetWorkflowID := parts[0]
-		eventKey := parts[1]
-
-		// Query database to check if event exists
-		query := s.RenderSQL(`SELECT EXISTS (SELECT 1 FROM %sworkflow_events WHERE workflow_uuid = $1 AND key = $2)`, s.dialect.SchemaPrefix(s.schema))
-		var exists bool
-		err := s.pool.QueryRow(ctx, query, targetWorkflowID, eventKey).Scan(&exists)
-		if err != nil {
-			s.logger.Warn("Failed to poll event", "payload", payload, "error", err)
-			continue
-		}
-
-		// If the event exists, wake the waiters so they re-check.
-		if exists {
+		if payload := workflowID + "::" + key; wanted[payload] {
 			s.EventNotifier.notify(payload)
 		}
 	}
+	if err := rows.Err(); err != nil {
+		s.logger.Warn("Failed to poll events", "error", err)
+	}
+}
+
+// splitPayloads indexes "<id>::<suffix>" waiter payloads: the set of payloads
+// to wake, and the distinct ids to query for. Malformed payloads are logged
+// and skipped.
+func splitPayloads(logger *slog.Logger, kind string, payloads []string) (map[string]bool, []string) {
+	wanted := make(map[string]bool, len(payloads))
+	seen := make(map[string]struct{}, len(payloads))
+	ids := make([]string, 0, len(payloads))
+	for _, payload := range payloads {
+		id, _, ok := strings.Cut(payload, "::")
+		if !ok {
+			logger.Warn("Invalid "+kind+" payload format", "payload", payload)
+			continue
+		}
+		wanted[payload] = true
+		if _, dup := seen[id]; !dup {
+			seen[id] = struct{}{}
+			ids = append(ids, id)
+		}
+	}
+	return wanted, ids
 }
 
 const NullTopic = "__null__topic__"
@@ -7504,6 +7541,19 @@ func (s *SysDB) SuspendWorkflowForResult(ctx context.Context, waiterID string, a
 // nil runner the two statements run in their own transaction.
 func (s *SysDB) WakeWorkflowWaiters(ctx context.Context, runner Querier, workflowID string) error {
 	if runner == nil {
+		// Fast path: almost no completion has a suspended waiter, and opening a
+		// write transaction for every one of them doubled the write load per
+		// workflow on sqlite's single writer. A waiter that registers between
+		// this read and its own commit re-checks the awaited status itself
+		// (suspendForResult), so skipping here loses no wake-up.
+		existsQuery := s.RenderSQL(`SELECT EXISTS (SELECT 1 FROM %sworkflow_waiters WHERE awaited_workflow_uuid = $1)`, s.dialect.SchemaPrefix(s.schema))
+		var exists bool
+		if err := s.pool.QueryRow(ctx, existsQuery, workflowID).Scan(&exists); err != nil {
+			return fmt.Errorf("failed to look up waiters of workflow %s: %w", workflowID, err)
+		}
+		if !exists {
+			return nil
+		}
 		tx, err := s.pool.BeginTx(ctx, TxOptions{})
 		if err != nil {
 			return fmt.Errorf("failed to begin transaction to wake waiters of workflow %s: %w", workflowID, err)

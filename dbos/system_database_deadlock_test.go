@@ -24,6 +24,7 @@ import (
 // the bug, NewContext never returns; with the fix it returns the error fast.
 func TestNewDBOSContextDoesNotDeadlockOnMigrationFailure(t *testing.T) {
 	skipIfSqlite(t, "requires a real Postgres role without CREATE privilege")
+	skipIfCockroach(t, "CockroachDB in insecure mode rejects CREATE ROLE ... PASSWORD")
 
 	const (
 		roleName     = "dbos_lowpriv_deadlock"
