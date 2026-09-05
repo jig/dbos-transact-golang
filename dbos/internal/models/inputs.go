@@ -32,18 +32,23 @@ type ListWorkflowsInput struct {
 	HasParent        *bool
 	Attributes       map[string]any
 	ScheduleName     []string
+	ApplicationName  []string
+	IsDebounced      *bool
 }
 
-// ListWorkflowsOption is a functional option for configuring workflow listing parameters.
+// Docs for the exported option and input types below live on their public
+// aliases in dbos/aliases.go.
+
 type ListWorkflowsOption func(*ListWorkflowsInput)
 
 type ListSchedulesInput struct {
 	Statuses             []ScheduleStatus
 	WorkflowNames        []string
+	ScheduleNames        []string
 	ScheduleNamePrefixes []string
+	ApplicationNames     []string
 }
 
-// ListSchedulesOption is a functional option for configuring schedule listing parameters.
 type ListSchedulesOption func(*ListSchedulesInput)
 
 type GetWorkflowStepsInput struct {
@@ -52,42 +57,38 @@ type GetWorkflowStepsInput struct {
 	Offset     *int
 }
 
-// GetWorkflowStepsOption is a functional option for GetWorkflowSteps.
 type GetWorkflowStepsOption func(*GetWorkflowStepsInput)
 
 type ResumeWorkflowInput struct {
 	QueueName string
 }
 
-// ResumeWorkflowOption is a functional option for configuring workflow resumption.
 type ResumeWorkflowOption func(*ResumeWorkflowInput)
 
 type CancelWorkflowInput struct {
 	CancelChildren bool
 }
 
-type CancelWorkflowOptions func(*CancelWorkflowInput)
+type CancelWorkflowOption func(*CancelWorkflowInput)
 
-// ForkWorkflowInput holds configuration parameters for forking workflows.
-// OriginalWorkflowID is required. Other fields are optional.
 type ForkWorkflowInput struct {
-	OriginalWorkflowID string // Required: The UUID of the original workflow to fork from
-	ForkedWorkflowID   string // Optional: Custom workflow ID for the forked workflow (auto-generated if empty)
-	StartStep          uint   // Optional: Step to start the forked workflow from (default: 0)
-	ApplicationVersion string // Optional: Application version for the forked workflow (inherits from original if empty)
-	QueueName          string // Optional: Queue to enqueue the forked workflow on (defaults to the internal queue)
-	QueuePartitionKey  string // Optional: Partition key when enqueueing the forked workflow onto a partitioned queue
+	OriginalWorkflowID  string            // Required: The UUID of the original workflow to fork from
+	ForkedWorkflowID    string            // Optional: Custom workflow ID for the forked workflow (auto-generated if empty)
+	StartStep           uint              // Optional: Step to start the forked workflow from (default: 0)
+	ApplicationVersion  string            // Optional: Application version for the forked workflow (inherits from original if empty)
+	QueueName           string            // Optional: Queue to enqueue the forked workflow on (defaults to the internal queue)
+	QueuePartitionKey   string            // Optional: Partition key when enqueueing the forked workflow onto a partitioned queue
+	Timeout             time.Duration     // Optional: Timeout for the forked workflow (inherits from original if zero)
+	ReplacementChildren map[string]string // Optional: maps original child workflow IDs to replacement IDs.
 }
 
-// GetWorkflowAggregatesInput is the input to GetWorkflowAggregates.
-//
-// At least one of the GroupBy* flags must be true, or TimeBucketSize must be > 0.
 type GetWorkflowAggregatesInput struct {
 	GroupByStatus             bool
 	GroupByName               bool
 	GroupByQueueName          bool
 	GroupByExecutorID         bool
 	GroupByApplicationVersion bool
+	GroupByApplicationName    bool
 
 	// Select* flags choose which aggregates to compute. At least one must be true.
 	// MinCreatedAt is an epoch-ms timestamp; the latency fields are in milliseconds.
@@ -116,16 +117,13 @@ type GetWorkflowAggregatesInput struct {
 	AuthenticatedUser  []string
 	ForkedFrom         []string
 	ParentWorkflowID   []string
+	ApplicationName    []string
 	WasForkedFrom      *bool
 	HasParent          *bool
 
 	Attributes map[string]any
 }
 
-// GetStepAggregatesInput is the input to GetStepAggregates.
-//
-// At least one of the GroupBy* flags must be true, or TimeBucketSize must be > 0.
-// At least one of the Select* flags must be true.
 type GetStepAggregatesInput struct {
 	GroupByFunctionName bool
 	GroupByStatus       bool
@@ -142,16 +140,17 @@ type GetStepAggregatesInput struct {
 	WorkflowIDPrefix []string
 	CompletedAfter   time.Time
 	CompletedBefore  time.Time
+	ApplicationName  []string
 }
 
 type StepInfo struct {
-	StepID          int       // The sequential ID of the step within the workflow
-	StepName        string    // The name of the step function
-	Output          any       // The output returned by the step (if any)
-	Error           error     // The error returned by the step (if any)
-	ChildWorkflowID string    // The ID of a child workflow spawned by this step (if applicable)
-	StartedAt       time.Time // When the step execution started
-	CompletedAt     time.Time // When the step execution completed
+	StepID          int       `json:"function_id"`                 // The sequential ID of the step within the workflow
+	StepName        string    `json:"function_name"`               // The name of the step function
+	Output          any       `json:"output,omitempty"`            // The output returned by the step (if any)
+	Error           error     `json:"error,omitempty"`             // The error returned by the step (if any)
+	ChildWorkflowID string    `json:"child_workflow_id,omitempty"` // The ID of a child workflow spawned by this step (if applicable)
+	StartedAt       time.Time `json:"started_at,omitzero"`         // When the step execution started
+	CompletedAt     time.Time `json:"completed_at,omitzero"`       // When the step execution completed
 }
 
 // AlertHandler is a function that handles alerts received from DBOS Conductor.

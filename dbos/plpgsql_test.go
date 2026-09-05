@@ -49,7 +49,7 @@ func TestNoPLpgSQL(t *testing.T) {
 
 	// End to end: a Send must reach a waiting Recv even though no NOTIFY trigger
 	// fires — delivery is by polling.
-	recvWorkflow := func(ctx DBOSContext, _ string) (string, error) {
+	recvWorkflow := func(ctx Context, _ string) (string, error) {
 		return Recv[string](ctx, "topic", 30*time.Second)
 	}
 	RegisterWorkflow(ctx, recvWorkflow)

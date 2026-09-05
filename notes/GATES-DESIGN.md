@@ -63,7 +63,7 @@ type GateRecvInput struct {
     Deadline time.Time       // zero = no deadline
 }
 // GateRecv = recv with gate bookkeeping. Returns the payload and deliveryID.
-func GateRecv[T any](ctx DBOSContext, in GateRecvInput) (T, string, error)
+func GateRecv[T any](ctx Context, in GateRecvInput) (T, string, error)
 
 type DeliverInput struct {
     WorkflowID string
@@ -75,11 +75,11 @@ type DeliverInput struct {
     Payload    any
 }
 type GateOutcome string // GateDelivered | GateRejectedClosed | GateRejectedAudience
-func DeliverToGate(ctx DBOSContext, in DeliverInput) (GateOutcome, string, error)
+func DeliverToGate(ctx Context, in DeliverInput) (GateOutcome, string, error)
 
 // IgnoreDelivery marks a delivered row 'ignored' (workflow policy discarded it,
 // ADR 0012 D6). Idempotent, at-least-once.
-func IgnoreDelivery(ctx DBOSContext, deliveryID string) error
+func IgnoreDelivery(ctx Context, deliveryID string) error
 ```
 
 Transactionality:

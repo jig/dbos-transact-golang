@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+
+	"github.com/jig/dbos-transact-golang/dbos/internal/models"
 )
 
 // SQLite migration numbering mirrors pg numbering (matching Python's
-// sqlite_migrations list). pg migrations 10, 14, 20, 38, and 39 have no SQLite
-// counterpart, so those version numbers are skipped rather than renumbered.
+// sqlite_migrations list). pg migrations with no SQLite counterpart (see
+// BuildSqliteMigrations) have their version numbers skipped, not renumbered.
 
 //go:embed migrations/sqlite/1_initial_dbos_schema.sql
 var sqliteMigration1SQL string
@@ -125,6 +127,45 @@ var sqliteMigration40SQL string
 //go:embed migrations/sqlite/41_add_schedule_name.sql
 var sqliteMigration41SQL string
 
+//go:embed migrations/sqlite/42_add_debounce_columns.sql
+var sqliteMigration42SQL string
+
+// pg migrations 43 and 44 (dropping plpgsql triggers) have no SQLite
+// counterpart and are omitted.
+
+//go:embed migrations/sqlite/45_create_partition_dequeue_index.sql
+var sqliteMigration45SQL string
+
+//go:embed migrations/sqlite/46_create_partition_dequeue_index_v2.sql
+var sqliteMigration46SQL string
+
+//go:embed migrations/sqlite/47_drop_partition_dequeue_index.sql
+var sqliteMigration47SQL string
+
+//go:embed migrations/sqlite/100_add_workflow_status_application_name.sql
+var sqliteMigration100SQL string
+
+//go:embed migrations/sqlite/101_add_queues_application_name.sql
+var sqliteMigration101SQL string
+
+//go:embed migrations/sqlite/102_add_workflow_schedules_application_name.sql
+var sqliteMigration102SQL string
+
+//go:embed migrations/sqlite/103_add_application_versions_application_name.sql
+var sqliteMigration103SQL string
+
+//go:embed migrations/sqlite/104_add_operation_outputs_application_name.sql
+var sqliteMigration104SQL string
+
+// pg migration 105 rewrites the enqueue_workflow stored function; SQLite has
+// none and omits the version.
+
+//go:embed migrations/sqlite/106_create_application_versions_owner_index.sql
+var sqliteMigration106SQL string
+
+//go:embed migrations/sqlite/107_create_application_versions_unclaimed_index.sql
+var sqliteMigration107SQL string
+
 // Fork migrations (high numbers avoid upstream collision). See DIVERGENCES.md §1.
 //
 //go:embed migrations/sqlite/1001_create_workflow_waiters.sql
@@ -138,7 +179,7 @@ var sqliteMigration1003SQL string
 
 // BuildSqliteMigrations returns the SQLite migration list. Versions mirror pg
 // numbering (matching Python's sqlite_migrations); pg migrations 10, 14, 20,
-// 38, and 39 have no SQLite counterpart and are omitted.
+// 38, 39, 43, 44, and 105 have no SQLite counterpart and are omitted.
 func BuildSqliteMigrations() []MigrationFile {
 	return []MigrationFile{
 		{Version: 1, SQL: sqliteMigration1SQL},
@@ -177,10 +218,53 @@ func BuildSqliteMigrations() []MigrationFile {
 		{Version: 37, SQL: sqliteMigration37SQL},
 		{Version: 40, SQL: sqliteMigration40SQL},
 		{Version: 41, SQL: sqliteMigration41SQL},
+		{Version: 42, SQL: sqliteMigration42SQL},
+		{Version: 45, SQL: sqliteMigration45SQL},
+		{Version: 46, SQL: sqliteMigration46SQL},
+		{Version: 47, SQL: sqliteMigration47SQL},
+		// Versions from SharedMigrationBase on are defined identically by
+		// every DBOS SDK; new migrations must be added to all of them.
+		{Version: 100, SQL: sqliteMigration100SQL},
+		{Version: 101, SQL: sqliteMigration101SQL},
+		{Version: 102, SQL: sqliteMigration102SQL},
+		{Version: 103, SQL: sqliteMigration103SQL},
+		{Version: 104, SQL: sqliteMigration104SQL},
+		{Version: 106, SQL: sqliteMigration106SQL},
+		{Version: 107, SQL: sqliteMigration107SQL},
 		{Version: 1001, SQL: sqliteMigration1001SQL},
 		{Version: 1002, SQL: sqliteMigration1002SQL},
 		{Version: 1003, SQL: sqliteMigration1003SQL},
 	}
+}
+
+// VerifySqliteMigrations checks the schema is at the version this build requires,
+// creating and changing nothing.
+func VerifySqliteMigrations(ctx context.Context, db *sql.DB, databaseLabel string, logger *slog.Logger) error {
+	migrations := BuildSqliteMigrations()
+	requiredVersion := migrations[len(migrations)-1].Version
+
+	var currentVersion int64
+	var exists int
+	err := db.QueryRowContext(ctx,
+		`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`,
+		MigrationTable).Scan(&exists)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("failed to probe sqlite_master: %v", err)
+	}
+	if err == nil {
+		if err := db.QueryRowContext(ctx,
+			fmt.Sprintf(`SELECT version FROM %s LIMIT 1`, MigrationTable)).Scan(&currentVersion); err != nil &&
+			!errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("failed to read current migration version: %v", err)
+		}
+	}
+
+	// A database ahead of this build belongs to a newer peer, which the migration runner also tolerates.
+	if currentVersion < requiredVersion {
+		return models.NewUnmigratedDatabaseError(databaseLabel, currentVersion, requiredVersion)
+	}
+	logger.Debug("System database schema version satisfies the required version", "current_version", currentVersion, "required_version", requiredVersion)
+	return nil
 }
 
 func RunSqliteMigrations(ctx context.Context, db *sql.DB, logger *slog.Logger) error {

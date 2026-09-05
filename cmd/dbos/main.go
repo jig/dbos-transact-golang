@@ -2,6 +2,8 @@ package main
 
 import (
 	"os"
+
+	_ "github.com/jig/dbos-transact-golang/dbos/driver/sqlite"
 )
 
 func main() {

@@ -1,6 +1,7 @@
 package sysdb
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,8 +15,6 @@ import (
 	"github.com/jackc/pgerrcode"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	sqlitelib "modernc.org/sqlite"
-	sqlite3 "modernc.org/sqlite/lib"
 )
 
 // dialect.go: per-backend SQL fragments and behaviours.
@@ -239,6 +238,15 @@ func (PostgresDialect) IsRetryable(err error, logger *slog.Logger) bool {
 	if err == nil {
 		return false
 	}
+	// context.DeadlineExceeded satisfies net.Error, so it would fall through to the
+	// net.Error check below and read as a transient driver failure. It is not one:
+	// either a caller's context expired (retrying can only fail again), or a DBOS
+	// timeout error wraps it as its cause -- Recv/GetEvent/handle timeouts are
+	// semantic outcomes on their own deadline, and retrying them loops forever
+	// against a live context. context.Canceled is excluded for the same reason.
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return false
+	}
 	// pgx surfaces ErrTxClosed for ops on a tx that has already finalized
 	// the caller must retry with a fresh tx.
 	if errors.Is(err, pgx.ErrTxClosed) {
@@ -348,32 +356,44 @@ func (SqliteDialect) SupportsArrayParameters() bool         { return false }
 func (SqliteDialect) SupportsDataModifyingCTE() bool        { return false }
 func (SqliteDialect) SupportsAttributesContainment() bool   { return false }
 
-// Classify sqlite errors via modernc's typed *sqlite.Error and the extended
-// result code constants in modernc.org/sqlite/lib. The Code() return is the
-// extended code (high byte = subcode, low byte = primary code); for retryable
+// Classify sqlite errors via the registered driver's ErrorCode extractor
+// (see sqlite_driver.go). The extracted value is the extended result code
+// (high byte = subcode, low byte = primary code); for retryable
 // classification we mask down to the primary code so all SQLITE_BUSY_* /
 // SQLITE_LOCKED_* variants match.
+//
+// The result codes are defined by SQLite itself and stable across drivers,
+// so they are spelled out here rather than imported from a driver package.
+const (
+	sqliteBusy                 = 5    // SQLITE_BUSY
+	sqliteLocked               = 6    // SQLITE_LOCKED
+	sqliteConstraintForeignKey = 787  // SQLITE_CONSTRAINT_FOREIGNKEY (19 | 3<<8)
+	sqliteConstraintPrimaryKey = 1555 // SQLITE_CONSTRAINT_PRIMARYKEY (19 | 6<<8)
+	sqliteConstraintUnique     = 2067 // SQLITE_CONSTRAINT_UNIQUE (19 | 8<<8)
+)
 
-// sqliteCode extracts the extended result code from err, or -1 if err is not
-// a modernc *sqlite.Error.
+// sqliteCode extracts the extended result code from err via the registered
+// driver, or -1 if no driver is registered or err is not a driver error.
 func sqliteCode(err error) int {
-	var se *sqlitelib.Error
-	if errors.As(err, &se) {
-		return se.Code()
+	sqliteDriverMu.RLock()
+	d := sqliteDriver
+	sqliteDriverMu.RUnlock()
+	if d == nil {
+		return -1
 	}
-	return -1
+	return d.ErrorCode(err)
 }
 
 func (SqliteDialect) IsUniqueViolation(err error) bool {
 	switch sqliteCode(err) {
-	case sqlite3.SQLITE_CONSTRAINT_UNIQUE, sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY:
+	case sqliteConstraintUnique, sqliteConstraintPrimaryKey:
 		return true
 	}
 	return false
 }
 
 func (SqliteDialect) IsForeignKeyViolation(err error) bool {
-	return sqliteCode(err) == sqlite3.SQLITE_CONSTRAINT_FOREIGNKEY
+	return sqliteCode(err) == sqliteConstraintForeignKey
 }
 
 // IsRetryable matches SQLITE_BUSY / SQLITE_LOCKED and their extended variants
@@ -385,7 +405,7 @@ func (SqliteDialect) IsRetryable(err error, logger *slog.Logger) bool {
 		return false
 	}
 	switch code & 0xFF {
-	case sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED:
+	case sqliteBusy, sqliteLocked:
 		if logger != nil {
 			logger.Warn("Retrying transient sqlite error", "error", err)
 		}

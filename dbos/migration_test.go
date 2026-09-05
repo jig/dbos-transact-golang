@@ -4,19 +4,39 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/url"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/jig/dbos-transact-golang/dbos/internal/sysdb"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// poolFromContext extracts the underlying pgxpool from a DBOSContext that was
+// triggerExists reports whether a trigger of the given name is installed on a
+// table in the dbos schema.
+func triggerExists(t *testing.T, pool *pgxpool.Pool, table, trigger string) bool {
+	t.Helper()
+	var found bool
+	err := pool.QueryRow(context.Background(), `
+		SELECT EXISTS (
+			SELECT 1 FROM pg_trigger tg
+			JOIN pg_class cl ON tg.tgrelid = cl.oid
+			JOIN pg_namespace ns ON cl.relnamespace = ns.oid
+			WHERE ns.nspname = 'dbos' AND cl.relname = $1 AND tg.tgname = $2)`,
+		table, trigger).Scan(&found)
+	require.NoError(t, err)
+	return found
+}
+
+// poolFromContext extracts the underlying pgxpool from a Context that was
 // set up via setupDBOS.
-func poolFromContext(t *testing.T, ctx DBOSContext) *pgxpool.Pool {
+func poolFromContext(t *testing.T, ctx Context) *pgxpool.Pool {
 	t.Helper()
 	c, ok := ctx.(*dbosContext)
 	require.True(t, ok)
@@ -244,4 +264,269 @@ func TestNewSystemDatabaseErrorPathNoDeadlock(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("newSystemDatabase deadlocked on its error path: pool.Close() waits on the still-acquired CockroachDB-detection connection")
 	}
+}
+
+// TestMigrationStatements verifies the printable migration SQL (used by
+// `dbos migrate --print-migrations`) is complete: executing it on a fresh
+// database leaves the schema fully migrated.
+func TestMigrationStatements(t *testing.T) {
+	skipIfSqlite(t, "printable migration SQL targets Postgres")
+	skipIfCockroach(t, "printable migration SQL is built with isCockroach=false")
+	ctx := setupDBOS(t, setupDBOSOptions{dropDB: true})
+	pool := poolFromContext(t, ctx)
+	bg := context.Background()
+
+	migs := sysdb.BuildMigrations("dbos", false)
+	latest := migs[len(migs)-1].Version
+
+	// Invalid migration numbers are rejected.
+	_, err := MigrationStatements("", 0)
+	require.Error(t, err)
+	_, err = MigrationStatements("", int(latest)+1)
+	require.Error(t, err)
+
+	stmts, err := MigrationStatements("", 1)
+	require.NoError(t, err)
+	require.Greater(t, len(stmts), 2)
+	assert.Equal(t, `CREATE SCHEMA IF NOT EXISTS "dbos";`, stmts[0])
+	assert.Equal(t, `CREATE TABLE IF NOT EXISTS "dbos".dbos_migrations (version BIGINT NOT NULL PRIMARY KEY);`, stmts[1])
+	assert.Contains(t, stmts, `INSERT INTO "dbos".dbos_migrations (version) VALUES (1);`)
+	assert.Equal(t, fmt.Sprintf(`UPDATE "dbos".dbos_migrations SET version = %d;`, latest), stmts[len(stmts)-1])
+	assert.Contains(t, stmts, "-- Migration 10 skipped: not applicable on fresh databases")
+	for _, stmt := range stmts {
+		assert.NotContains(t, stmt, "DO $$")
+		assert.NotContains(t, stmt, "ADD PRIMARY KEY (message_uuid)")
+	}
+
+	// Starting mid-way omits the prelude and earlier migrations.
+	mid, err := MigrationStatements("", 10)
+	require.NoError(t, err)
+	assert.Equal(t, "-- Migration 10 skipped: not applicable on fresh databases", mid[0])
+	assert.Equal(t, `UPDATE "dbos".dbos_migrations SET version = 10;`, mid[1])
+	assert.Contains(t, mid, "-- Migration 11")
+	assert.NotContains(t, mid, stmts[0])
+	assert.NotContains(t, mid, "-- Migration 9")
+
+	// The unused versions between the Go history and the shared base emit no
+	// bookkeeping, and a from inside the gap starts at the shared base.
+	assert.Contains(t, stmts, "-- Migration 100")
+	assert.Contains(t, stmts, fmt.Sprintf("-- Migration %d", latest))
+	assert.NotContains(t, stmts, `UPDATE "dbos".dbos_migrations SET version = 48;`)
+	gap, err := MigrationStatements("", int(sysdb.SharedMigrationBase)-1)
+	require.NoError(t, err)
+	assert.Equal(t, "-- Migration 100", gap[0])
+
+	_, err = pool.Exec(bg, "DROP SCHEMA dbos CASCADE")
+	require.NoError(t, err)
+
+	for _, stmt := range stmts {
+		_, err := pool.Exec(bg, stmt)
+		require.NoError(t, err, "statement failed: %s", stmt)
+	}
+
+	need, err := sysdb.ShouldMigrate(bg, pool, "dbos", false)
+	require.NoError(t, err)
+	assert.False(t, need, "SQL from MigrationStatements should leave the schema fully migrated")
+	var version int64
+	require.NoError(t, pool.QueryRow(bg, "SELECT version FROM dbos.dbos_migrations").Scan(&version))
+	assert.Equal(t, latest, version)
+
+	// A notifying transaction takes a global lock, so the streams and
+	// workflow_events triggers were replaced by coalesced notifications pushed off
+	// the write path. The notifications trigger stays: DBOS.Send may run in a
+	// process with no notifier loop to flush a notification for it.
+	assert.False(t, triggerExists(t, pool, "streams", "dbos_streams_trigger"))
+	assert.False(t, triggerExists(t, pool, "workflow_events", "dbos_workflow_events_trigger"))
+	// Plain-SQL fork (DIVERGENCES.md §2): the notifications trigger is gone as
+	// well; Send is observed by the receiver's polling loop instead.
+	assert.False(t, triggerExists(t, pool, "notifications", "dbos_notifications_trigger"),
+		"the plain-SQL fork ships no triggers at all")
+
+	// A funny schema name is quoted throughout and applies cleanly.
+	funny := "F8nny_sCHem@-n@m3"
+	fstmts, err := MigrationStatements(funny, 1)
+	require.NoError(t, err)
+	assert.Equal(t, fmt.Sprintf(`CREATE SCHEMA IF NOT EXISTS "%s";`, funny), fstmts[0])
+	for _, stmt := range fstmts {
+		assert.NotContains(t, stmt, "CREATE TABLE "+funny+".")
+	}
+	for _, stmt := range fstmts {
+		_, err := pool.Exec(bg, stmt)
+		require.NoError(t, err, "statement failed: %s", stmt)
+	}
+	need, err = sysdb.ShouldMigrate(bg, pool, funny, false)
+	require.NoError(t, err)
+	assert.False(t, need)
+	_, err = pool.Exec(bg, fmt.Sprintf(`DROP SCHEMA "%s" CASCADE`, funny))
+	require.NoError(t, err)
+}
+
+// TestSkipMigrationsVerifiesMigratedDatabase launches against an already-migrated database.
+func TestSkipMigrationsVerifiesMigratedDatabase(t *testing.T) {
+	setupDBOS(t, setupDBOSOptions{dropDB: true})
+
+	verifyingCtx, err := NewContext(context.Background(), Config{
+		DatabaseURL:    backendDatabaseURL(t),
+		AppName:        "test-app",
+		SkipMigrations: true,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { Shutdown(verifyingCtx, 30*time.Second) })
+
+	workflow := func(ctx Context, _ string) (string, error) { return "migrated", nil }
+	RegisterWorkflow(verifyingCtx, workflow, WithWorkflowName("SkipMigrationsWorkflow"))
+	require.NoError(t, verifyingCtx.Launch())
+
+	handle, err := RunWorkflow(verifyingCtx, workflow, "")
+	require.NoError(t, err)
+	result, err := handle.GetResult()
+	require.NoError(t, err)
+	assert.Equal(t, "migrated", result)
+}
+
+// TestSkipMigrationsRejectsUnmigratedSchema fails launch on an unmigrated schema,
+// without creating anything on the way past.
+func TestSkipMigrationsRejectsUnmigratedSchema(t *testing.T) {
+	skipIfSqlite(t, "pg schema semantics; sqlite has no schemas")
+	databaseURL := getDatabaseURL()
+	bg := context.Background()
+
+	pool, err := pgxpool.New(bg, databaseURL)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	const schema = "skip_migrations_unmigrated"
+	_, err = pool.Exec(bg, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", schema))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(bg, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", schema))
+	})
+
+	migs := sysdb.BuildMigrations(schema, detectCockroach(t, pool))
+	latest := migs[len(migs)-1].Version
+
+	_, err = NewContext(bg, Config{
+		DatabaseURL:    databaseURL,
+		AppName:        "test-app",
+		DatabaseSchema: schema,
+		SkipMigrations: true,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), fmt.Sprintf("is at schema version 0, but this version of DBOS requires %d", latest))
+
+	var schemaExists bool
+	require.NoError(t, pool.QueryRow(bg,
+		`SELECT EXISTS(SELECT 1 FROM information_schema.schemata WHERE schema_name = $1)`,
+		schema).Scan(&schemaExists))
+	assert.False(t, schemaExists, "verification must not create the schema")
+}
+
+// TestSkipMigrationsVersionComparison rejects a database behind this build and
+// tolerates one ahead of it.
+func TestSkipMigrationsVersionComparison(t *testing.T) {
+	skipIfSqlite(t, "pg schema semantics; sqlite has no schemas")
+	databaseURL := getDatabaseURL()
+	bg := context.Background()
+
+	pool, err := pgxpool.New(bg, databaseURL)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	const schema = "skip_migrations_versioned"
+	_, err = pool.Exec(bg, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", schema))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(bg, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", schema))
+	})
+
+	isCockroach := detectCockroach(t, pool)
+	require.NoError(t, sysdb.RunMigrations(bg, pool, schema, isCockroach, slog.Default()))
+	migs := sysdb.BuildMigrations(schema, isCockroach)
+	latest := migs[len(migs)-1].Version
+
+	setVersion := func(version int64) {
+		t.Helper()
+		_, err := pool.Exec(bg, fmt.Sprintf("UPDATE %s.%s SET version = $1", schema, sysdb.MigrationTable), version)
+		require.NoError(t, err)
+	}
+	newVerifyingContext := func() (Context, error) {
+		return NewContext(bg, Config{
+			DatabaseURL:    databaseURL,
+			AppName:        "test-app",
+			DatabaseSchema: schema,
+			SkipMigrations: true,
+		})
+	}
+
+	setVersion(latest - 1)
+	_, err = newVerifyingContext()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), fmt.Sprintf("is at schema version %d, but this version of DBOS requires %d", latest-1, latest))
+
+	setVersion(latest + 1)
+	aheadCtx, err := newVerifyingContext()
+	require.NoError(t, err, "a database ahead of this build belongs to a newer peer")
+	require.NoError(t, Shutdown(aheadCtx, 30*time.Second))
+}
+
+// TestSkipMigrationsDoesNotCreateDatabase fails on a missing system database.
+func TestSkipMigrationsDoesNotCreateDatabase(t *testing.T) {
+	skipIfSqlite(t, "pg database creation; sqlite is covered by TestSkipMigrationsSqlite")
+	bg := context.Background()
+	parsedURL, err := url.Parse(getDatabaseURL())
+	require.NoError(t, err)
+	if parsedURL.Scheme == "" {
+		t.Skip("DBOS_SYSTEM_DATABASE_URL is not in URL form")
+	}
+
+	const databaseName = "dbos_skip_migrations_missing"
+	adminURL := *parsedURL
+	adminURL.Path = "/postgres"
+	adminConn, err := pgx.Connect(bg, adminURL.String())
+	require.NoError(t, err)
+	defer adminConn.Close(bg)
+	require.NoError(t, sysdb.DropDatabaseIfExists(bg, adminConn, databaseName))
+
+	missingURL := *parsedURL
+	missingURL.Path = "/" + databaseName
+	_, err = NewContext(bg, Config{
+		DatabaseURL:    missingURL.String(),
+		AppName:        "test-app",
+		SkipMigrations: true,
+	})
+	require.Error(t, err)
+
+	var exists bool
+	require.NoError(t, adminConn.QueryRow(bg, "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)", databaseName).Scan(&exists))
+	assert.False(t, exists, "verification must not create the system database")
+}
+
+// TestSkipMigrationsSqlite covers the sqlite paths: a missing file and an unmigrated one.
+func TestSkipMigrationsSqlite(t *testing.T) {
+	bg := context.Background()
+	migs := sysdb.BuildSqliteMigrations()
+	latest := migs[len(migs)-1].Version
+
+	missingPath := filepath.Join(t.TempDir(), "missing.db")
+	_, err := NewContext(bg, Config{
+		DatabaseURL:    "sqlite:" + missingPath,
+		AppName:        "test-app",
+		SkipMigrations: true,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "does not exist")
+	_, statErr := os.Stat(missingPath)
+	assert.True(t, os.IsNotExist(statErr), "verification must not create the database file")
+
+	unmigratedPath := filepath.Join(t.TempDir(), "unmigrated.db")
+	file, err := os.Create(unmigratedPath)
+	require.NoError(t, err)
+	require.NoError(t, file.Close())
+	_, err = NewContext(bg, Config{
+		DatabaseURL:    "sqlite:" + unmigratedPath,
+		AppName:        "test-app",
+		SkipMigrations: true,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), fmt.Sprintf("is at schema version 0, but this version of DBOS requires %d", latest))
 }

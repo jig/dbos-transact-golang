@@ -13,7 +13,7 @@ import (
 )
 
 // gateRowState reads the authoritative gate row.
-func gateRowState(t *testing.T, c DBOSContext, wfID, gate string) (open bool, found bool) {
+func gateRowState(t *testing.T, c Context, wfID, gate string) (open bool, found bool) {
 	t.Helper()
 	s := c.(*dbosContext).systemDB.(*sysdb.SysDB)
 	q := s.RenderSQL(`SELECT open FROM %sworkflow_gates WHERE workflow_uuid = $1 AND gate = $2`, s.Dialect().SchemaPrefix(s.Schema()))
@@ -24,7 +24,7 @@ func gateRowState(t *testing.T, c DBOSContext, wfID, gate string) (open bool, fo
 	return open, true
 }
 
-func deliveryOutcome(t *testing.T, c DBOSContext, deliveryID string) string {
+func deliveryOutcome(t *testing.T, c Context, deliveryID string) string {
 	t.Helper()
 	s := c.(*dbosContext).systemDB.(*sysdb.SysDB)
 	q := s.RenderSQL(`SELECT outcome FROM %sworkflow_gate_deliveries WHERE delivery_uuid = $1`, s.Dialect().SchemaPrefix(s.Schema()))
@@ -33,7 +33,7 @@ func deliveryOutcome(t *testing.T, c DBOSContext, deliveryID string) string {
 	return outcome
 }
 
-func waitGateOpenRow(t *testing.T, c DBOSContext, wfID, gate string) {
+func waitGateOpenRow(t *testing.T, c Context, wfID, gate string) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
@@ -51,7 +51,7 @@ func waitGateOpenRow(t *testing.T, c DBOSContext, wfID, gate string) {
 func TestGatePrimitive(t *testing.T) {
 	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true})
 
-	gateWF := func(ctx DBOSContext, _ string) (string, error) {
+	gateWF := func(ctx Context, _ string) (string, error) {
 		payload, deliveryID, err := GateRecv[string](ctx, GateRecvInput{
 			Gate: "approve", Org: "org-1",
 			Audience: []GatePrincipal{{Type: GatePrincipalGroup, Principal: "approvers"}},
@@ -62,14 +62,14 @@ func TestGatePrimitive(t *testing.T) {
 		}
 		return payload + "|" + deliveryID, nil
 	}
-	timeoutWF := func(ctx DBOSContext, _ string) (string, error) {
+	timeoutWF := func(ctx Context, _ string) (string, error) {
 		_, deliveryID, err := GateRecv[string](ctx, GateRecvInput{
 			Gate: "approve", Org: "org-1",
 			Audience: []GatePrincipal{{Type: GatePrincipalUser, Principal: "u1"}},
 			Timeout:  300 * time.Millisecond,
 		})
-		var dbosErr *DBOSError
-		if errors.As(err, &dbosErr) && dbosErr.Code == TimeoutError {
+		var dbosErr *Error
+		if errors.As(err, &dbosErr) && dbosErr.Code == ErrorCodeTimeout {
 			return "timed-out|" + deliveryID, nil
 		}
 		return "", fmt.Errorf("expected timeout, got payload (err=%v)", err)

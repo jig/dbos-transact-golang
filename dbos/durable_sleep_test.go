@@ -35,12 +35,11 @@ func waitForStatus(t *testing.T, handle WorkflowHandle[string], expected Workflo
 func TestDurableSleepSuspension(t *testing.T) {
 	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true, durableSleepThreshold: 200 * time.Millisecond})
 
-	userQueue := NewWorkflowQueue(dbosCtx, "durable-sleep-queue",
-		WithQueueBasePollingInterval(50*time.Millisecond),
-		WithQueueMaxPollingInterval(500*time.Millisecond))
+	userQueue, qErr := RegisterQueue(dbosCtx, "durable-sleep-queue", WithQueueBasePollingInterval(50*time.Millisecond))
+	require.NoError(t, qErr)
 
 	var bodyExecutions, stepExecutions atomic.Int64
-	sleepingWorkflow := func(ctx DBOSContext, input string) (string, error) {
+	sleepingWorkflow := func(ctx Context, input string) (string, error) {
 		bodyExecutions.Add(1)
 		stepResult, err := RunAsStep(ctx, func(ctx context.Context) (string, error) {
 			stepExecutions.Add(1)
@@ -56,7 +55,7 @@ func TestDurableSleepSuspension(t *testing.T) {
 	}
 
 	var loopBodyExecutions, loopStepExecutions atomic.Int64
-	loopingWorkflow := func(ctx DBOSContext, _ string) (string, error) {
+	loopingWorkflow := func(ctx Context, _ string) (string, error) {
 		loopBodyExecutions.Add(1)
 		for range 2 {
 			if _, err := RunAsStep(ctx, func(ctx context.Context) (int64, error) {
@@ -72,7 +71,7 @@ func TestDurableSleepSuspension(t *testing.T) {
 	}
 
 	var shortBodyExecutions atomic.Int64
-	shortSleepWorkflow := func(ctx DBOSContext, _ string) (string, error) {
+	shortSleepWorkflow := func(ctx Context, _ string) (string, error) {
 		shortBodyExecutions.Add(1)
 		if _, err := Sleep(ctx, 100*time.Millisecond); err != nil {
 			return "", err
@@ -121,11 +120,11 @@ func TestDurableSleepSuspension(t *testing.T) {
 		bodyExecutions.Store(0)
 		stepExecutions.Store(0)
 
-		handle, err := RunWorkflow(dbosCtx, sleepingWorkflow, "queued", WithQueue(userQueue.Name))
+		handle, err := RunWorkflow(dbosCtx, sleepingWorkflow, "queued", WithQueue(userQueue))
 		require.NoError(t, err, "failed to enqueue workflow")
 
 		status := waitForStatus(t, handle, WorkflowStatusDelayed, 5*time.Second)
-		assert.Equal(t, userQueue.Name, status.QueueName, "enqueued workflow should stay on its own queue")
+		assert.Equal(t, userQueue.GetName(), status.QueueName, "enqueued workflow should stay on its own queue")
 
 		result, err := handle.GetResult(WithHandleTimeout(60*time.Second), WithHandlePollingInterval(100*time.Millisecond))
 		require.NoError(t, err, "failed to get workflow result after suspension")
@@ -167,12 +166,11 @@ func TestDurableSleepSuspension(t *testing.T) {
 func TestDurableResultSuspension(t *testing.T) {
 	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true, durableSleepThreshold: 200 * time.Millisecond})
 
-	childQueue := NewWorkflowQueue(dbosCtx, "durable-result-queue",
-		WithQueueBasePollingInterval(50*time.Millisecond),
-		WithQueueMaxPollingInterval(500*time.Millisecond))
+	childQueue, qErr := RegisterQueue(dbosCtx, "durable-result-queue", WithQueueBasePollingInterval(50*time.Millisecond))
+	require.NoError(t, qErr)
 
 	var sleepingChildBody atomic.Int64
-	sleepingChild := func(ctx DBOSContext, input string) (string, error) {
+	sleepingChild := func(ctx Context, input string) (string, error) {
 		sleepingChildBody.Add(1)
 		if _, err := Sleep(ctx, 1500*time.Millisecond); err != nil {
 			return "", err
@@ -181,7 +179,7 @@ func TestDurableResultSuspension(t *testing.T) {
 	}
 
 	var sleepingParentBody atomic.Int64
-	sleepingParent := func(ctx DBOSContext, input string) (string, error) {
+	sleepingParent := func(ctx Context, input string) (string, error) {
 		sleepingParentBody.Add(1)
 		handle, err := RunWorkflow(ctx, sleepingChild, input)
 		if err != nil {
@@ -195,7 +193,7 @@ func TestDurableResultSuspension(t *testing.T) {
 	}
 
 	var slowChildBody atomic.Int64
-	slowChild := func(ctx DBOSContext, input string) (string, error) {
+	slowChild := func(ctx Context, input string) (string, error) {
 		slowChildBody.Add(1)
 		return RunAsStep(ctx, func(ctx context.Context) (string, error) {
 			time.Sleep(1 * time.Second)
@@ -204,9 +202,9 @@ func TestDurableResultSuspension(t *testing.T) {
 	}
 
 	var slowParentBody atomic.Int64
-	slowParent := func(ctx DBOSContext, input string) (string, error) {
+	slowParent := func(ctx Context, input string) (string, error) {
 		slowParentBody.Add(1)
-		handle, err := RunWorkflow(ctx, slowChild, input, WithQueue(childQueue.Name))
+		handle, err := RunWorkflow(ctx, slowChild, input, WithQueue(childQueue))
 		if err != nil {
 			return "", err
 		}
@@ -218,13 +216,13 @@ func TestDurableResultSuspension(t *testing.T) {
 	}
 
 	var fastChildBody atomic.Int64
-	fastChild := func(ctx DBOSContext, input string) (string, error) {
+	fastChild := func(ctx Context, input string) (string, error) {
 		fastChildBody.Add(1)
 		return input + "-fast", nil
 	}
 
 	var fastParentBody atomic.Int64
-	fastParent := func(ctx DBOSContext, input string) (string, error) {
+	fastParent := func(ctx Context, input string) (string, error) {
 		fastParentBody.Add(1)
 		handle, err := RunWorkflow(ctx, fastChild, input)
 		if err != nil {
@@ -238,7 +236,7 @@ func TestDurableResultSuspension(t *testing.T) {
 	}
 
 	var grandParentBody atomic.Int64
-	grandParent := func(ctx DBOSContext, input string) (string, error) {
+	grandParent := func(ctx Context, input string) (string, error) {
 		grandParentBody.Add(1)
 		handle, err := RunWorkflow(ctx, sleepingParent, input)
 		if err != nil {
@@ -346,7 +344,7 @@ func TestDurableRecvSuspension(t *testing.T) {
 	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true, durableSleepThreshold: 200 * time.Millisecond})
 
 	var recvBody atomic.Int64
-	recvWorkflow := func(ctx DBOSContext, _ string) (string, error) {
+	recvWorkflow := func(ctx Context, _ string) (string, error) {
 		recvBody.Add(1)
 		msg, err := Recv[string](ctx, "signal", 30*time.Second)
 		if err != nil {
@@ -356,21 +354,21 @@ func TestDurableRecvSuspension(t *testing.T) {
 	}
 
 	var timeoutBody atomic.Int64
-	timeoutWorkflow := func(ctx DBOSContext, _ string) (string, error) {
+	timeoutWorkflow := func(ctx Context, _ string) (string, error) {
 		timeoutBody.Add(1)
 		if _, err := Recv[string](ctx, "never", 1*time.Second); err != nil {
 			// The timeout surfaces on the post-suspension replay: the recorded error
-			// must still carry its DBOSError code (regression for errorFromRecorded).
-			var dbosErr *DBOSError
-			if errors.As(err, &dbosErr) && dbosErr.Code == TimeoutError {
+			// must still carry its Error code (regression for errorFromRecorded).
+			var dbosErr *Error
+			if errors.As(err, &dbosErr) && dbosErr.Code == ErrorCodeTimeout {
 				return "timed-out", nil
 			}
-			return "", fmt.Errorf("expected a TimeoutError, got: %w", err)
+			return "", fmt.Errorf("expected a ErrorCodeTimeout, got: %w", err)
 		}
 		return "unexpected-message", nil
 	}
 
-	senderWorkflow := func(ctx DBOSContext, destinationID string) (string, error) {
+	senderWorkflow := func(ctx Context, destinationID string) (string, error) {
 		if err := Send(ctx, destinationID, "from-workflow", "signal"); err != nil {
 			return "", err
 		}
@@ -379,7 +377,7 @@ func TestDurableRecvSuspension(t *testing.T) {
 
 	preludeEvent := NewEvent()
 	var gatedBody atomic.Int64
-	gatedRecvWorkflow := func(ctx DBOSContext, _ string) (string, error) {
+	gatedRecvWorkflow := func(ctx Context, _ string) (string, error) {
 		gatedBody.Add(1)
 		if _, err := RunAsStep(ctx, func(c context.Context) (string, error) {
 			preludeEvent.Wait() // hold the workflow here until the message is in the database
@@ -476,7 +474,7 @@ func TestDurableGetEventSuspension(t *testing.T) {
 	// wake is event-driven, not the producer's completion).
 	setGate := NewEvent()
 	finishGate := NewEvent()
-	producerWorkflow := func(ctx DBOSContext, _ string) (string, error) {
+	producerWorkflow := func(ctx Context, _ string) (string, error) {
 		if _, err := RunAsStep(ctx, func(c context.Context) (string, error) {
 			setGate.Wait()
 			return "", nil
@@ -496,7 +494,7 @@ func TestDurableGetEventSuspension(t *testing.T) {
 	}
 
 	var consumerBody atomic.Int64
-	consumerWorkflow := func(ctx DBOSContext, targetID string) (string, error) {
+	consumerWorkflow := func(ctx Context, targetID string) (string, error) {
 		consumerBody.Add(1)
 		val, err := GetEvent[string](ctx, targetID, "status", 30*time.Second)
 		if err != nil {
@@ -506,16 +504,16 @@ func TestDurableGetEventSuspension(t *testing.T) {
 	}
 
 	var timeoutBody atomic.Int64
-	timeoutConsumerWorkflow := func(ctx DBOSContext, targetID string) (string, error) {
+	timeoutConsumerWorkflow := func(ctx Context, targetID string) (string, error) {
 		timeoutBody.Add(1)
 		if _, err := GetEvent[string](ctx, targetID, "missing", 1*time.Second); err != nil {
 			// The timeout surfaces on the post-suspension replay: the recorded error
-			// must still carry its DBOSError code (regression for errorFromRecorded).
-			var dbosErr *DBOSError
-			if errors.As(err, &dbosErr) && dbosErr.Code == TimeoutError {
+			// must still carry its Error code (regression for errorFromRecorded).
+			var dbosErr *Error
+			if errors.As(err, &dbosErr) && dbosErr.Code == ErrorCodeTimeout {
 				return "timed-out", nil
 			}
-			return "", fmt.Errorf("expected a TimeoutError, got: %w", err)
+			return "", fmt.Errorf("expected a ErrorCodeTimeout, got: %w", err)
 		}
 		return "unexpected-event", nil
 	}
@@ -588,7 +586,7 @@ func TestDurableSleepDisabledByDefault(t *testing.T) {
 	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
 
 	var bodyExecutions atomic.Int64
-	sleepingWorkflow := func(ctx DBOSContext, _ string) (string, error) {
+	sleepingWorkflow := func(ctx Context, _ string) (string, error) {
 		bodyExecutions.Add(1)
 		if _, err := Sleep(ctx, 1*time.Second); err != nil {
 			return "", err

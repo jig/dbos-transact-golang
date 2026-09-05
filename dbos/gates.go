@@ -56,7 +56,7 @@ type GateRecvInput struct {
 // delivery arrives or the timeout fires; the gate closes in the same
 // transaction as the recv checkpoint. Returns the payload and the delivery
 // audit row ID ("" on timeout).
-func GateRecv[T any](ctx DBOSContext, in GateRecvInput) (T, string, error) {
+func GateRecv[T any](ctx Context, in GateRecvInput) (T, string, error) {
 	var zero T
 	if ctx == nil {
 		return zero, "", errors.New("ctx cannot be nil")
@@ -71,7 +71,7 @@ func GateRecv[T any](ctx DBOSContext, in GateRecvInput) (T, string, error) {
 
 // convertRecvResult decodes a *recvResult into the caller's type, mirroring
 // the public Recv[R] conversion.
-func convertRecvResult[R any](ctx DBOSContext, msg any) (R, error) {
+func convertRecvResult[R any](ctx Context, msg any) (R, error) {
 	var zero R
 	if msg == nil {
 		return zero, nil
@@ -103,7 +103,7 @@ func convertRecvResult[R any](ctx DBOSContext, msg any) (R, error) {
 	return typed, nil
 }
 
-func (c *dbosContext) GateRecv(_ DBOSContext, in GateRecvInput) (any, string, error) {
+func (c *dbosContext) GateRecv(_ Context, in GateRecvInput) (any, string, error) {
 	wfState, ok := c.Value(workflowStateKey).(*workflowState)
 	if !ok || wfState == nil {
 		return nil, "", models.NewStepExecutionError("", "DBOS.recv", fmt.Errorf("workflow state not found in context: are you running this step within a workflow?"))
@@ -138,14 +138,14 @@ type DeliverInput = sysdb.DeliverInput
 // with its outcome, and — only when delivered — signals the waiting workflow.
 // Rejections commit their audit row and signal nothing. The outcome is a
 // value, not an error: callers map it to their transport (403/409/204).
-func DeliverToGate(ctx DBOSContext, in DeliverInput) (GateOutcome, string, error) {
+func DeliverToGate(ctx Context, in DeliverInput) (GateOutcome, string, error) {
 	if ctx == nil {
 		return "", "", errors.New("ctx cannot be nil")
 	}
 	return ctx.DeliverToGate(ctx, in)
 }
 
-func (c *dbosContext) DeliverToGate(_ DBOSContext, in DeliverInput) (GateOutcome, string, error) {
+func (c *dbosContext) DeliverToGate(_ Context, in DeliverInput) (GateOutcome, string, error) {
 	if in.WorkflowID == "" || in.Gate == "" || in.Subject == "" {
 		return "", "", errors.New("workflow ID, gate and subject are required")
 	}
@@ -167,14 +167,14 @@ func (c *dbosContext) DeliverToGate(_ DBOSContext, in DeliverInput) (GateOutcome
 // IgnoreDelivery marks a delivered audit row as ignored by workflow policy
 // (ADR 0012 D6). Idempotent; at-least-once semantics are fine — an already
 // ignored row stays ignored.
-func IgnoreDelivery(ctx DBOSContext, deliveryID string) error {
+func IgnoreDelivery(ctx Context, deliveryID string) error {
 	if ctx == nil {
 		return errors.New("ctx cannot be nil")
 	}
 	return ctx.IgnoreDelivery(ctx, deliveryID)
 }
 
-func (c *dbosContext) IgnoreDelivery(_ DBOSContext, deliveryID string) error {
+func (c *dbosContext) IgnoreDelivery(_ Context, deliveryID string) error {
 	if deliveryID == "" {
 		return nil
 	}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"reflect"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/jig/dbos-transact-golang/dbos/internal/models"
@@ -35,9 +36,9 @@ type DataSource struct {
 	dialect Dialect
 	schema  string
 
-	// sameAsSystemDB is set when this data source's pool is the very same engine
-	// handle as the DBOS system database.
-	sameAsSystemDB bool
+	// Guard setup (dialect resolution + completion-table creation).
+	setupMu   sync.Mutex
+	setupDone bool
 }
 
 // Name returns the data source's name (WithDataSourceName, default "datasource").
@@ -84,7 +85,7 @@ type Engine interface {
 //
 //	pool, _ := pgxpool.New(ctx, appDatabaseURL)
 //	ds, err := dbos.NewDataSource(ctx, pool, dbos.WithDataSourceName("app"))
-func NewDataSource[E Engine](ctx DBOSContext, engine E, opts ...DataSourceOption) (*DataSource, error) {
+func NewDataSource[E Engine](ctx Context, engine E, opts ...DataSourceOption) (*DataSource, error) {
 	if ctx == nil {
 		return nil, errors.New("ctx cannot be nil")
 	}
@@ -134,25 +135,37 @@ func NewDataSource[E Engine](ctx DBOSContext, engine E, opts ...DataSourceOption
 		schema:  options.schema,
 	}
 
-	// A data source whose pool is the very same engine as the system database
-	// needs no durability table: RunAsTransaction collapses onto the single
-	// system transaction (runAsTxn), so skip dialect resolution and table
-	// creation entirely.
+	// A data source whose pool is the very same engine as this context's system
+	// database needs no durability table: RunAsTransaction collapses onto the
+	// single system transaction (runAsTxn), so defer dialect resolution and
+	// table creation until the source is used with a different system database.
 	if sysdb.SameEngine(ds.pool, c.systemDB.Pool()) {
-		ds.sameAsSystemDB = true
 		c.logger.Debug("Data source shares the system database; using single-transaction durability", "datasource", ds.name)
 		return ds, nil
 	}
 
-	if err := ds.resolveDialect(c); err != nil {
+	if err := ds.setup(c); err != nil {
 		return nil, fmt.Errorf("data source %q: %w", ds.name, err)
+	}
+	return ds, nil
+}
+
+// setup resolves the dialect and ensures the transaction_completion table exists.
+func (ds *DataSource) setup(c *dbosContext) error {
+	ds.setupMu.Lock()
+	defer ds.setupMu.Unlock()
+	if ds.setupDone {
+		return nil
+	}
+	if err := ds.resolveDialect(c); err != nil {
+		return err
 	}
 	if err := ds.ensureCompletionTable(c); err != nil {
-		return nil, fmt.Errorf("data source %q: %w", ds.name, err)
+		return err
 	}
-
+	ds.setupDone = true
 	c.logger.Debug("Created data source", "datasource", ds.name, "dialect", ds.dialect.Name(), "schema", ds.schema)
-	return ds, nil
+	return nil
 }
 
 // qualifiedCompletionTable returns the schema-qualified transaction_completion
@@ -181,7 +194,7 @@ func (ds *DataSource) completionTableStatements() []string {
 		fmt.Sprintf(`CREATE SCHEMA IF NOT EXISTS %s`, pgx.Identifier{ds.schema}.Sanitize()),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 	workflow_id TEXT NOT NULL,
-	step_id INT NOT NULL,
+	step_id INT4 NOT NULL,
 	output TEXT,
 	error TEXT,
 	serialization TEXT,
@@ -272,6 +285,30 @@ func (ds *DataSource) ensureCompletionTable(c *dbosContext) error {
 	return nil
 }
 
+// resolveUserTx adapts a caller-owned transaction to the portable Tx the system
+// database writes through. It accepts a Tx (as handed to a RunAsTransaction
+// callback), a pgx.Tx, or a *sql.Tx.
+func resolveUserTx(tx any) (Tx, error) {
+	switch t := tx.(type) {
+	case Tx:
+		if t != nil {
+			return t, nil
+		}
+	case pgx.Tx:
+		if t != nil {
+			return sysdb.NewPgxTx(t), nil
+		}
+	case *sql.Tx:
+		if t != nil {
+			return sysdb.NewSQLTx(t), nil
+		}
+	case nil:
+	default:
+		return nil, models.NewInvalidOptionError(fmt.Sprintf("unsupported transaction type %T: expected pgx.Tx, *sql.Tx or dbos.Tx", tx))
+	}
+	return nil, models.NewInvalidOptionError("transaction cannot be nil")
+}
+
 // completionRecord is a row from the transaction_completion table. A success row
 // stores output (error nil); a permanently failed transaction stores a serialized
 // error (output nil) written in a standalone insert after fn's transaction rolls
@@ -335,7 +372,7 @@ func (ds *DataSource) recordCompletion(ctx context.Context, q Querier, workflowI
 //	    }
 //	    return res.RowsAffected()
 //	})
-func RunAsTransaction[R any](ctx DBOSContext, ds *DataSource, fn Txn[R], opts ...StepOption) (R, error) {
+func RunAsTransaction[R any](ctx Context, ds *DataSource, fn Txn[R], opts ...StepOption) (R, error) {
 	if ctx == nil {
 		return *new(R), models.NewStepExecutionError("", "", fmt.Errorf("ctx cannot be nil"))
 	}
@@ -369,18 +406,20 @@ func RunAsTransaction[R any](ctx DBOSContext, ds *DataSource, fn Txn[R], opts ..
 // output without re-running fn when the user transaction already committed.
 //
 // When the data source shares the system database's pool, the call collapses onto runAsTxn.
-func (c *dbosContext) RunAsTransaction(dbosCtx DBOSContext, ds *DataSource, fn TxnFunc, opts ...StepOption) (any, error) {
-	// Reject a transaction nested inside another transaction.
-	// (A transaction nested inside a plain RunAsStep is fine)
-	if ws, ok := c.Value(workflowStateKey).(*workflowState); ok && ws != nil && ws.isWithinTransaction {
+func (c *dbosContext) RunAsTransaction(dbosCtx Context, ds *DataSource, fn TxnFunc, opts ...StepOption) (any, error) {
+	if ws, ok := c.Value(workflowStateKey).(*workflowState); ok && ws != nil && (ws.isWithinTransaction || ws.isWithinStep) {
 		stepOpts := &stepOptions{}
 		for _, opt := range opts {
 			opt(stepOpts)
 		}
-		return nil, models.NewStepExecutionError(ws.workflowID, stepOpts.stepName, fmt.Errorf("cannot call RunAsTransaction within a transaction"))
+		enclosing := "a step"
+		if ws.isWithinTransaction {
+			enclosing = "a transaction"
+		}
+		return nil, models.NewStepExecutionError(ws.workflowID, stepOpts.stepName, fmt.Errorf("cannot call RunAsTransaction within %s", enclosing))
 	}
 
-	if ds.sameAsSystemDB {
+	if sysdb.SameEngine(ds.pool, c.systemDB.Pool()) {
 		// runAsTxn manages a transaction for the user function.
 		// reuse our internal path used for all DBOS "special" steps (e.g., setEvent)
 		return c.runAsTxn(dbosCtx, fn, opts...)
@@ -393,28 +432,8 @@ func (c *dbosContext) RunAsTransaction(dbosCtx DBOSContext, ds *DataSource, fn T
 	if fn == nil {
 		return nil, models.NewStepExecutionError(prep.WorkflowID, prep.StepOpts.stepName, fmt.Errorf("transaction function cannot be nil"))
 	}
-
-	if prep.IsWithinStep {
-		// Invoked inside an enclosing step: open a real transaction on the user
-		// pool and manage its commit/rollback, but record no durability row.
-		txOpts := TxOptions{IsoLevel: IsoLevelReadCommitted}
-		if prep.StepOpts.txIsoLevel != nil {
-			txOpts.IsoLevel = *prep.StepOpts.txIsoLevel
-		}
-		uncancellableCtx := WithoutCancel(c)
-		tx, err := ds.pool.BeginTx(uncancellableCtx, txOpts)
-		if err != nil {
-			return nil, models.NewStepExecutionError(prep.WorkflowID, prep.StepOpts.stepName, fmt.Errorf("failed to begin transaction: %w", err))
-		}
-		defer tx.Rollback(uncancellableCtx)
-		output, err := fn(withinTransactionContext(c), tx)
-		if err != nil {
-			return nil, err
-		}
-		if err := tx.Commit(uncancellableCtx); err != nil {
-			return nil, models.NewStepExecutionError(prep.WorkflowID, prep.StepOpts.stepName, fmt.Errorf("failed to commit transaction: %w", err))
-		}
-		return output, nil
+	if err := ds.setup(c); err != nil {
+		return nil, models.NewStepExecutionError(prep.WorkflowID, prep.StepOpts.stepName, fmt.Errorf("data source %q: %w", ds.name, err))
 	}
 
 	uncancellableCtx := WithoutCancel(c)
@@ -529,8 +548,10 @@ func (c *dbosContext) RunAsTransaction(dbosCtx DBOSContext, ds *DataSource, fn T
 	// OUTER: the user-facing step retry policy (maxRetries + predicate).
 	stepOutput, stepError := executeStepWithRetry(c, stepState.workflowID, stepOpts, runTxnResilient)
 
-	if stepInterruptedByCancellation(stepState, stepError) {
-		return stepOutput, models.NewWorkflowCancelledError(stepState.workflowID, stepError)
+	// The workflow being cancelled mid-step interrupts the step, whatever its
+	// outcome: nothing is checkpointed, so a resume re-executes the step.
+	if isWorkflowCtxCancelled(stepState) {
+		return stepOutput, interruptedStepError(stepState, stepError)
 	}
 
 	// txn2: checkpoint the outcome into the system database.

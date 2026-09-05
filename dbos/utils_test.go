@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	_ "github.com/jig/dbos-transact-golang/dbos/driver/sqlite"
 	"github.com/jig/dbos-transact-golang/dbos/internal/models"
 	"github.com/jig/dbos-transact-golang/dbos/internal/sysdb"
 
@@ -91,7 +92,7 @@ func resetTestDatabase(t *testing.T, databaseURL string) {
 	ctx := context.Background()
 	conn, err := pgx.Connect(ctx, databaseURL)
 	if err != nil {
-		// Database likely does not exist yet; NewDBOSContext will create it.
+		// Database likely does not exist yet; NewContext will create it.
 		return
 	}
 	defer conn.Close(ctx)
@@ -202,10 +203,11 @@ type setupDBOSOptions struct {
 	schedulerPollingInterval time.Duration
 	durableSleepThreshold    time.Duration
 	databaseURL              string // share another test's database (sqlite URLs are per-*testing.T otherwise)
+	appName                  string // application name (defaults to "test-app")
 }
 
 /* Test database setup */
-func setupDBOS(t *testing.T, opts setupDBOSOptions) DBOSContext {
+func setupDBOS(t *testing.T, opts setupDBOSOptions) Context {
 	t.Helper()
 
 	databaseURL := opts.databaseURL
@@ -219,15 +221,19 @@ func setupDBOS(t *testing.T, opts setupDBOSOptions) DBOSContext {
 		}
 	}
 
+	appName := opts.appName
+	if appName == "" {
+		appName = "test-app"
+	}
 	config := Config{
 		DatabaseURL:              databaseURL,
-		AppName:                  "test-app",
+		AppName:                  appName,
 		Serializer:               opts.serializer,
 		SchedulerPollingInterval: opts.schedulerPollingInterval,
 		DurableSleepThreshold:    opts.durableSleepThreshold,
 	}
 
-	dbosCtx, err := NewDBOSContext(context.Background(), config)
+	dbosCtx, err := NewContext(context.Background(), config)
 	require.NoError(t, err)
 	require.NotNil(t, dbosCtx)
 
@@ -292,10 +298,10 @@ func (e *Event) Clear() {
 }
 
 // setWorkflowStatusPending sets the workflow's status to PENDING in the DB (clearing output, error, started_at_epoch_ms).
-func setWorkflowStatusPending(t *testing.T, dbosCtx DBOSContext, workflowID string) {
+func setWorkflowStatusPending(t *testing.T, dbosCtx Context, workflowID string) {
 	t.Helper()
 	c, ok := dbosCtx.(*dbosContext)
-	require.True(t, ok, "expected DBOSContext to be *dbosContext")
+	require.True(t, ok, "expected Context to be *dbosContext")
 	sysDB, ok := c.systemDB.(*sysdb.SysDB)
 	require.True(t, ok, "expected systemDB to be *sysDB")
 	updateQuery := sysDB.Dialect().RewriteQuery(fmt.Sprintf(`UPDATE %sworkflow_status
@@ -306,7 +312,7 @@ func setWorkflowStatusPending(t *testing.T, dbosCtx DBOSContext, workflowID stri
 	require.NoError(t, err, "failed to set workflow status to PENDING")
 }
 
-func queueEntriesAreCleanedUp(ctx DBOSContext) bool {
+func queueEntriesAreCleanedUp(ctx Context) bool {
 	maxTries := 10
 	success := false
 	exec, ok := ctx.(*dbosContext)
@@ -321,14 +327,16 @@ func queueEntriesAreCleanedUp(ctx DBOSContext) bool {
 			return false
 		}
 
+		// Scoped so a peer context sharing the database doesn't fail the check.
 		query := sdb.Dialect().RewriteQuery(fmt.Sprintf(`SELECT COUNT(*)
 				  FROM %sworkflow_status
 				  WHERE queue_name IS NOT NULL
 					AND queue_name != $1
-					AND status IN ('ENQUEUED', 'PENDING')`, sdb.Dialect().SchemaPrefix(sdb.Schema())))
+					AND status IN ('ENQUEUED', 'PENDING')
+					AND (application_name = $2 OR application_name IS NULL)`, sdb.Dialect().SchemaPrefix(sdb.Schema())))
 
 		var count int
-		err = tx.QueryRow(ctx, query, models.InternalQueueName).Scan(&count)
+		err = tx.QueryRow(ctx, query, models.InternalQueueName, exec.config.AppName).Scan(&count)
 		tx.Rollback(ctx)
 
 		if err != nil {
@@ -343,4 +351,16 @@ func queueEntriesAreCleanedUp(ctx DBOSContext) bool {
 		time.Sleep(1 * time.Second)
 	}
 	return success
+}
+
+// startDuplicateExecution starts a second, concurrent execution of an already-PENDING
+// workflow the way the queue runner dispatches a workflow it has claimed: straight to
+// the execution phase, with no status insert. The queue runner discards the execution's
+// handle, so the caller gets a polling handle on the workflow's recorded outcome.
+func startDuplicateExecution[P any, R any](ctx Context, fn Workflow[P, R], input P, workflowID string) WorkflowHandle[R] {
+	c := ctx.(*dbosContext)
+	handle := c.executeWorkflow(func(ctx Context, in any) (any, error) {
+		return fn(ctx, in.(P))
+	}, input, workflowExecution{workflowID: workflowID})
+	return typedHandle[R](c, handle)
 }

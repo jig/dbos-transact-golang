@@ -46,6 +46,46 @@ touched, the change **type**, the rationale, and notes/risks for re-applying.
     gate inside the same `runAsTxn` transaction as the recv checkpoint via
     `ConsumeMessageWithUUID` + `CloseGate`. Read-audience copy on fork is batched
     into upstream's bulk `ForkWorkflows`.
+- **2026-09-05 merge of upstream v1.3.0 (`ab56911`, #396–#462):** upstream's v1
+  API rename (`Context`, `Error`/`ErrorCode*`, `RegisterQueue`, `ScheduleSpec`,
+  `WithFilter*`, `Shutdown` returning an error — see upstream
+  `docs/go-v1-migration-guide.md`) was applied mechanically to the fork files.
+  Fork status after the merge:
+  - §1: the `GetResult` grace wait passes `failIfMissing=false` to the new
+    `AwaitWorkflowResult`; `UpdateWorkflowOutcome` now returns `(recorded bool,
+    error)` (#417) and the waiter wake-up runs before that return whatever the
+    outcome (a spurious wake costs the waiter one replay).
+  - §4: upstream #426 introduced its own `errShutdown` cause and skips the
+    durable cancel on shutdown; the fork's `errShutdownInitiated` was dropped in
+    favour of it. The `ResetWorkflowRecoveryAttempts` call remains fork-only,
+    inside that same branch.
+  - §5: DROPPED — `models.ErrorFromRecorded` and `TestErrorFromRecorded` were
+    removed. Upstream's `Error` JSON round-trips its code (`parseErrorCode`), all
+    recordings are type-preserving, and there is no production data holding
+    legacy plain-string histories (PoC stance: drop & recreate).
+  - §7: unchanged; the gate methods stay on `Context` (upstream moved `Send`,
+    `GetEvent` etc. to the `Client` sub-interface; gates need a launched runtime).
+  - §9: the `PromoteApplicationVersion` de-flake was dropped — upstream's
+    `SetLatestApplicationVersion` now clamps the timestamp above the latest one.
+  - Migrations: upstream added 42–47 and the shared-base 100–107
+    (`application_name`); fork migrations stay 1001–1003, after them.
+  - `dbos/client.go` was deleted upstream (`Client` is a sub-interface of `Context`).
+  - §2: upstream migration 105 (PL/pgSQL `enqueue_workflow` with
+    `application_name`, plus its `search_path` hardening) is neutralized like 14
+    and 38; 43/44 (DROP TRIGGER IF EXISTS) run harmlessly. Upstream's
+    `TestMigrationStatements` now asserts the notifications trigger is *absent*,
+    and upstream's `TestNotificationsReachOtherProcesses` (#427, asserts pushed
+    wake-ups under 1 s) is skipped: here cross-process stream readers wake on
+    the 1 s fallback poll and event/message waiters on the 100 ms poller.
+  - Tests: sqlite needs the `dbos/driver/sqlite` blank import (#407; upstream's
+    `utils_test.go` carries it). `durable_sleep_test.go` was ported to
+    `RegisterQueue`/`WithQueue(queue)`.
+  - **Rename gotcha for future merges:** a word-boundary `DBOSError`→`Error` sed
+    must NOT touch string literals: upstream pins the gob wire name
+    `gob.RegisterName("*dbos.DBOSError", &Error{})` for v0-persisted errors (the
+    fluxos8 golden fixtures depend on it) and `ErrorCode.String()` returns bare
+    names (`"WorkflowCancelled"`), which are also the on-disk JSON form. Diff the
+    renamed upstream files against `upstream/main` afterwards.
 - **Module renamed:** `go.mod` is `module github.com/jig/dbos-transact-golang`
   (renamed from `dbos-inc/...` across all imports). Consumers (fluxos8) import the
   `jig/...` path; the `go.work` `use ../dbos-transact-golang` picks up this tree.
@@ -158,6 +198,9 @@ Re-apply notes: the principled long-term fix (lease/heartbeat liveness instead o
 a dispatch counter) is deferred.
 
 ## 5. DBOSError code preservation across replay
+
+> **STATUS (2026-09): DROPPED** with the v1.3.0 merge — see the 2026-09-05 bullet
+> above. Kept for history.
 
 > **RE-FORK STATUS (2026-07): ONLY PARTLY superseded — `errorFromRecorded` is
 > still needed.** Upstream gob-encodes Go↔Go *workflow* errors, preserving the

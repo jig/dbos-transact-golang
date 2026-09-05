@@ -19,7 +19,7 @@ func TestGetMetrics(t *testing.T) {
 	require.NotNil(t, sysDB.systemDB)
 
 	// Define test workflows
-	testWorkflowA := func(ctx DBOSContext, input string) (string, error) {
+	testWorkflowA := func(ctx Context, input string) (string, error) {
 		_, err := RunAsStep(ctx, func(_ context.Context) (string, error) {
 			return "x", nil
 		}, WithStepName("testStepX"))
@@ -35,7 +35,7 @@ func TestGetMetrics(t *testing.T) {
 		return "a", nil
 	}
 
-	testWorkflowB := func(ctx DBOSContext, input string) (string, error) {
+	testWorkflowB := func(ctx Context, input string) (string, error) {
 		_, err := RunAsStep(ctx, func(_ context.Context) (string, error) {
 			return "y", nil
 		}, WithStepName("testStepY"))
@@ -48,6 +48,7 @@ func TestGetMetrics(t *testing.T) {
 	// Register workflows with custom names
 	RegisterWorkflow(dbosCtx, testWorkflowA, WithWorkflowName("testWorkflowA"))
 	RegisterWorkflow(dbosCtx, testWorkflowB, WithWorkflowName("testWorkflowB"))
+	require.NoError(t, Launch(dbosCtx), "failed to launch DBOS")
 
 	// Record start time before creating workflows
 	startTime := time.Now()
@@ -70,7 +71,7 @@ func TestGetMetrics(t *testing.T) {
 
 	// Query metrics from start to now + 10 hours
 	endTime := time.Now().Add(10 * time.Hour)
-	metrics, err := sysDB.systemDB.GetMetrics(context.Background(), startTime.Format(time.RFC3339), endTime.Format(time.RFC3339))
+	metrics, err := sysDB.systemDB.GetMetrics(context.Background(), startTime.Format(time.RFC3339), endTime.Format(time.RFC3339), nil)
 	require.NoError(t, err)
 	assert.GreaterOrEqual(t, len(metrics), 4, "Expected at least 4 metrics (2 workflow counts + 2 step counts)")
 
@@ -124,7 +125,7 @@ func TestGetMetricsEmptyTimeRange(t *testing.T) {
 	futureTime := time.Now().Add(24 * time.Hour)
 	futureTime2 := futureTime.Add(1 * time.Hour)
 
-	metrics, err := sysDB.systemDB.GetMetrics(context.Background(), futureTime.Format(time.RFC3339), futureTime2.Format(time.RFC3339))
+	metrics, err := sysDB.systemDB.GetMetrics(context.Background(), futureTime.Format(time.RFC3339), futureTime2.Format(time.RFC3339), nil)
 	require.NoError(t, err)
 	assert.Equal(t, 0, len(metrics), "Should return empty metrics for future time range")
 }

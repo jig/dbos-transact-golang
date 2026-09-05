@@ -17,7 +17,7 @@ func TestApplicationVersions(t *testing.T) {
 
 		latest, err := GetLatestApplicationVersion(dbosCtx)
 		require.NoError(t, err)
-		require.NotNil(t, latest)
+		require.NotZero(t, latest)
 		require.Equal(t, dbosCtx.GetApplicationVersion(), latest.Name)
 
 		versions, err := ListApplicationVersions(dbosCtx)
@@ -33,8 +33,8 @@ func TestApplicationVersions(t *testing.T) {
 
 		c := dbosCtx.(*dbosContext)
 		// Re-registering the same version must not create a duplicate row.
-		require.NoError(t, c.systemDB.CreateApplicationVersion(c, c.applicationVersion))
-		require.NoError(t, c.systemDB.CreateApplicationVersion(c, c.applicationVersion))
+		require.NoError(t, c.systemDB.CreateApplicationVersion(c, c.applicationVersion, c.requestedOwner("")))
+		require.NoError(t, c.systemDB.CreateApplicationVersion(c, c.applicationVersion, c.requestedOwner("")))
 
 		versions, err := ListApplicationVersions(dbosCtx)
 		require.NoError(t, err)
@@ -47,8 +47,8 @@ func TestApplicationVersions(t *testing.T) {
 
 		c := dbosCtx.(*dbosContext)
 		// Insert an older version directly so it sorts before "current".
-		require.NoError(t, c.systemDB.CreateApplicationVersion(c, "older-version"))
-		require.NoError(t, c.systemDB.UpdateApplicationVersionTimestamp(c, "older-version", time.Now().Add(-time.Hour).UnixMilli()))
+		require.NoError(t, c.systemDB.CreateApplicationVersion(c, "older-version", c.requestedOwner("")))
+		require.NoError(t, c.systemDB.UpdateApplicationVersionTimestamp(c, "older-version", time.Now().Add(-time.Hour).UnixMilli(), c.requestedOwner("")))
 
 		latest, err := GetLatestApplicationVersion(dbosCtx)
 		require.NoError(t, err)
@@ -78,9 +78,9 @@ func TestApplicationVersions(t *testing.T) {
 
 		_, err = GetLatestApplicationVersion(dbosCtx)
 		require.Error(t, err)
-		var dbosErr *DBOSError
-		require.True(t, errors.As(err, &dbosErr), "expected *DBOSError, got %T: %v", err, err)
-		require.Equal(t, NoApplicationVersions, dbosErr.Code)
+		var dbosErr *Error
+		require.True(t, errors.As(err, &dbosErr), "expected *Error, got %T: %v", err, err)
+		require.Equal(t, ErrorCodeNoApplicationVersions, dbosErr.Code)
 	})
 
 	t.Run("SetLatestRequiresVersionName", func(t *testing.T) {

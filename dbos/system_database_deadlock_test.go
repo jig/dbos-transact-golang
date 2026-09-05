@@ -16,12 +16,12 @@ import (
 // deadlock where newSystemDatabase held the detection connection (acquired to
 // detect the database type) across pool.Close() on the migration-failure error
 // path. pgxpool.Pool.Close() blocks until every acquired connection is released,
-// so NewDBOSContext hung forever instead of returning the "permission denied"
+// so NewContext hung forever instead of returning the "permission denied"
 // error.
 //
 // The scenario: a role that can connect but lacks CREATE on the database, so the
 // CREATE SCHEMA in runMigrations is denied (SQLSTATE 42501, non-retryable). With
-// the bug, NewDBOSContext never returns; with the fix it returns the error fast.
+// the bug, NewContext never returns; with the fix it returns the error fast.
 func TestNewDBOSContextDoesNotDeadlockOnMigrationFailure(t *testing.T) {
 	skipIfSqlite(t, "requires a real Postgres role without CREATE privilege")
 
@@ -89,16 +89,16 @@ func TestNewDBOSContextDoesNotDeadlockOnMigrationFailure(t *testing.T) {
 		RawQuery: "sslmode=disable",
 	}
 
-	// Run NewDBOSContext under a watchdog. pool.Close() does not observe the
+	// Run NewContext under a watchdog. pool.Close() does not observe the
 	// context, so a context timeout would not break the deadlock — we need an
 	// out-of-band timer to fail the test instead of hanging the suite forever.
 	type result struct {
-		dbosCtx DBOSContext
+		dbosCtx Context
 		err     error
 	}
 	done := make(chan result, 1)
 	go func() {
-		c, err := NewDBOSContext(context.Background(), Config{
+		c, err := NewContext(context.Background(), Config{
 			AppName:        "deadlock-test",
 			DatabaseURL:    lowprivURL.String(),
 			DatabaseSchema: testSchema,
@@ -117,6 +117,6 @@ func TestNewDBOSContextDoesNotDeadlockOnMigrationFailure(t *testing.T) {
 				strings.Contains(res.err.Error(), "failed to run migrations"),
 			"expected a migration/permission error, got: %v", res.err)
 	case <-time.After(30 * time.Second):
-		t.Fatal("NewDBOSContext hung: pool.Close() deadlocked with the detection connection still checked out (regression)")
+		t.Fatal("NewContext hung: pool.Close() deadlocked with the detection connection still checked out (regression)")
 	}
 }
